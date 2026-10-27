@@ -31,7 +31,7 @@
 - [x] hubert / rmvpe / 示例音色：bytes + sha256 + 多源 + 断点续传
 - [x] 自备 `.pth` / `.index` 导入与列表（文件头 + 大小下限校验）
 - [x] 缺 `tools/uvr5` 时禁用分离选项并提示
-- [x] 包体：权重不进包，只带 `vendor/rvc`（0.56 MB）；`npm pack` 132 kB
+- [x] 包体：权重不进包，只带 `vendor/rvc`（0.26 MB）；`npm pack` 85 kB（解包 344 kB）
 - [x] worker 从数据目录读权重，缺权重 `fatal` 快速失败
 - [x] 真实链路冒烟：`install=ready`，vendor 代码 + 数据目录权重，热态 1.85s
 

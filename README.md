@@ -35,7 +35,8 @@ T3 面板、T4 与 gpt-sovits 联动、T5 验收见仓库根目录的 `tasks.md`
 ## 运行时
 
 - RVC 推理代码：`RVC-Project/Retrieval-based-Voice-Conversion-WebUI` @ `81eed5e`（无 fairseq，HuBERT 走 transformers）。
-  瘦身副本随包分发在 `vendor/rvc`（`infer`、`configs`、`i18n`、几个 `tools/*.py`），约 0.56 MB；整包 tgz 约 130 kB。
+  瘦身副本随包分发在 `vendor/rvc`（`infer`、`configs`、`i18n` 的 `zh_CN`/`en_US` 语言包、几个 `tools/*.py`），
+  29 个文件 / 约 0.26 MB；整包 tgz 约 85 kB（解包 344 kB）。
 - **权重不进包**：`hubert_base`（transformers 三件套）、`rmvpe.pt`、示例音色共约 587 MB，首次安装时下到
   `<插件数据目录>/assets` 与 `<插件数据目录>/voices`：先写 `.partial` 再校验 SHA-256 才改名，断点续传；
   来源顺序为自有 ModelScope 仓库 → hf-mirror → huggingface。也可把现成的 `.pth` / `.index` 直接放进 `voices` 目录。

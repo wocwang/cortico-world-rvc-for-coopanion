@@ -11,8 +11,8 @@
 export const UPSTREAM_REPO = 'RVC-Project/Retrieval-based-Voice-Conversion-WebUI';
 export const UPSTREAM_COMMIT = '81eed5e8f68b6bed1789f682fe78cdd324495afc';
 
-/** `vendor/rvc` 里保留的目录：推理链只用到这些（不含 assets / train / WebUI / VST）。 */
-export const VENDOR_NOTE = 'infer, configs, i18n, tools/{cuda_graph,file_io,progress}.py + LICENSE';
+/** `vendor/rvc` 里保留的目录：推理链只用到这些（不含 assets / train / WebUI / VST，也不含用不到的语言包）。 */
+export const VENDOR_NOTE = 'infer, configs, i18n/{i18n.py,locale/{zh_CN,en_US}.json}, tools/{cuda_graph,file_io,progress}.py + LICENSE';
 
 /** 内置示例音色（MIT）：大肥鱼。上游文件名是 `dafeiyu`，落盘统一成 `daifeiyu`。 */
 export const SAMPLE_VOICE = 'daifeiyu';
