@@ -29,9 +29,10 @@ from pathlib import Path
 
 
 def _is_foreign_tools(path: str, root: str) -> bool:
-    """gpt-sovits 运行时根也在 sys.path 上，它那份 tools/ 会遮住本项目的 tools.cuda_graph。"""
+    """gpt-sovits 运行时根也在 sys.path 上，它那份 tools/ 会遮住本项目的 tools.cuda_graph。
+    只看有没有 tools 目录，不依赖 tools/asr：运行时包缺 asr 时同样会遮住。"""
     try:
-        return os.path.isdir(os.path.join(path, "tools", "asr")) and os.path.abspath(path) != root
+        return os.path.isdir(os.path.join(path, "tools")) and os.path.abspath(path) != root
     except OSError:
         return False
 

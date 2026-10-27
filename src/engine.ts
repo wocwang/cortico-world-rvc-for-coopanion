@@ -13,6 +13,7 @@
  * worker 的日志一律走 stderr，stdout 只放协议行。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
 
@@ -189,6 +190,14 @@ export class RvcEngine {
     this.st = { phase: 'starting', device: null, model: null, pid: null, detail: null, startMs: null };
     const python = this.opts.pythonPath;
     const script = this.opts.scriptPath;
+    const fail = (msg: string): never => {
+      this.st = { ...this.st, phase: 'error', detail: msg };
+      throw new RvcError('unavailable', msg);
+    };
+    // spawn 的 ENOENT 也可能只是 cwd 不存在（Node 不区分），先把三个前提逐一说清楚。
+    if (!existsSync(python)) fail(`Python 解释器不存在：${python}（在面板点「一键安装」重建依赖）`);
+    if (!existsSync(script)) fail(`worker.py 不存在：${script}（重装 RVC 插件）`);
+    if (!existsSync(this.opts.codeDir)) fail(`推理代码目录不存在：${this.opts.codeDir}（重装 RVC 插件）`);
     const child = spawn(python, [script, this.opts.codeDir, this.opts.voicesDir, this.opts.assetsDir], {
       cwd: this.opts.codeDir,
       windowsHide: true,

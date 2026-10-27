@@ -103,7 +103,7 @@ describe('World 面板数据面', () => {
 
   it('引擎不可用时 convert 直接失败，不落文件', async () => {
     const { invoke, dataDir } = await makeWorld();
-    await expect(invoke('convert', ['a.wav', pth().toString('base64'), { format: 'wav' }])).rejects.toThrow(/未就绪|未启动/);
+    await expect(invoke('convert', ['a.wav', pth().toString('base64'), { format: 'wav' }])).rejects.toThrow(/未就绪|未启动|不存在/);
     expect((await invoke('state') as State).lastConvert).toBeNull();
     expect(dataDir).toBeTruthy();
   });
@@ -114,6 +114,6 @@ describe('World 面板数据面', () => {
     await expect(invoke('convert', ['a.wav'])).rejects.toThrow('缺少音频内容');
     await expect(invoke('convert', ['a.wav', pth().toString('base64'), { pitch: 99 }])).rejects.toThrow('pitch 必须是');
     await expect(invoke('convert', ['a.wav', pth().toString('base64'), { separator: 'uvr5' }])).rejects.toThrow('tools/uvr5');
-    await expect(invoke('convert', ['a.wav', pth().toString('base64')])).rejects.toThrow(/未就绪|未启动/);
+    await expect(invoke('convert', ['a.wav', pth().toString('base64')])).rejects.toThrow(/未就绪|未启动|不存在/);
   });
 });

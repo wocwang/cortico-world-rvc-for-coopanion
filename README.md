@@ -11,6 +11,8 @@
 T1 骨架、T2 资产、T3 面板、T4 与 gpt-sovits 联动、T5 验收（已完成）。
 gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声」：交给 QQ 等插件的音频会先过这里，
 失败或超时原样放行。整链冒烟脚本在 `pr-gpt-sovits/repo/scripts/smoke-rvc.mts`。
+0.1.1 修复：CPU 档运行时缺 `tools/asr` 时，其 `tools/` 会遮住本插件的同名模块，worker 起不来；
+现在只在缺目录/路径不存在时给出明确原因，并正确剔除运行时的 `tools/`。
 
 ## 接口
 
