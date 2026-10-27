@@ -1,0 +1,21 @@
+{
+  // 与 gpt-sovits 插件同一份口径：一份配置同时 check Node 侧(子进程、HTTP 接口)
+  // 与之后 T3 的浏览器侧面板，所以 lib 里 DOM 与 ES2022 都在，types 只留 node。
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.mts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
