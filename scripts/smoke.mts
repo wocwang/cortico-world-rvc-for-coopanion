@@ -4,24 +4,46 @@
  *
  * 本机跑（路径可用环境变量覆盖）：
  *   pnpm exec tsx scripts/smoke.mts
- *   RVC_SMOKE_PYTHON=... RVC_SMOKE_CODE=... RVC_SMOKE_VOICES=... RVC_SMOKE_INPUT=... pnpm exec tsx scripts/smoke.mts
+ *   RVC_SMOKE_PYTHON=... RVC_SMOKE_CODE=... RVC_SMOKE_ASSETS=... RVC_SMOKE_VOICES=... RVC_SMOKE_INPUT=... pnpm exec tsx scripts/smoke.mts
  *
- * 需要：gpt-sovits 运行时派生的 venv、RVC 代码目录（含 hubert/rmvpe）、一个音色 `.pth`。
+ * 与 T1 的差别：推理代码改用包内 `vendor/rvc`，权重放到 `<数据目录>/assets`，
+ * 与正式安装后的布局一致；先确认 `install` 状态是 `ready`，再验一次真实转换。
+ *
+ * 需要：gpt-sovits 运行时派生的 venv、一份上游 `assets/`（hubert_base、rmvpe、示例音色）。
  */
-import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, linkSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import type { Logger, WorldHost } from 'cortico/core/types.ts';
 import { DEFAULT_PORT, RVC_DEFAULTS } from '../src/config.ts';
 import { RvcWorld } from '../src/world.ts';
 
 const temp = tmpdir();
-const here = join(temp, 'rvc-t1');
+const repo = dirname(dirname(fileURLToPath(import.meta.url)));
+const here = join(temp, 'rvc-smoke');
 const pythonPath = process.env.RVC_SMOKE_PYTHON || join(temp, 'rvc-probe', 'Scripts', 'python.exe');
-const codeDir = process.env.RVC_SMOKE_CODE || join(temp, 'rvc-src');
+const codeDir = process.env.RVC_SMOKE_CODE || join(repo, 'vendor', 'rvc');
+const sourceAssets = process.env.RVC_SMOKE_ASSETS || join(temp, 'rvc-src', 'assets');
 const input = process.env.RVC_SMOKE_INPUT || join(temp, 'asr-probe', 'in', 'female.wav');
 const outDir = join(here, 'out');
+const assetsDir = join(here, 'assets');
+
+/** 把上游 assets 里的三份权重硬链接/复制到数据目录，模拟 `install` 装好之后的样子。 */
+function prepareAssets(): string {
+  const files = ['hubert_base/config.json', 'hubert_base/preprocessor_config.json', 'hubert_base/pytorch_model.bin', 'rmvpe/rmvpe.pt'];
+  for (const file of files) {
+    const from = join(sourceAssets, file);
+    const to = join(assetsDir, file);
+    if (!existsSync(from)) throw new Error(`缺权重：${from}`);
+    if (existsSync(to) && statSync(to).size === statSync(from).size) continue;
+    mkdirSync(dirname(to), { recursive: true });
+    rmSync(to, { force: true });
+    try { linkSync(from, to); } catch { cpSync(from, to); }
+  }
+  return assetsDir;
+}
 
 /** 音色目录：把 `.pth` 与 `.index` 硬链接到一起，模拟真实的 voices 布局。 */
 function prepareVoices(): string {
@@ -30,8 +52,8 @@ function prepareVoices(): string {
   const dir = join(here, 'voices');
   mkdirSync(dir, { recursive: true });
   const pairs: Array<[string, string]> = [
-    [join(codeDir, 'assets', 'weights', 'daifeiyu.pth'), join(dir, 'daifeiyu.pth')],
-    [join(codeDir, 'assets', 'indices', 'daifeiyu.index'), join(dir, 'daifeiyu.index')],
+    [join(sourceAssets, 'weights', 'daifeiyu.pth'), join(dir, 'daifeiyu.pth')],
+    [join(sourceAssets, 'indices', 'daifeiyu.index'), join(dir, 'daifeiyu.index')],
   ];
   for (const [from, to] of pairs) {
     if (!existsSync(from)) continue;
@@ -69,18 +91,25 @@ const world = new RvcWorld({
     enabled: true,
     codeDir,
     pythonPath,
+    assetsDir: prepareAssets(),
     voicesDir: prepareVoices(),
     voice: 'daifeiyu',
     httpApi: true,
     httpPort: port || DEFAULT_PORT,
   },
   dataDir: here,
-  packageDir: here,
+  packageDir: repo,
   runtimesRoot: () => '',
 });
 
 const host = { log } as unknown as WorldHost;
 await world.start(host);
+
+const panel = world.webUi('zh').invoke!;
+const first = (await panel('service', 'state', [])) as Record<string, unknown>;
+const install = first.install as Record<string, unknown>;
+console.log('paths:', { codeDir: first.codeDir, assetsDir: first.assetsDir, voicesDir: first.voicesDir, uvr5: first.uvr5 });
+console.log('install:', install);
 
 const base = `http://127.0.0.1:${port}`;
 const deadline = Date.now() + 180_000;
@@ -91,9 +120,8 @@ while (Date.now() < deadline) {
   await new Promise((r) => setTimeout(r, 500));
 }
 console.log('health:', health);
-if (!health.ready) {
-  const st = (await (world as unknown as { invoke(p: string, m: string): Promise<unknown> }).invoke('service', 'state')) as Record<string, unknown>;
-  console.error('未就绪：', st);
+if (!health.ready || install.phase !== 'ready') {
+  console.error('未就绪：', await panel('service', 'state', []));
   await world.stop();
   process.exit(1);
 }

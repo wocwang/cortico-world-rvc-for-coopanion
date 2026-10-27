@@ -15,7 +15,9 @@ import type { Language } from 'cortico/core/language.ts';
 import type { Logger, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { configGroups, DEFAULT_PORT, RVC_ID, worldLabel, type RvcConfigSection } from './config.ts';
 import { RvcEngine, RvcError, type EngineState } from './engine.ts';
+import { RvcInstaller, type InstallState } from './install.ts';
 import { startConvertServer, type ConvertDeps, type ConvertJob, type ConvertServerHandle } from './server.ts';
+import { importVoiceFile, listVoices } from './voices.ts';
 
 const WORKER_SCRIPT = fileURLToPath(new URL('./python/worker.py', import.meta.url));
 
@@ -59,15 +61,24 @@ export function firstVoice(voicesDir: string): string {
   }
 }
 
+/** 推理代码里有没有 `tools/uvr5`：没有就把 `separator=uvr5` 标成不可用。 */
+export function hasUvr5(codeDir: string): boolean {
+  return !!codeDir && existsSync(join(codeDir, 'tools', 'uvr5'));
+}
+
 export class RvcWorld implements World {
   readonly id = RVC_ID;
   private readonly opts: RvcWorldOptions;
   private log: Logger | null = null;
   private engine: RvcEngine | null = null;
+  private installer: RvcInstaller | null = null;
   private server: ConvertServerHandle | null = null;
   private starting: Promise<void> | null = null;
   private stopped = true;
   private launchDetail = '';
+  private codeDir = '';
+  private assetsDir = '';
+  private voicesDir = '';
 
   constructor(opts: RvcWorldOptions) {
     this.opts = opts;
@@ -100,7 +111,7 @@ export class RvcWorld implements World {
           getMethods: ['config'],
         })),
       ],
-      invoke: async (panel, method) => this.invoke(panel, method),
+      invoke: async (panel, method, args) => this.invoke(panel, method, args),
     };
   }
 
@@ -109,26 +120,28 @@ export class RvcWorld implements World {
     this.stopped = false;
     this.launchDetail = '';
     const paths = this.paths();
+    this.codeDir = paths.codeDir;
+    this.assetsDir = paths.assetsDir;
+    this.voicesDir = paths.voicesDir;
+    this.installer = new RvcInstaller(paths.assetsDir, paths.voicesDir);
     this.engine = new RvcEngine({
       pythonPath: paths.pythonPath,
       codeDir: paths.codeDir,
       voicesDir: paths.voicesDir,
+      assetsDir: paths.assetsDir,
       scriptPath: WORKER_SCRIPT,
       voice: this.opts.cfg.voice.trim() || firstVoice(paths.voicesDir),
       runtimeDir: paths.runtimeDir || undefined,
       log: this.log,
     });
     // 就绪可能要十几秒；先让 World 挂上，接口立刻能答 `ready=false`。
-    this.starting = this.engine.start().catch((err: unknown) => {
-      this.launchDetail = err instanceof Error ? err.message : String(err);
-      this.log?.warn('RVC 引擎启动失败', { err: this.launchDetail });
-    });
-    void this.starting;
+    this.bootEngine();
     if (this.opts.cfg.httpApi) void this.startHttp();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.installer?.cancel();
     const server = this.server;
     this.server = null;
     await server?.close();
@@ -138,17 +151,32 @@ export class RvcWorld implements World {
     this.starting = null;
   }
 
+  /** 拉起/重拉引擎；失败原因进 `launchDetail`，面板与接口据此解释。 */
+  private bootEngine(): void {
+    const engine = this.engine;
+    if (!engine) return;
+    this.starting = engine.start()
+      .then(() => { this.launchDetail = ''; })
+      .catch((err: unknown) => {
+        this.launchDetail = err instanceof Error ? err.message : String(err);
+        this.log?.warn('RVC 引擎启动失败', { err: this.launchDetail });
+      });
+    void this.starting;
+  }
+
   /** 面板/接口共用：此刻引擎状态。 */
   health(): { ready: boolean; device: string | null; model: string | null } {
     const st = this.engine?.state();
     return { ready: !!this.engine?.ready(), device: st?.device ?? null, model: st?.model ?? null };
   }
 
-  private paths(): { codeDir: string; pythonPath: string; runtimeDir: string; voicesDir: string } {
+  private paths(): { codeDir: string; pythonPath: string; runtimeDir: string; voicesDir: string; assetsDir: string } {
     const dataDir = this.opts.dataDir;
     const runtimeDir = this.opts.cfg.runtimeDir.trim() || findRuntimeDir(this.opts.runtimesRoot());
     return {
-      codeDir: this.opts.cfg.codeDir.trim() || join(dataDir, 'rvc'),
+      // 代码随包走（vendor/rvc，只读）；权重与音色在数据目录。
+      codeDir: this.opts.cfg.codeDir.trim() || join(this.opts.packageDir, 'vendor', 'rvc'),
+      assetsDir: this.opts.cfg.assetsDir.trim() || join(dataDir, 'assets'),
       pythonPath: this.opts.cfg.pythonPath.trim() || join(dataDir, 'venv', 'Scripts', 'python.exe'),
       runtimeDir,
       voicesDir: this.opts.cfg.voicesDir.trim() || join(dataDir, 'voices'),
@@ -160,6 +188,7 @@ export class RvcWorld implements World {
       ready: () => !!this.engine?.ready(),
       stateText: () => this.engine?.state().detail ?? (this.launchDetail || 'RVC 引擎启动中'),
       health: () => this.health(),
+      uvr5: () => hasUvr5(this.codeDir),
       convert: (job) => this.convert(job),
       log: this.log ?? silentLogger,
     };
@@ -214,9 +243,10 @@ export class RvcWorld implements World {
     }
   }
 
-  private async invoke(panel: string, method: string): Promise<unknown> {
+  private async invoke(panel: string, method: string, args: unknown[] = []): Promise<unknown> {
     if (method === 'state') {
       const st: EngineState | null = this.engine ? this.engine.state() : null;
+      const voices = listVoices(this.voicesDir);
       return {
         phase: st?.phase ?? 'stopped',
         ready: this.health().ready,
@@ -226,9 +256,47 @@ export class RvcWorld implements World {
         port: this.server?.port ?? (this.opts.cfg.httpApi ? this.opts.cfg.httpPort : null),
         detail: st?.detail ?? this.launchDetail,
         tail: this.engine?.output() ?? [],
+        codeDir: this.codeDir,
+        assetsDir: this.assetsDir,
+        voicesDir: this.voicesDir,
+        uvr5: hasUvr5(this.codeDir),
+        install: this.installer?.state() ?? { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' },
+        voiceCount: voices.length,
       };
     }
+    if (method === 'install') return this.startInstall();
+    if (method === 'cancel') {
+      this.installer?.cancel();
+      return this.installer?.state() ?? null;
+    }
+    if (method === 'voices') return { voices: listVoices(this.voicesDir) };
+    if (method === 'import') {
+      const fileName = typeof args[0] === 'string' ? args[0] : '';
+      const base64 = typeof args[1] === 'string' ? args[1] : '';
+      if (!fileName || !base64) return { error: '需要文件名与 base64 内容' };
+      try {
+        const done = importVoiceFile(this.voicesDir, fileName, Buffer.from(base64, 'base64'));
+        this.log?.info('导入 RVC 音色', done);
+        return { ...done, voices: listVoices(this.voicesDir) };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+    }
     return { error: `unknown method: ${panel}.${method}` };
+  }
+
+  /** 面板点「安装」：开始下载资产与示例音色，装完自动重拉引擎。 */
+  private startInstall(): InstallState {
+    const installer = this.installer;
+    if (!installer) return { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' };
+    if (installer.state().phase === 'working') return installer.state();
+    void installer.install().then(() => {
+      const state = installer.state();
+      this.log?.info('RVC 资产安装结束', { phase: state.phase, detail: state.detail });
+      if (this.stopped || state.phase !== 'ready') return;
+      if (this.engine && !this.engine.ready() && this.engine.state().phase !== 'starting') this.bootEngine();
+    });
+    return installer.state();
   }
 }
 

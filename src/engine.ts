@@ -26,10 +26,12 @@ export class RvcError extends Error {
 export interface EngineOptions {
   /** 派生 venv 的 python.exe。 */
   pythonPath: string;
-  /** RVC 推理代码目录。 */
+  /** RVC 推理代码目录（包内 `vendor/rvc`，只读）。 */
   codeDir: string;
   /** 音色权重目录。 */
   voicesDir: string;
+  /** 模型资产目录（`hubert_base/`、`rmvpe/`）。 */
+  assetsDir: string;
   /** worker.py 的绝对路径。 */
   scriptPath: string;
   /** 启动时就载入的音色（.pth 文件名去掉扩展名）；空为目录里第一个。 */
@@ -187,7 +189,7 @@ export class RvcEngine {
     this.st = { phase: 'starting', device: null, model: null, pid: null, detail: null, startMs: null };
     const python = this.opts.pythonPath;
     const script = this.opts.scriptPath;
-    const child = spawn(python, [script, this.opts.codeDir, this.opts.voicesDir], {
+    const child = spawn(python, [script, this.opts.codeDir, this.opts.voicesDir, this.opts.assetsDir], {
       cwd: this.opts.codeDir,
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -195,6 +197,8 @@ export class RvcEngine {
         ...process.env,
         PYTHONIOENCODING: 'utf-8',
         PYTHONUNBUFFERED: '1',
+        // 代码目录在扩展包里，别在里面写 __pycache__。
+        PYTHONDONTWRITEBYTECODE: '1',
         RVC_DEFAULT_VOICE: this.opts.voice ?? '',
         PATH: this.searchPath(),
       },
@@ -263,6 +267,15 @@ export class RvcEngine {
       waiter?.resolve();
       return;
     }
+    if (msg.type === 'fatal') {
+      // worker 启动即失败（代码或资产缺失）：立刻报错，不等到超时。
+      const why = typeof msg.error === 'string' && msg.error ? msg.error : 'RVC worker 启动失败';
+      this.st = { ...this.st, phase: 'error', detail: why };
+      const waiter = this.readyWaiters;
+      this.readyWaiters = null;
+      waiter?.reject(new RvcError('unavailable', why));
+      return;
+    }
     if (msg.type === 'result') {
       const id = typeof msg.id === 'number' ? msg.id : -1;
       const pending = this.pending.get(id);
@@ -298,7 +311,8 @@ export class RvcEngine {
   private onExit(child: ChildProcess, detail: string): void {
     if (this.child !== child) return;
     this.child = null;
-    const err = new RvcError('unavailable', `${detail}：${this.tail.slice(-3).join(' | ') || '无输出'}`);
+    const reason = this.st.detail ? `（${this.st.detail}）` : '';
+    const err = new RvcError('unavailable', `${detail}${reason}：${this.tail.slice(-3).join(' | ') || '无输出'}`);
     if (this.st.phase === 'starting') {
       this.st = { ...this.st, phase: 'error', detail: err.message };
       const waiter = this.readyWaiters;

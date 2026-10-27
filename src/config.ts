@@ -7,10 +7,14 @@ export const RVC_ID = 'rvc';
 export interface RvcConfigSection {
   enabled: boolean;
   /**
-   * RVC 推理代码目录（含 `infer/`、`configs/`、`tools/`、`assets/`）。
-   * 空为插件数据目录下的 `rvc`。
+   * RVC 推理代码目录。空为扩展包自带的 `vendor/rvc`（只含源码，不含权重）。
    */
   codeDir: string;
+  /**
+   * 模型资产目录（`hubert_base/`、`rmvpe/`）。空为插件数据目录下的 `assets`。
+   * 资产约 587 MB，首次使用在面板里安装（断点续传、SHA-256 校验），不随包分发。
+   */
+  assetsDir: string;
   /**
    * 派生 venv 里的 `python.exe`。空为插件数据目录下的 `venv\Scripts\python.exe`。
    * 派生 venv 以 gpt-sovits 运行时为 base（`--system-site-packages`），不复制整套运行时。
@@ -47,6 +51,7 @@ export const DEFAULT_PORT = 9881;
 export const RVC_DEFAULTS: RvcConfigSection = {
   enabled: false,
   codeDir: '',
+  assetsDir: '',
   pythonPath: '',
   runtimeDir: '',
   voicesDir: '',
@@ -70,7 +75,8 @@ const TEXT = {
     pitch: { title: '变调（半音）', description: '0 为原调；男声转女声一般 +12 左右。' },
     indexRate: { title: '索引率', description: '0..1，越高越贴近音色、但可能带出素材口音；该音色没有 .index 时忽略。' },
     protect: { title: '保护清辅音', description: '0..0.5，防止换声后齿音、吸气声被抹掉。' },
-    codeDir: { title: '推理代码目录', description: '含 infer/cli.py 的 RVC 源码目录；留空为插件数据目录下的 rvc。' },
+    codeDir: { title: '推理代码目录', description: 'RVC 源码目录；留空用扩展包自带的 vendor/rvc（只含代码，不含权重）。' },
+    assetsDir: { title: '模型资产目录', description: 'hubert_base 与 rmvpe 所在目录；留空为插件数据目录下的 assets。约 587 MB，首次使用在面板里安装，不随包分发。' },
     pythonPath: { title: '派生 venv 的 python.exe', description: '留空为插件数据目录下的 venv\\Scripts\\python.exe。派生 venv 以 gpt-sovits 运行时为 base，不复制整套运行时。' },
     runtimeDir: { title: 'gpt-sovits 运行时目录', description: '派生 venv 的 base，也借它的 ffmpeg；留空自动挑部署里最新的一个。' },
     voicesDir: { title: '音色目录', description: '放 .pth 与同名 .index；留空为插件数据目录下的 voices。' },
@@ -86,7 +92,8 @@ const TEXT = {
     pitch: { title: 'Pitch (semitones)', description: '0 keeps the original key; a male voice to female is usually around +12.' },
     indexRate: { title: 'Index rate', description: '0..1; higher sticks closer to the voice but may leak the source accent. Ignored when the voice has no .index.' },
     protect: { title: 'Protect voiceless consonants', description: '0..0.5; keeps sibilants and breaths from being smeared by the conversion.' },
-    codeDir: { title: 'Inference code folder', description: 'The RVC source checkout with infer/cli.py; empty uses rvc under the plugin data folder.' },
+    codeDir: { title: 'Inference code folder', description: 'RVC source folder; empty uses the bundled vendor/rvc (code only, no weights).' },
+    assetsDir: { title: 'Model assets folder', description: 'Where hubert_base and rmvpe live; empty uses assets under the plugin data folder. About 587 MB, installed from the panel on first use; not shipped in the package.' },
     pythonPath: { title: 'Derived venv python.exe', description: 'Empty uses venv\\Scripts\\python.exe under the plugin data folder. The venv is based on the gpt-sovits runtime instead of copying it.' },
     runtimeDir: { title: 'gpt-sovits runtime folder', description: 'Base of the derived venv and the source of ffmpeg; empty picks the newest one in the deployment.' },
     voicesDir: { title: 'Voices folder', description: 'Holds .pth files and matching .index files; empty uses voices under the plugin data folder.' },
@@ -124,6 +131,7 @@ export function configGroups(language: Language): ConfigGroup[] {
         description: t.groupService.description,
         properties: {
           [`${K}.codeDir`]: { type: 'string', title: t.codeDir.title, description: t.codeDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
+          [`${K}.assetsDir`]: { type: 'string', title: t.assetsDir.title, description: t.assetsDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.pythonPath`]: { type: 'string', title: t.pythonPath.title, description: t.pythonPath.description, 'x-path': { kind: 'file', extensions: ['.exe'] }, 'x-hot': true },
           [`${K}.runtimeDir`]: { type: 'string', title: t.runtimeDir.title, description: t.runtimeDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.voicesDir`]: { type: 'string', title: t.voicesDir.title, description: t.voicesDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },

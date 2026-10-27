@@ -18,12 +18,15 @@
 - 测试：队列并发=1、队列满 503、token 校验、参数校验、失败映射 502。
 - 冒烟（`scripts/smoke.mts`）：预热 19.3s，5.4s 48k 输入 → 2.2s 出 40k WAV 430KB，落盘成功。
 
-## T2 资产
+## T2 资产（已完成 2026-10-27）
 
 - `src/catalog.ts`：hubert / rmvpe / 示例音色的 bytes + sha256 + 多源（ModelScope 自有仓库优先）。
 - `src/install.ts`：下载到 `.partial` → 校验 → 改名；断点续传；进度回调。
 - 用户自备 `.pth/.index` 导入（校验文件头/大小，列表可见）。
 - 缺失 `tools/uvr5` 时禁用 `separator=uvr5`，面板给提示。
+- 包体：只带 `vendor/rvc`（40 文件 / 0.56 MB），权重运行时下载；`npm pack` 132 kB（解包 643 kB）。
+- worker 改从 `assetsDir` 读权重（`rmvpe_root` + 覆盖 `infer.hubert.HUBERT_MODEL_PATH`），缺权重直接 `fatal` 快速失败。
+- 测试 29 项（server 13 / install 7 / voices 9）；真实链路冒烟：`install` 报 `ready`、vendor 代码 + 数据目录权重，预热 22s，5.4s 音频 → 1.85s WAV 430KB，`vendor` 未产生 `__pycache__`。
 
 ## T3 面板
 

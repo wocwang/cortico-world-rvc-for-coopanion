@@ -1,6 +1,7 @@
 """常驻 RVC 推理 worker。
 
-由 `src/engine.ts` 启动：`python worker.py <codeDir> <voicesDir>`。
+由 `src/engine.ts` 启动：`python worker.py <codeDir> <voicesDir> <assetsDir>`。
+`codeDir` 是包内的 `vendor/rvc`（只读），模型资产在 `assetsDir`（hubert_base/、rmvpe/）。
 启动时载入 RVC 代码与默认音色、预热一次，然后按行读 stdin 的 JSON 请求、按行写 stdout 的 JSON 结果。
 
 stdout 只放协议行（原 fd 被 dup 出来单独写，其余输出统统改到 stderr），
@@ -15,6 +16,7 @@ stdout 只放协议行（原 fd 被 dup 出来单独写，其余输出统统改�
   {"type":"ready","device":"cuda:0","model":"daifeiyu","warn":null}
   {"type":"result","id":1,"ok":true,"ms":123,"sampleRate":40000}
   {"type":"result","id":1,"ok":false,"kind":"decode|infer|param","error":"..."}
+  {"type":"fatal","error":"..."}
 """
 
 import json
@@ -23,6 +25,7 @@ import sys
 import time
 import traceback
 from io import BytesIO
+from pathlib import Path
 
 
 def _is_foreign_tools(path: str, root: str) -> bool:
@@ -34,11 +37,12 @@ def _is_foreign_tools(path: str, root: str) -> bool:
 
 
 def main() -> int:
-    if len(sys.argv) < 3:
-        print("usage: worker.py <codeDir> <voicesDir>", file=sys.stderr)
+    if len(sys.argv) < 4:
+        print("usage: worker.py <codeDir> <voicesDir> <assetsDir>", file=sys.stderr)
         return 2
     root = os.path.abspath(sys.argv[1])
     voices = os.path.abspath(sys.argv[2])
+    assets = os.path.abspath(sys.argv[3])
 
     # 协议通道：先复制一份原 stdout，再把 fd 1 指向 stderr。
     proto = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
@@ -51,7 +55,18 @@ def main() -> int:
     if not os.path.isdir(root):
         emit({"type": "fatal", "error": "推理代码目录不存在：%s" % root})
         return 1
+    # 资产缺失就在 import torch 之前报出来：引擎能立刻报错，不必等到 3 分钟超时。
+    missing = [
+        os.path.join(assets, "hubert_base", "config.json"),
+        os.path.join(assets, "hubert_base", "pytorch_model.bin"),
+        os.path.join(assets, "rmvpe", "rmvpe.pt"),
+    ]
+    absent = [p for p in missing if not os.path.isfile(p)]
+    if absent:
+        emit({"type": "fatal", "error": "缺少模型资产：%s（在面板里安装，或把 assets 目录指到已有权重）" % "、".join(absent)})
+        return 1
     os.makedirs(voices, exist_ok=True)
+    os.makedirs(assets, exist_ok=True)
 
     sys.path[:] = [p for p in sys.path if not (p and _is_foreign_tools(p, root))]
     sys.path.insert(0, root)
@@ -60,7 +75,7 @@ def main() -> int:
     os.environ["weight_root"] = voices
     os.environ["index_root"] = voices
     os.environ["outside_index_root"] = voices
-    os.environ.setdefault("rmvpe_root", os.path.join(root, "assets", "rmvpe"))
+    os.environ["rmvpe_root"] = os.path.join(assets, "rmvpe")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
@@ -75,6 +90,9 @@ def main() -> int:
 
     from infer.audio import load_audio, wav2  # noqa: E402
     from infer.vc.modules import VC  # noqa: E402
+    from infer import hubert as _hubert  # noqa: E402
+    # 上游把 hubert 目录写死在代码根下；资产放在插件数据目录，这里改指过去（模块读的是这个全局量）。
+    _hubert.HUBERT_MODEL_PATH = Path(assets, "hubert_base").resolve()
 
     vc = VC(config)
     current = {"voice": "", "index": ""}

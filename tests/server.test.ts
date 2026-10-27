@@ -44,6 +44,7 @@ async function boot(opts: {
   queueLimit?: number;
   fail?: RvcError;
   saved?: string;
+  uvr5?: boolean;
 } = {}): Promise<Harness> {
   const jobs: ConvertJob[] = [];
   const overlap: boolean[] = [];
@@ -53,6 +54,7 @@ async function boot(opts: {
     ready: () => opts.ready !== false,
     stateText: () => 'starting',
     health: () => ({ ready: opts.ready !== false, device: 'cuda:0', model: 'daifeiyu' }),
+    uvr5: () => opts.uvr5 === true,
     convert: async (job) => {
       overlap.push(busy);
       busy = true;
@@ -142,6 +144,19 @@ describe('RVC 本机接口', () => {
       const res = await post(base, body);
       expect(res.status, why).toBe(400);
     }
+  });
+
+  it('separator=uvr5 按推理代码能力给不同提示', async () => {
+    const missing = await boot({ uvr5: false });
+    const a = await post(missing.base, form({ separator: 'uvr5' }));
+    expect(a.status).toBe(400);
+    expect(((await a.json()) as { error: string }).error).toContain('tools/uvr5');
+    await handle?.close();
+
+    const present = await boot({ uvr5: true });
+    const b = await post(present.base, form({ separator: 'uvr5' }));
+    expect(b.status).toBe(400);
+    expect(((await b.json()) as { error: string }).error).toContain('还没接上推理');
   });
 
   it('错误映射：未就绪 409、解码失败 400、推理失败 502', async () => {

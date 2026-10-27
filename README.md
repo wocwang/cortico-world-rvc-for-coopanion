@@ -8,8 +8,8 @@
 
 ## 状态
 
-T1 骨架（已完成）：World 生命周期、配置、常驻 worker、HTTP 接口、串行队列与测试。
-T2 资产安装、T3 面板、T4 与 gpt-sovits 联动、T5 验收见仓库根目录的 `tasks.md` / `spec.md`。
+T1 骨架、T2 资产（已完成）：World 生命周期、配置、常驻 worker、HTTP 接口、串行队列、权重下载与音色导入。
+T3 面板、T4 与 gpt-sovits 联动、T5 验收见仓库根目录的 `tasks.md` / `spec.md`。
 
 ## 接口
 
@@ -35,13 +35,17 @@ T2 资产安装、T3 面板、T4 与 gpt-sovits 联动、T5 验收见仓库根�
 ## 运行时
 
 - RVC 推理代码：`RVC-Project/Retrieval-based-Voice-Conversion-WebUI` @ `81eed5e`（无 fairseq，HuBERT 走 transformers）。
+  瘦身副本随包分发在 `vendor/rvc`（`infer`、`configs`、`i18n`、几个 `tools/*.py`），约 0.56 MB；整包 tgz 约 130 kB。
+- **权重不进包**：`hubert_base`（transformers 三件套）、`rmvpe.pt`、示例音色共约 587 MB，首次安装时下到
+  `<插件数据目录>/assets` 与 `<插件数据目录>/voices`：先写 `.partial` 再校验 SHA-256 才改名，断点续传；
+  来源顺序为自有 ModelScope 仓库 → hf-mirror → huggingface。也可把现成的 `.pth` / `.index` 直接放进 `voices` 目录。
 - 解释器：从 gpt-sovits 运行时派生的私有 venv（`--system-site-packages`），只补 `faiss-cpu`、`praat-parselmouth`；
   **不复制、也不修改**共享运行时。
-- 常驻 worker + 启动预热：热态约 0.3 秒，显存峰值 545–773 MB。
+- 常驻 worker + 启动预热：热态约 0.3 秒，显存峰值 545–773 MB。worker 只从 `assetsDir` 读权重，不写 `vendor`。
 
 ## 示例音色
 
-`YukiKaze1337/DaFeiYu_rvc_v2_40k`（MIT），`.pth` 与 `.index` 随包分发（T2 起）。
+`YukiKaze1337/DaFeiYu_rvc_v2_40k`（大肥鱼，MIT）。`.pth` 与 `.index` 不随包分发，由安装流程下载到 `voices` 目录；
 上游 RVC-Project 为 MIT；`hubert_base` / `rmvpe.pt` 来自 `lj1995/VoiceConversionWebUI`。
 
 ## 开发
@@ -50,7 +54,8 @@ T2 资产安装、T3 面板、T4 与 gpt-sovits 联动、T5 验收见仓库根�
 pnpm install
 pnpm typecheck
 pnpm test
-# 真实链路冒烟（需要本机的派生 venv、RVC 代码目录与一个音色；可用 RVC_SMOKE_* 覆盖路径）
+# 真实链路冒烟（需要本机的派生 venv 与一份上游 assets/；可用 RVC_SMOKE_* 覆盖路径）
+# 默认用包内 vendor/rvc 当代码目录，权重硬链接到 %TEMP%\rvc-smoke\assets 模拟安装结果
 pnpm exec tsx scripts/smoke.mts
 ```
 

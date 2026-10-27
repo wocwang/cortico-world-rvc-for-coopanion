@@ -43,6 +43,8 @@ export interface ConvertDeps {
   stateText(): string;
   /** 引擎状态：设备、当前音色。 */
   health(): { ready: boolean; device: string | null; model: string | null };
+  /** 推理代码里有没有 `tools/uvr5`：没有就禁用 `separator=uvr5`。 */
+  uvr5(): boolean;
   /** 真正做转换；失败抛 `RvcError`。 */
   convert(job: ConvertJob): Promise<ConvertOutcome>;
   log: Logger;
@@ -117,8 +119,8 @@ const num = (raw: string | undefined, fallback: number): number => {
   return value;
 };
 
-/** 字段校验：范围按 spec §6，越界一律 400。 */
-export function readConvertJob(multipart: MultipartBody): ConvertJob {
+/** 字段校验：范围按 spec §6，越界一律 400。`opts.uvr5` 为 false 时禁用分离。 */
+export function readConvertJob(multipart: MultipartBody, opts: { uvr5?: boolean } = {}): ConvertJob {
   const { fields, file } = multipart;
   if (!file || !file.data.length) throw new RvcHttpError(400, '缺少音频文件 file');
   const ext = /\.[^./\\]+$/.exec(file.filename.toLowerCase())?.[0] ?? '';
@@ -135,7 +137,11 @@ export function readConvertJob(multipart: MultipartBody): ConvertJob {
   if (protect < 0 || protect > PROTECT_MAX) throw new RvcHttpError(400, `protect 必须在 0..${PROTECT_MAX}`);
   const separator = (fields.separator ?? 'off').trim() || 'off';
   if (separator !== 'off' && separator !== 'uvr5') throw new RvcHttpError(400, `未知的 separator：${separator}`);
-  if (separator === 'uvr5') throw new RvcHttpError(400, 'separator=uvr5 暂不可用（缺 tools/uvr5）');
+  if (separator === 'uvr5') {
+    throw new RvcHttpError(400, opts.uvr5
+      ? 'separator=uvr5 还没接上推理，请先自行分离人声（separator=off）'
+      : '本机 RVC 代码没有 tools/uvr5，人声分离不可用；请上传干净人声（separator=off）');
+  }
   const format = (fields.format ?? 'wav').trim() || 'wav';
   if (format !== 'wav' && format !== 'mp3') throw new RvcHttpError(400, `未知的 format：${format}`);
   const saveRaw = (fields.save ?? '0').trim() || '0';
@@ -211,7 +217,7 @@ export function startConvertServer(opts: {
 
   const convert = async (res: ServerResponse, req: IncomingMessage): Promise<void> => {
     const raw = await readBody(req, MAX_BODY_BYTES);
-    const job = readConvertJob(parseMultipart(raw, req.headers['content-type'] ?? ''));
+    const job = readConvertJob(parseMultipart(raw, req.headers['content-type'] ?? ''), { uvr5: deps.uvr5() });
     if (!deps.ready()) throw new RvcHttpError(409, `模型未就绪：${deps.stateText()}`);
     await acquire();
     const at = Date.now();
