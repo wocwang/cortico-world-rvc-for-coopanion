@@ -51,8 +51,8 @@
 - [x] 联动页 RVC 子卡（检测/端点/超时/变调/索引率/一键写入/试听）
 - [x] 三种故障场景测试通过（RVC 停止 / 超时 / 500）
 
-## T5 验收
+## T5 验收（已完成 2026-10-27）
 
-- [ ] typecheck / 测试 / build 全绿
-- [ ] 「文字 → 合成 → RVC → WAV」本机跑通并试听
-- [ ] tgz + 本地 commit（不 push / 不发 release）
+- [x] typecheck / 测试 / build 全绿（gpt-sovits 100、本仓 40）
+- [x] 「文字 → 合成 → RVC → WAV」本机跑通（48 kHz → 40 kHz，落盘可试听）
+- [x] tgz + 本地 commit（不 push / 不发 release）

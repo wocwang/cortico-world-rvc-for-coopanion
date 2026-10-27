@@ -51,11 +51,14 @@
 - 测试 100 项（新增 rvc-link 8 / http-tts 2 / config 2）；typecheck 与面板 build 通过（30.3 KB）。
 - 基线 `dbb4c54` 之上改动，仅本地 commit。
 
-## T5 验收打包
+## T5 验收打包（已完成 2026-10-27）
 
-- `typecheck` + 测试 + `build`；本机跑通「文字 → gpt-sovits → RVC → WAV」。
-- 出 tgz；本地 commit（不 push、不发 release）。
-- 更新 gpt-sovits CHANGELOG（联动项）与本文档勾选。
+- 两侧 `typecheck` / 测试 / `build` 全绿：gpt-sovits 100 项、本仓 40 项。
+- 整链实测（`pr-gpt-sovits/repo/scripts/smoke-rvc.mts`，本机 api_v2 9880 + RVC 临时端口）：
+  - 不开 RVC：48 kHz / 433,964 B，2.07 s；
+  - 开 RVC：40 kHz / 360,044 B，RVC 本体 5.2 s，整句 7.3 s；
+  - 中途停掉 RVC：仍 200 且是 48 kHz 原音频，日志一条「这次原样返回」。
+- 出 tgz：gpt-sovits 0.5.13、本仓 0.1.0（权重不进包）；本地 commit，不 push、不发 release。
 
 ## 另册（不急）
 
