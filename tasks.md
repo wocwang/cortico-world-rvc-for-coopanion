@@ -40,12 +40,16 @@
 - 测试 40 项（server 13 / install 7 / voices 9 / world 7 / venv 4）。
 - 真实链路：`venv=ready`、音色列表 `daifeiyu`、面板转换 430444 B WAV 落盘、随后 HTTP 转换 397 ms。
 
-## T4 接回 gpt-sovits
+## T4 接回 gpt-sovits（已完成 2026-10-27）
 
-- gpt-sovits：`config.ts` 加 `rvc.*` 六项；`http-tts.ts` 出口后处理（失败透传 + 日志限流）；
-  联动页加 RVC 子卡（检测/端点/超时/变调/索引率/一键写入/试听）。
-- 改前确认 gpt-sovits 工作树干净（基线 `dbb4c54` 已提交）。
-- 测试：RVC 停止 / 超时 / 500 三种情况都返回原音频。
+- gpt-sovits：`config.ts` 加 `rvc.*` 七项（enabled / endpoint / token / timeoutMs / pitch / indexRate / protect），
+  进「与其他插件联动」组，全部热改；默认 `http://127.0.0.1:9881`、超时 8000 ms。
+- `src/rvc-link.ts`：出口后处理，单次 `POST /convert` 带超时；没开 / 连不上 / 超时 / 非 2xx / 不是 WAV 一律原样返回，
+  失败日志同一句每分钟最多一条。
+- `http-tts.ts`：新增 `post` 钩子接 `RvcLink.convert`；钩子抛错也按原音频发，链路不断。
+- 联动页 RVC 子卡：检测（就绪 / 没就绪 / 连不上 / 非 2xx）、端点、超时、变调、索引率、一键写入、试听（合成 → RVC → WAV）。
+- 测试 100 项（新增 rvc-link 8 / http-tts 2 / config 2）；typecheck 与面板 build 通过（30.3 KB）。
+- 基线 `dbb4c54` 之上改动，仅本地 commit。
 
 ## T5 验收打包
 
