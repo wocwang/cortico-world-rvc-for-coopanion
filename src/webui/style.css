@@ -1,0 +1,15 @@
+/* RVC 面板：状态行、参数网格、音频与日志。配色沿用宿主主题变量。 */
+.rvc-row { display: grid; grid-template-columns: 5em auto 1fr auto; align-items: center; gap: .6em; padding: .35em 0; }
+.rvc-row[hidden] { display: none; }
+.rvc-name { opacity: .75; }
+.rvc-pill { padding: .1em .55em; border-radius: 999px; font-size: .85em; white-space: nowrap; background: var(--bg-2, rgba(127, 127, 127, .15)); }
+.rvc-pill[data-tone="on"] { color: var(--ok, #2e8b57); }
+.rvc-pill[data-tone="warn"] { color: var(--warn, #b8860b); }
+.rvc-pill[data-tone="bad"] { color: var(--bad, #c0392b); }
+.rvc-detail { font-size: .85em; opacity: .7; overflow-wrap: anywhere; }
+.rvc-acts { display: flex; gap: .4em; justify-content: flex-end; }
+.rvc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(9em, 1fr)); gap: .6em; margin: .6em 0; }
+.rvc-grid .field, .rvc-grid input, .rvc-grid select { width: 100%; }
+.rvc-log { max-height: 12em; overflow: auto; font-size: .8em; opacity: .8; white-space: pre-wrap; }
+.rvc-audio { width: 100%; margin: .6em 0; }
+.rvc-hint { font-size: .85em; opacity: .7; }

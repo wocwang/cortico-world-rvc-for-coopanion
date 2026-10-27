@@ -28,11 +28,17 @@
 - worker 改从 `assetsDir` 读权重（`rmvpe_root` + 覆盖 `infer.hubert.HUBERT_MODEL_PATH`），缺权重直接 `fatal` 快速失败。
 - 测试 29 项（server 13 / install 7 / voices 9）；真实链路冒烟：`install` 报 `ready`、vendor 代码 + 数据目录权重，预热 22s，5.4s 音频 → 1.85s WAV 430KB，`vendor` 未产生 `__pycache__`。
 
-## T3 面板
+## T3 面板（已完成 2026-10-27）
 
 - `src/webui/client.ts`：服务状态、依赖/权重进度、音色列表、变调、索引率、保护清辅音、
   上传音频 → 试听 → 落盘、日志尾部。
-- 上传走 world 内部调用 `convert`（不经 gpt-sovits）。
+- 上传走 world 内部调用 `convert`（不经 gpt-sovits）：base64 进、`$binary` 出，落盘到 `<dataDir>/out`。
+- `src/venv.ts`：派生 venv 探测/创建/补包（`faiss-cpu 1.15.1`、`praat-parselmouth 0.4.7`），
+  面板「一键安装」先跑它；已有 venv 在 `start()` 后台探一次，直接显示就绪。
+- 配置组改为 `webUi().config`，交给框架自带配置视图，不再各占一个面板。
+- 面板 bundle 用 esbuild 打包到 `dist/`（12.2 KB JS + 0.9 KB CSS，不打 sourcemap）；整包 100 kB。
+- 测试 40 项（server 13 / install 7 / voices 9 / world 7 / venv 4）。
+- 真实链路：`venv=ready`、音色列表 `daifeiyu`、面板转换 430444 B WAV 落盘、随后 HTTP 转换 397 ms。
 
 ## T4 接回 gpt-sovits
 

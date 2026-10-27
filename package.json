@@ -50,23 +50,28 @@
       "local",
       "experimental"
     ],
+    "webUiClient": "dist/webui.js",
+    "webUiStyle": "dist/webui.css",
     "describe": "describe.json"
   },
   "files": [
     "src",
+    "dist",
     "vendor",
     "README.md",
     "LICENSE",
     "describe.json"
   ],
   "scripts": {
+    "build": "node scripts/build-webui.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm test && npm run typecheck"
+    "prepublishOnly": "npm run build && npm test && npm run typecheck"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "cortico": "^0.2.3",
+    "esbuild": "^0.28.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

@@ -126,6 +126,45 @@ if (!health.ready || install.phase !== 'ready') {
   process.exit(1);
 }
 
+/**
+ * 面板也要真跑一遍：venv 探测 → 音色列表 → 上传转换（base64 进、`$binary` 出）。
+ * 失败就退出，别让「接口通了、面板没通」蒙混过去。
+ */
+const service = (await panel('service', 'state', [])) as Record<string, unknown>;
+const voices = (await panel('voices', 'voices', [])) as { voices: Array<{ name: string }> };
+console.log('panel voices:', voices.voices.map((v) => v.name).join(', ') || '(none)');
+
+let venvPhase = (service.venv as { phase: string }).phase;
+const venvDeadline = Date.now() + 60_000;
+while (venvPhase !== 'ready' && Date.now() < venvDeadline) {
+  await new Promise((r) => setTimeout(r, 500));
+  venvPhase = (((await panel('service', 'state', [])) as Record<string, unknown>).venv as { phase: string }).phase;
+}
+console.log('panel venv:', venvPhase);
+if (venvPhase !== 'ready' || !voices.voices.length) {
+  console.error('面板前置条件不满足：', { venvPhase, voices: voices.voices.length });
+  await world.stop();
+  process.exit(1);
+}
+
+const panelBin = (await panel('convert', 'convert', [
+  'female.wav',
+  readFileSync(input).toString('base64'),
+  { pitch: 0, indexRate: 0.3, protect: 0.33, format: 'wav' },
+])) as { $binary?: { mime: string; base64: string } };
+const panelBytes = Buffer.from(panelBin.$binary?.base64 ?? '', 'base64');
+mkdirSync(outDir, { recursive: true });
+const panelOut = join(outDir, 'panel.wav');
+writeFileSync(panelOut, panelBytes);
+const after = (await panel('service', 'state', [])) as Record<string, unknown>;
+const last = after.lastConvert as { ms: number; bytes: number; savedPath: string | null } | null;
+console.log('panel convert:', panelBin.$binary?.mime, panelBytes.length, 'bytes', 'saved=', last?.savedPath);
+if (panelBytes.subarray(0, 4).toString() !== 'RIFF' || !last?.savedPath || !existsSync(last.savedPath)) {
+  console.error('面板转换结果不对：', { mime: panelBin.$binary?.mime, size: panelBytes.length, last });
+  await world.stop();
+  process.exit(1);
+}
+
 const form = new FormData();
 form.set('file', new Blob([readFileSync(input)], { type: 'audio/wav' }), 'female.wav');
 form.set('voice', 'daifeiyu');
