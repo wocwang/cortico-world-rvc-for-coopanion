@@ -15,9 +15,10 @@ export const UPSTREAM_COMMIT = '81eed5e8f68b6bed1789f682fe78cdd324495afc';
 export const VENDOR_NOTE = 'infer, configs, i18n/{i18n.py,locale/{zh_CN,en_US}.json}, tools/{cuda_graph,file_io,progress}.py + LICENSE';
 
 /**
- * 内置示例音色：大肥鱼。上游文件名是 `dafeiyu`，落盘统一成 `daifeiyu`。
- * 授权**不是 MIT**：模型卡写的是「个人学习、娱乐、非商业的二次创作，禁止冒充/诈骗/伪造」；
- * 训练素材是机械合成音（非真人录音）。来源见 README「示例音色」与 B 站 `BV1cbH56KER3`。
+ * 内置示例音色：显示名「星落落大肥鱼」（与 gpt-sovits 的默认音色命名一致），落盘 ID 沿用上游 `daifeiyu`。
+ * 权重是用 gpt-sovits 的 dfy 干音自训的 RVC v2 40k 模型（606 条日语干音 / 29.46 分钟，底模来自 RVC-Project）。
+ * 授权**不是 MIT**：仅供个人学习、娱乐和非商业使用，注明音源即可，禁止冒充/诈骗/伪造，商用需另行授权。
+ * 音源见 README「示例音色」与 B 站 `BV1cbH56KER3`；训练素材为机械合成音（非真人录音）。
  */
 export const SAMPLE_VOICE = 'daifeiyu';
 
@@ -30,11 +31,11 @@ export interface PinnedFile {
   sources: readonly string[];
 }
 
-const MS_OWN = 'https://www.modelscope.cn/models/Phantivia/rvc-for-coopanion/resolve/master';
+const MS_OWN = 'https://www.modelscope.cn/models/wocwang/rvc-for-coopanion/resolve/master';
+const GH_OWN = 'https://github.com/wocwang/cortico-world-rvc-for-coopanion/releases/download/voice-20261028';
 const HF_MIRROR = 'https://hf-mirror.com';
 const HF = 'https://huggingface.co';
 const UPSTREAM_PATH = 'lj1995/VoiceConversionWebUI/resolve/main';
-const VOICE_PATH = 'YukiKaze1337/DaFeiYu_rvc_v2_40k/resolve/main';
 
 /** 一个文件：自有魔搭 → hf-mirror → huggingface。`remote` 是上游仓库里的相对路径。 */
 function pinned(path: string, remote: string, bytes: number, sha256: string, mirrorPath = path): PinnedFile {
@@ -58,10 +59,17 @@ export const ASSET_FILES: readonly PinnedFile[] = [
   pinned('rmvpe/rmvpe.pt', `${UPSTREAM_PATH}/rmvpe.pt`, 181184272, '6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193'),
 ];
 
-/** 内置示例音色，落到 `<dataDir>/voices`；索引在上游是另一个文件名，落盘时改成同名 `.index`。 */
+/** 自训音色，落到 `<dataDir>/voices`：自有魔搭仓库 → GitHub Release。索引落盘统一改名成同名 `.index`。 */
+const voiceFile = (path: string, bytes: number, sha256: string): PinnedFile => ({
+  path,
+  bytes,
+  sha256,
+  sources: [`${MS_OWN}/voices/${path}`, `${GH_OWN}/${path}`],
+});
+
 export const VOICE_FILES: readonly PinnedFile[] = [
-  pinned(`${SAMPLE_VOICE}.pth`, `${VOICE_PATH}/dafeiyu.pth`, 55229202, 'eaa043e9329fa7a6c9002ccff4efe7667d42ab8187eb5f9297c5f2b2628c9935', `voices/${SAMPLE_VOICE}.pth`),
-  pinned(`${SAMPLE_VOICE}.index`, `${VOICE_PATH}/added_IVF1314_Flat_nprobe_1_dafeiyu_v2.index`, 161949619, '01da84f7efd48f713835e6dfc87f9ee865cd0e223f8bc40eb35b15696b0058a7', `voices/${SAMPLE_VOICE}.index`),
+  voiceFile(`${SAMPLE_VOICE}.pth`, 55223661, 'ff64ca1e5978073058882fc86ebd68acd5ac0b1a7d846e6d0c0137b7bf582a02'),
+  voiceFile(`${SAMPLE_VOICE}.index`, 266765099, '3387bece70af26610f80858d52e8d7343ffc6904b95c73f6006ca7c302568196'),
 ];
 
 /** 两类资产总字节，面板显示总量用。 */

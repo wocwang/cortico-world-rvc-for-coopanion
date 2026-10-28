@@ -142,7 +142,7 @@ const servicePanel: WebUiPanel = {
     const uvr5Warn = ui.msgline(t.uvr5Off, true);
     const bar = ui.progress({ tone: 'warn' });
     bar.el.hidden = true;
-    sheet.append(bar.el, uvr5Warn);
+    sheet.append(bar.el, uvr5Warn, ui.h('div', 'rvc-detail', t.voiceNotice));
 
     const installBtn = ui.button(t.install, { variant: 'primary', size: 'sm', onClick: () => void call('install') });
     const cancelBtn = ui.button(t.cancel, { size: 'sm', onClick: () => void call('cancel') });
@@ -191,7 +191,7 @@ const servicePanel: WebUiPanel = {
       cancelBtn.hidden = !busy;
       // 音色
       setPill(voiceRow.pill, s.voiceCount ? t.voicesCount(s.voiceCount) : t.noVoice, s.voiceCount ? 'on' : 'off');
-      voiceRow.detail.textContent = s.voiceCount ? s.defaultVoice : t.noVoiceHint;
+      voiceRow.detail.textContent = s.voiceCount ? t.voiceLabel(s.defaultVoice) : t.noVoiceHint;
       // 接口
       setPill(apiRow.pill, s.port ? t.apiOn(s.port) : t.apiOff, s.port ? 'on' : 'off');
       apiRow.detail.textContent = s.queue ? t.queueText(s.queue) : '';
@@ -279,7 +279,7 @@ const convertPanel: WebUiPanel = {
 
     function render(s: PanelState, voices: VoiceRow[]): void {
       state = s;
-      fillSelect(ui, voiceSelect, [{ value: '', label: t.defaultVoice }, ...voices.map((v) => ({ value: v.name, label: v.name }))]);
+      fillSelect(ui, voiceSelect, [{ value: '', label: t.defaultVoice }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
       convertBtn.disabled = !s.ready;
       if (!s.ready && s.detail) msg.textContent = s.detail;
     }
@@ -392,7 +392,7 @@ const voicesPanel: WebUiPanel = {
       list.textContent = '';
       if (!voices.length) { list.append(ui.h('div', 'rvc-detail', t.noVoiceHint)); return; }
       for (const v of voices) {
-        const line = row(list, ui, v.name);
+        const line = row(list, ui, t.voiceLabel(v.name));
         const using = v.name === defaultVoice;
         setPill(line.pill, using ? t.using : '', using ? 'on' : 'off');
         line.detail.textContent = [ui.fmt.bytes(v.bytes), v.index ? t.indexHas(ui.fmt.bytes(v.index)) : t.indexNone].join(' · ');

@@ -1,4 +1,4 @@
-# RVC 变声 — Coopanion World
+# RVC唱歌-大肥鱼 — Coopanion World
 
 把任意一段音频换成桌宠的音色。全程本机推理，不上传任何录音。
 
@@ -42,7 +42,7 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
 ## 面板
 
 - **服务**：引擎 / 派生 venv / 权重 / 音色 / 接口五行状态，一键安装、取消与重启引擎，日志尾部。
-  一键安装先建派生 venv 并补 `faiss-cpu`、`praat-parselmouth`，再下 587 MB 权重，装完自动重拉引擎。
+  一键安装先建派生 venv 并补 `faiss-cpu`、`praat-parselmouth`，再下约 692 MB 权重，装完自动重拉引擎。
 - **变声**：上传音频 → 变调 / 索引率 / 保护清辅音 → 试听 → 下载；结果同时存到 `<插件数据目录>/out`。
 - **音色**：列出 `.pth` / `.index`，导入自备权重，一键设为默认。
 
@@ -54,22 +54,30 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
 - RVC 推理代码：`RVC-Project/Retrieval-based-Voice-Conversion-WebUI` @ `81eed5e`（无 fairseq，HuBERT 走 transformers）。
   瘦身副本随包分发在 `vendor/rvc`（`infer`、`configs`、`i18n` 的 `zh_CN`/`en_US` 语言包、几个 `tools/*.py`），
   29 个文件 / 约 0.26 MB；整包 tgz 约 100 kB（解包 391 kB，含面板 bundle）。
-- **权重不进包**：`hubert_base`（transformers 三件套）、`rmvpe.pt`、示例音色共约 587 MB，首次安装时下到
+- **权重不进包**：`hubert_base`（transformers 三件套）、`rmvpe.pt`、示例音色共约 692 MB，首次安装时下到
   `<插件数据目录>/assets` 与 `<插件数据目录>/voices`：先写 `.partial` 再校验 SHA-256 才改名，断点续传；
-  来源顺序为自有 ModelScope 仓库 → hf-mirror → huggingface。也可把现成的 `.pth` / `.index` 直接放进 `voices` 目录。
+  来源顺序为自有 ModelScope 仓库 → GitHub Release（示例音色）/ hf-mirror → huggingface（上游资产）。
+  也可把现成的 `.pth` / `.index` 直接放进 `voices` 目录。
 - 解释器：从 gpt-sovits 运行时派生的私有 venv（`--system-site-packages`），只补 `faiss-cpu`、`praat-parselmouth`；
   **不复制、也不修改**共享运行时。
 - 常驻 worker + 启动预热：热态约 0.3 秒，显存峰值 545–773 MB。worker 只从 `assetsDir` 读权重，不写 `vendor`。
 
 ## 示例音色
 
-`YukiKaze1337/DaFeiYu_rvc_v2_40k`（大肥鱼）。`.pth` 与 `.index` 不随包分发，由安装流程下载到 `voices` 目录。
+显示名「星落落大肥鱼」（与 gpt-sovits 的默认音色命名一致），落盘 ID 沿用上游 `daifeiyu`。
+`.pth` 与 `.index` 不随包分发，由安装流程下载到 `voices` 目录。
 
-**授权不是 MIT**：该模型卡写明「仅供个人学习、娱乐和非商业的二次创作使用；请勿冒充他人、用于诈骗或伪造」；
-训练素材是机械合成音（非真人录音）。音色来源见 B 站 `BV1cbH56KER3`（UP 主「星落落_oi」：
-「自用随意，不可商用」）。**音源作者已确认：非商业使用、注明音源即可**，所以本插件在非商业场景内置该示例音色，
-并在 README、市场简介与面板里注明来源；商用仍需另行授权。上游 RVC-Project 为 MIT；`hubert_base` / `rmvpe.pt`
-来自 `lj1995/VoiceConversionWebUI`。
+内置权重是用 gpt-sovits 的 `dfy` 干音自训的 RVC v2 40k 模型（生成器 + faiss 索引），底模
+`f0G40k.pth` / `f0D40k.pth` 来自 RVC-Project 官方预训练。训练集是全部 606 条日语干音 / 29.46 分钟：
+21 条《人是猫》翻唱切片（B 站 `BV1freb6iErC`，AI 合成人声）+ 585 条 GPT-SoVITS 合成素材，切成 648 段
+40 kHz 音频；RMVPE f0，HuBERT 768 维特征。RVC 训练只吃音频，不需要文本或语言标注；这批素材是日语，所以换中文输入会
+带一点日语口音与韵律。旧版内置权重来自 `YukiKaze1337/DaFeiYu_rvc_v2_40k`，已被新模型替换。
+
+**授权不是 MIT**：**仅供个人学习、娱乐和非商业使用，注明音源即可；请勿冒充他人、用于诈骗或伪造。**
+训练素材是机械合成音（非真人录音），音色来源见 B 站 `BV1cbH56KER3`（UP 主「星落落_oi」：
+「自用随意，不可商用」）；**音源作者已确认非商业使用、注明音源即可**，所以本插件在非商业场景内置该音色，
+并在 README、市场简介与面板里注明来源。**商用需另行取得音源作者授权。** 上游 RVC-Project 为 MIT；
+`hubert_base` / `rmvpe.pt` 来自 `lj1995/VoiceConversionWebUI`。
 
 ## 开发
 

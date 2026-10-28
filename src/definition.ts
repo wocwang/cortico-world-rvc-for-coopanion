@@ -18,7 +18,7 @@ const PACKAGE_DIR = fileURLToPath(new URL('..', import.meta.url));
 
 export const RVC: WorldDefinition<RvcConfigSection> = {
   id: RVC_ID,
-  label: 'RVC 变声',
+  label: 'RVC唱歌-大肥鱼',
   defaults: () => structuredClone(RVC_DEFAULTS),
   configOptions(kind, language) {
     if (kind === TIER_OPTIONS) return tierOptions(language);

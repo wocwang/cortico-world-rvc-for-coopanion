@@ -5,7 +5,7 @@
  * 中断留下的 `.partial` 下次用 `Range` 续传（服务器不支持就整段重下）。
  * 每个文件按 `sources` 顺序试，前一个失败（网络、HTTP 状态、校验）才试下一个。
  *
- * 包体不带权重：这里下载的 hubert / rmvpe / 示例音色共约 587 MB，放插件数据目录。
+ * 包体不带权重：这里下载的 hubert / rmvpe / 示例音色共约 692 MB，放插件数据目录。
  */
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
