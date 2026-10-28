@@ -15,7 +15,8 @@ export const UPSTREAM_COMMIT = '81eed5e8f68b6bed1789f682fe78cdd324495afc';
 export const VENDOR_NOTE = 'infer, configs, i18n/{i18n.py,locale/{zh_CN,en_US}.json}, tools/{cuda_graph,file_io,progress}.py + LICENSE';
 
 /**
- * 内置示例音色：显示名「星落落大肥鱼」（与 gpt-sovits 的默认音色命名一致），落盘 ID 沿用上游 `daifeiyu`。
+ * 内置示例音色：显示名「小肥鱼」，落盘 ID 沿用上游 `daifeiyu`。
+ * 官方 `YukiKaze1337/DaFeiYu_rvc_v2_40k` 在本项目里叫「星落落大肥鱼」，已不再内置。
  * 权重是用 gpt-sovits 的 dfy 干音自训的 RVC v2 40k 模型（606 条日语干音 / 29.46 分钟，底模来自 RVC-Project）。
  * 授权**不是 MIT**：仅供个人学习、娱乐和非商业使用，注明音源即可，禁止冒充/诈骗/伪造，商用需另行授权。
  * 音源见 README「示例音色」与 B 站 `BV1cbH56KER3`；训练素材为机械合成音（非真人录音）。

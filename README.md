@@ -64,7 +64,8 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
 
 ## 示例音色
 
-显示名「星落落大肥鱼」（与 gpt-sovits 的默认音色命名一致），落盘 ID 沿用上游 `daifeiyu`。
+内置的是自训版「小肥鱼」，落盘 ID 沿用上游 `daifeiyu`。
+官方 `YukiKaze1337/DaFeiYu_rvc_v2_40k` 在本项目里叫「星落落大肥鱼」，已不再内置。
 `.pth` 与 `.index` 不随包分发，由安装流程下载到 `voices` 目录。
 
 内置权重是用 gpt-sovits 的 `dfy` 干音自训的 RVC v2 40k 模型（生成器 + faiss 索引），底模
