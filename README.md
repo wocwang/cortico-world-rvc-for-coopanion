@@ -15,6 +15,8 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
 0.1.2 起改为只在缺目录/路径不存在时给出明确原因，并正确剔除运行时的 `tools/`。
 0.1.2 修复：宿主的 `ctx.packageDir` 指向加载它的 bot 包（`resources/app/build/cortico/bots/<bot>`），
 不是本扩展的安装目录；现在改用本包 `src/definition.ts` 的 `import.meta.url` 定位 `vendor/rvc`。
+0.2.0 起「推理档」可选自动 / 显卡 / CPU：切档后点「重启引擎」会自动重建派生 venv（GPU 档约 0.6–0.8 GB 显存）。
+0.2.1：示例音色授权改为「个人非商业」（非 MIT）；删掉「建议 60 秒以内」；面板与配置补显存/内存占用提示。
 
 ## 接口
 
@@ -61,7 +63,11 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
 
 ## 示例音色
 
-`YukiKaze1337/DaFeiYu_rvc_v2_40k`（大肥鱼，MIT）。`.pth` 与 `.index` 不随包分发，由安装流程下载到 `voices` 目录；
+`YukiKaze1337/DaFeiYu_rvc_v2_40k`（大肥鱼）。`.pth` 与 `.index` 不随包分发，由安装流程下载到 `voices` 目录。
+
+**授权不是 MIT**：该模型卡写明「仅供个人学习、娱乐和非商业的二次创作使用；请勿冒充他人、用于诈骗或伪造」；
+训练素材是机械合成音（非真人录音）。音色来源见 B 站 `BV1cbH56KER3`（UP 主「星落落_oi」：
+「自用随意，不可商用」）。因此本插件里的示例音色**只用于个人非商业场景**；商用请联系原作者取得授权。
 上游 RVC-Project 为 MIT；`hubert_base` / `rmvpe.pt` 来自 `lj1995/VoiceConversionWebUI`。
 
 ## 开发

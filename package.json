@@ -1,6 +1,6 @@
 {
   "name": "@wocwang/cortico-world-rvc-for-coopanion",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Cortico World for Coopanion: voice conversion with RVC — upload any audio and get it back in the pet's voice, plus a local HTTP endpoint (127.0.0.1:9881) for other plugins",
   "author": "wocwang",
@@ -38,11 +38,11 @@
     "locales": {
       "zh": {
         "displayName": "RVC 变声—大肥鱼",
-        "description": "把任意一段音频换成桌宠的音色：上传音频、可选变调、试听与落盘，全程在本机推理。内置公开示例音色（大肥鱼，MIT），也支持导入自备 .pth / .index。另开一个只监听本机的 HTTP 接口（默认 127.0.0.1:9881），其他插件可以用 POST /convert 直接拿到变声后的音频。只做推理，不做训练。"
+        "description": "把任意一段音频换成桌宠的音色：上传音频、可选变调、试听与落盘，全程在本机推理。内置示例音色（大肥鱼，仅供个人非商业使用），也支持导入自备 .pth / .index。另开一个只监听本机的 HTTP 接口（默认 127.0.0.1:9881），其他插件可以用 POST /convert 直接拿到变声后的音频。只做推理，不做训练。"
       },
       "en": {
         "displayName": "RVC Voice Changer — Fatfish",
-        "description": "Turns any audio clip into the pet's voice: upload, optional pitch shift, preview and save, all inferred on your own machine. Ships a public sample voice (DaFeiYu, MIT) and accepts your own .pth / .index. Also serves a loopback-only HTTP endpoint (127.0.0.1:9881 by default) so other plugins can POST /convert and get the converted audio back. Inference only, no training."
+        "description": "Turns any audio clip into the pet's voice: upload, optional pitch shift, preview and save, all inferred on your own machine. Ships a sample voice (DaFeiYu, personal non-commercial use only) and accepts your own .pth / .index. Also serves a loopback-only HTTP endpoint (127.0.0.1:9881 by default) so other plugins can POST /convert and get the converted audio back. Inference only, no training."
       }
     },
     "tags": [

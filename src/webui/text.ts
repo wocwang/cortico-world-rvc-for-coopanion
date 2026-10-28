@@ -4,11 +4,11 @@ import type { Language } from 'cortico/core/language.ts';
 const TEXT = {
   zh: {
     serviceTitle: '服务',
-    serviceHint: 'RVC 推理服务、依赖与权重的状态；首次使用先点「一键安装」。',
+    serviceHint: 'RVC 推理服务、依赖与权重的状态；首次使用先点「一键安装」。占用：GPU 档约 0.6–0.8 GB 显存，CPU 档约 1–2 GB 内存。',
     convertTitle: '变声',
     convertHint: '上传一段音频，换成桌宠的音色；试听后可再落盘。',
     voicesTitle: '音色',
-    voicesHint: '示例音色由安装流程下载；也可以导入自备的 .pth 与同名 .index。',
+    voicesHint: '示例音色由安装流程下载（仅限个人非商业使用）；也可以导入自备的 .pth 与同名 .index。',
     rowEngine: '引擎',
     rowDeps: '依赖',
     rowWeights: '权重',
@@ -43,7 +43,7 @@ const TEXT = {
     noVoiceHint: '点「一键安装」下载示例音色，或在「音色」页导入自备权重。',
     // 变声
     file: '音频文件',
-    fileHint: 'wav / flac / mp3 / ogg / m4a；建议 60 秒以内。',
+    fileHint: 'wav / flac / mp3 / ogg / m4a。',
     voice: '音色',
     defaultVoice: '默认音色',
     pitch: '变调（半音）',
@@ -108,7 +108,7 @@ const TEXT = {
     noVoice: 'No voices yet',
     noVoiceHint: 'Click "Install" to fetch the sample voice, or import your own weights on the Voices page.',
     file: 'Audio file',
-    fileHint: 'wav / flac / mp3 / ogg / m4a; 60 seconds or less works best.',
+    fileHint: 'wav / flac / mp3 / ogg / m4a.',
     voice: 'Voice',
     defaultVoice: 'Default voice',
     pitch: 'Pitch (semitones)',
