@@ -346,13 +346,16 @@ export class RvcWorld implements World {
     return this.opts.cfg.voice.trim() || voices[0]?.name || '';
   }
 
-  /** 面板点「一键安装」：先建派生 venv、补依赖，再下权重，装完自动重拉引擎。 */
+  /** 面板点「一键安装」：先停引擎，再建派生 venv、补依赖、下权重，装完自动重拉引擎。 */
   private startSetup(): void {
     const installer = this.installer;
     const venv = this.venv;
     if (!installer || !venv) return;
     if (venv.state().phase === 'working' || installer.state().phase === 'working') return;
     void (async () => {
+      // worker 在跑时会占住 venv 里的 .pyd/.dll，pip 覆盖不了这些文件；先停掉再装。
+      await this.engine?.stop();
+      if (this.stopped) return;
       await venv.ensure();
       if (this.stopped) return;
       if (venv.state().phase !== 'ready') {

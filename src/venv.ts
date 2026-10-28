@@ -20,8 +20,13 @@ export interface VenvState {
 
 /** T0 探针里验证过的两个包与版本；运行时自带的 torch/transformers 不再装。 */
 export const VENV_PACKAGES = ['faiss-cpu==1.15.1', 'praat-parselmouth==0.4.7'];
-/** 直连 PyPI 失败时换的镜像（只重试一次）。 */
-const PIP_MIRROR = 'https://pypi.tuna.tsinghua.edu.cn/simple';
+/**
+ * 依赖先走阿里云镜像（国内直连 PyPI 经常 SSL 中断；清华源对 pip 的 UA 返回 403，不能用），
+ * 镜像失败再回官方 PyPI。网络参数收紧，免得默认重试把「安装中」卡住。
+ */
+const PIP_MIRROR = 'https://mirrors.aliyun.com/pypi/simple/';
+const PIP_OFFICIAL = 'https://pypi.org/simple';
+const PIP_NET_ARGS = ['--timeout', '30', '--retries', '2'];
 /** 失败时保留的日志行数。 */
 const TAIL_LINES = 12;
 const PROBE_TIMEOUT_MS = 90_000;
@@ -96,12 +101,12 @@ export class RvcVenv {
       if (code !== 0) { this.st = { phase: 'error', detail: `创建 venv 失败：${this.lastLine()}` }; return; }
     }
     this.st = { phase: 'working', detail: '安装 faiss / parselmouth' };
-    const base = ['-I', '-X', 'utf8', '-u', '-m', 'pip', 'install', '--no-warn-script-location', ...VENV_PACKAGES];
-    let code = await this.exec(pythonPath, base, PIP_TIMEOUT_MS);
+    const base = ['-I', '-X', 'utf8', '-u', '-m', 'pip', 'install', '--no-warn-script-location', ...PIP_NET_ARGS, ...VENV_PACKAGES];
+    let code = await this.exec(pythonPath, [...base, '-i', PIP_MIRROR], PIP_TIMEOUT_MS);
     if (code !== 0) {
-      this.st = { phase: 'working', detail: '直连 PyPI 失败，换镜像重试' };
-      this.opts.log?.warn('RVC 依赖直连 PyPI 失败，改走镜像', { tail: this.tail.slice(-3) });
-      code = await this.exec(pythonPath, [...base, '-i', PIP_MIRROR], PIP_TIMEOUT_MS);
+      this.st = { phase: 'working', detail: '镜像没装上，换官方 PyPI 重试' };
+      this.opts.log?.warn('RVC 依赖镜像失败，改走官方 PyPI', { tail: this.tail.slice(-3) });
+      code = await this.exec(pythonPath, [...base, '-i', PIP_OFFICIAL], PIP_TIMEOUT_MS);
     }
     if (code !== 0) { this.st = { phase: 'error', detail: `装依赖失败：${this.lastLine()}` }; return; }
     if (await this.probe()) this.st = { phase: 'ready', detail: null };

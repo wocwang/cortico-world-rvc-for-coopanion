@@ -279,7 +279,9 @@ const convertPanel: WebUiPanel = {
 
     function render(s: PanelState, voices: VoiceRow[]): void {
       state = s;
-      fillSelect(ui, voiceSelect, [{ value: '', label: t.defaultVoice }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
+      // 「默认」是跟随配置/目录第一个的动态项，把实际音色带上，免得和下面的显式项看起来一样。
+      const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
+      fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
       convertBtn.disabled = !s.ready;
       if (!s.ready && s.detail) msg.textContent = s.detail;
     }
