@@ -370,10 +370,20 @@ export class RvcWorld implements World {
   private async restartEngine(): Promise<void> {
     await this.engine?.stop();
     if (this.stopped) return;
-    // 可能改过推理档/运行时：按当前配置重建 venv 与引擎（venv 的 base 变了会在下次安装时重建）。
+    // 可能改过推理档/运行时：按当前配置重建 venv 与引擎（venv 的 base 变了会自动重建）。
     this.setup();
-    void this.venv?.check();
-    this.bootEngine();
+    const venv = this.venv;
+    if (!venv) return;
+    await venv.check();
+    if (this.stopped) return;
+    if (venv.state().phase === 'ready') {
+      this.bootEngine();
+      return;
+    }
+    // 切了推理档或依赖没装：重建派生 venv，装完再拉起引擎，面板能看到「安装中」。
+    void venv.ensure().then(() => {
+      if (!this.stopped && venv.state().phase === 'ready') this.bootEngine();
+    });
   }
 
   /** 面板上传一条音频：走和 HTTP 接口同一套校验与本机文件转换，回二进制。 */
