@@ -68,9 +68,23 @@ const voiceFile = (path: string, bytes: number, sha256: string): PinnedFile => (
   sources: [`${MS_OWN}/voices/${path}`, `${GH_OWN}/${path}`],
 });
 
+/** 官方 DaFeiYu（显示名「星落落大肥鱼」）的落盘 ID；与自训的 `daifeiyu`（小肥鱼）区分开。 */
+export const OFFICIAL_VOICE = 'xll';
+
+/** 官方模型只在上游 Hugging Face：先 hf-mirror，再原站（国内多半不通，只当兜底）。 */
+const OFFICIAL_VOICE_PATH = 'YukiKaze1337/DaFeiYu_rvc_v2_40k/resolve/main';
+const officialVoiceFile = (path: string, remote: string, bytes: number, sha256: string): PinnedFile => ({
+  path,
+  bytes,
+  sha256,
+  sources: [`${HF_MIRROR}/${OFFICIAL_VOICE_PATH}/${remote}`, `${HF}/${OFFICIAL_VOICE_PATH}/${remote}`],
+});
+
 export const VOICE_FILES: readonly PinnedFile[] = [
   voiceFile(`${SAMPLE_VOICE}.pth`, 55223661, 'ff64ca1e5978073058882fc86ebd68acd5ac0b1a7d846e6d0c0137b7bf582a02'),
   voiceFile(`${SAMPLE_VOICE}.index`, 266765099, '3387bece70af26610f80858d52e8d7343ffc6904b95c73f6006ca7c302568196'),
+  officialVoiceFile(`${OFFICIAL_VOICE}.pth`, 'dafeiyu.pth', 55229202, 'eaa043e9329fa7a6c9002ccff4efe7667d42ab8187eb5f9297c5f2b2628c9935'),
+  officialVoiceFile(`${OFFICIAL_VOICE}.index`, 'added_IVF1314_Flat_nprobe_1_dafeiyu_v2.index', 161949619, '01da84f7efd48f713835e6dfc87f9ee865cd0e223f8bc40eb35b15696b0058a7'),
 ];
 
 /** 两类资产总字节，面板显示总量用。 */

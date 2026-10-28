@@ -1,6 +1,6 @@
 {
   "name": "@wocwang/cortico-world-rvc-for-coopanion",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "type": "module",
   "description": "Cortico World for Coopanion: voice conversion with RVC — upload any audio and get it back in the pet's voice, plus a local HTTP endpoint (127.0.0.1:9881) for other plugins",
   "author": "wocwang",
