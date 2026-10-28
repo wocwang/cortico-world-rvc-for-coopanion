@@ -3,9 +3,14 @@ import { pick, type Language } from 'cortico/core/language.ts';
 
 export const RVC_ID = 'rvc';
 
+/** 推理档：沿用 gpt-sovits 的口径，`auto` 检测 NVIDIA 显卡后优先 CUDA 档运行时。 */
+export type RvcTier = 'auto' | 'cuda' | 'cpu';
+
 /** config.json 的 `worlds.rvc` 段。 */
 export interface RvcConfigSection {
   enabled: boolean;
+  /** 推理档；改档后重建派生 venv 并重启引擎生效。 */
+  tier: RvcTier;
   /**
    * RVC 推理代码目录。空为扩展包自带的 `vendor/rvc`（只含源码，不含权重）。
    */
@@ -50,6 +55,7 @@ export const DEFAULT_PORT = 9881;
 
 export const RVC_DEFAULTS: RvcConfigSection = {
   enabled: false,
+  tier: 'auto',
   codeDir: '',
   assetsDir: '',
   pythonPath: '',
@@ -66,11 +72,18 @@ export const RVC_DEFAULTS: RvcConfigSection = {
 
 const K = `worlds.${RVC_ID}`;
 
+/** `x-options` 的选项源，由定义的 `configOptions` 给出。 */
+export const TIER_OPTIONS = `${RVC_ID}:tier`;
+
 const TEXT = {
   zh: {
     title: 'RVC 变声',
-    groupConvert: { title: '变声参数', description: '默认音色与三个推理参数；面板上传时还可以逐次覆盖。' },
+    groupConvert: { title: '变声参数', description: '推理档、默认音色与三个推理参数；面板上传时还可以逐次覆盖。' },
     groupService: { title: '运行与接口', description: '推理代码、派生 venv 与音色目录，以及给其他插件用的本机 HTTP 接口。' },
+    tier: { title: '推理档', description: '自动：检测到 NVIDIA 显卡就用显卡档，否则 CPU 档。显卡档的派生 venv 基于 CUDA 运行时，变声快很多；改档后在面板点「重启引擎」生效，切档会自动重建 venv。' },
+    tierAuto: '自动',
+    tierCuda: '显卡（NVIDIA）',
+    tierCpu: 'CPU',
     voice: { title: '默认音色', description: 'voices 目录里 .pth 的文件名（不含扩展名）；留空用第一个。同名 .index 有则自动带上。' },
     pitch: { title: '变调（半音）', description: '0 为原调；男声转女声一般 +12 左右。' },
     indexRate: { title: '索引率', description: '0..1，越高越贴近音色、但可能带出素材口音；该音色没有 .index 时忽略。' },
@@ -86,8 +99,12 @@ const TEXT = {
   },
   en: {
     title: 'RVC Voice Changer',
-    groupConvert: { title: 'Conversion', description: 'Default voice and the three inference knobs; the panel can override them per upload.' },
+    groupConvert: { title: 'Conversion', description: 'Inference tier, default voice and the three inference knobs; the panel can override them per upload.' },
     groupService: { title: 'Runtime and API', description: 'Inference code, derived venv, voices folder, and the loopback HTTP endpoint for other plugins.' },
+    tier: { title: 'Inference tier', description: 'Auto uses the GPU tier when an NVIDIA GPU is detected, otherwise CPU. The GPU tier builds the derived venv on the CUDA runtime and is much faster; after changing this, click Restart engine — switching tiers rebuilds the venv automatically.' },
+    tierAuto: 'Auto',
+    tierCuda: 'GPU (NVIDIA)',
+    tierCpu: 'CPU',
     voice: { title: 'Default voice', description: 'A .pth file name in the voices folder without the extension; empty uses the first one. A matching .index is picked up automatically.' },
     pitch: { title: 'Pitch (semitones)', description: '0 keeps the original key; a male voice to female is usually around +12.' },
     indexRate: { title: 'Index rate', description: '0..1; higher sticks closer to the voice but may leak the source accent. Ignored when the voice has no .index.' },
@@ -115,6 +132,7 @@ export function configGroups(language: Language): ConfigGroup[] {
         title: t.groupConvert.title,
         description: t.groupConvert.description,
         properties: {
+          [`${K}.tier`]: { type: 'string', title: t.tier.title, description: t.tier.description, 'x-options': TIER_OPTIONS, 'x-hot': true },
           [`${K}.voice`]: { type: 'string', title: t.voice.title, description: t.voice.description, 'x-hot': true },
           [`${K}.pitch`]: { type: 'number', title: t.pitch.title, description: t.pitch.description, minimum: PITCH_MIN, maximum: PITCH_MAX, multipleOf: 1, 'x-hot': true },
           [`${K}.indexRate`]: { type: 'number', title: t.indexRate.title, description: t.indexRate.description, minimum: 0, maximum: 1, multipleOf: 0.05, 'x-hot': true },
@@ -146,4 +164,14 @@ export function configGroups(language: Language): ConfigGroup[] {
 
 export function worldLabel(language: Language): string {
   return pick(language, TEXT).title;
+}
+
+/** 推理档下拉的选项；与 gpt-sovits 的「自动 / 显卡 / CPU」同一个口径。 */
+export function tierOptions(language: Language): Array<{ value: RvcTier; label: string }> {
+  const t = pick(language, TEXT);
+  return [
+    { value: 'auto', label: t.tierAuto },
+    { value: 'cuda', label: t.tierCuda },
+    { value: 'cpu', label: t.tierCpu },
+  ];
 }

@@ -6,8 +6,8 @@
  * 已经能 `import faiss, parselmouth` 就不动它，所以重复点安装是安全的。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
 
 export type VenvPhase = 'absent' | 'working' | 'ready' | 'error';
@@ -50,6 +50,11 @@ export class RvcVenv {
   /** 只探一次：venv 已经能 import 就标就绪，不用等用户点安装。 */
   async check(): Promise<VenvState> {
     if (this.running || this.st.phase === 'ready') return this.state();
+    // 推理档换了：旧 venv 的 base 是另一档运行时，先别探测，等面板「一键安装」重建。
+    if (!this.baseMatches()) {
+      this.st = { phase: 'absent', detail: '推理档变了，需要重建派生 venv' };
+      return this.state();
+    }
     if (await this.probe()) this.st = { phase: 'ready', detail: null };
     return this.state();
   }
@@ -69,6 +74,15 @@ export class RvcVenv {
   private async run(): Promise<void> {
     this.tail = [];
     this.st = { phase: 'working', detail: '检查依赖' };
+    if (!this.baseMatches()) {
+      this.st = { phase: 'working', detail: '推理档变了，重建派生 venv' };
+      try {
+        rmSync(this.venvRoot(), { recursive: true, force: true });
+      } catch (err) {
+        this.st = { phase: 'error', detail: `删除旧 venv 失败：${err instanceof Error ? err.message : String(err)}` };
+        return;
+      }
+    }
     if (await this.probe()) { this.st = { phase: 'ready', detail: null }; return; }
     const { pythonPath, basePython } = this.opts;
     // 没有 base 就长不出 venv：先把「装 gpt-sovits 运行时」这条讲清楚，别只报 pip 错。
@@ -97,6 +111,22 @@ export class RvcVenv {
   /** venv 根：`<root>/Scripts/python.exe` 往上两级。 */
   private venvRoot(): string {
     return dirname(dirname(this.opts.pythonPath));
+  }
+
+  /**
+   * 派生 venv 是否仍以当前 base 运行时为底：读 `pyvenv.cfg` 的 `home`。
+   * 没有 base、没有 venv 或读不到 cfg 时按匹配处理（不擅自删用户目录）。
+   */
+  private baseMatches(): boolean {
+    if (!this.opts.basePython) return true;
+    try {
+      const cfg = readFileSync(join(this.venvRoot(), 'pyvenv.cfg'), 'utf8');
+      const home = /^\s*home\s*=\s*(.+)$/mi.exec(cfg)?.[1]?.trim();
+      if (!home) return true;
+      return resolve(home) === resolve(dirname(this.opts.basePython));
+    } catch {
+      return true;
+    }
   }
 
   private async probe(): Promise<boolean> {

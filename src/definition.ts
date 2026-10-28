@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runtimesRoot } from 'cortico/paths.ts';
 import type { WorldDefinition, WorldDescribe } from 'cortico/world.ts';
-import { RVC_DEFAULTS, RVC_ID, type RvcConfigSection } from './config.ts';
+import { RVC_DEFAULTS, RVC_ID, TIER_OPTIONS, tierOptions, type RvcConfigSection } from './config.ts';
 import { RvcWorld } from './world.ts';
 
 /** 本 World 不注册工具、不发事件：它只提供 HTTP 接口与面板。 */
@@ -20,6 +20,10 @@ export const RVC: WorldDefinition<RvcConfigSection> = {
   id: RVC_ID,
   label: 'RVC 变声',
   defaults: () => structuredClone(RVC_DEFAULTS),
+  configOptions(kind, language) {
+    if (kind === TIER_OPTIONS) return tierOptions(language);
+    return [];
+  },
   // ctx.cfg 是 `worlds.rvc` 的活引用：http 开关、参数改了现读即生效
   create: (ctx) => new RvcWorld({
     cfg: ctx.cfg,

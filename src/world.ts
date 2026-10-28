@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
 import type { Logger, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
-import { configGroups, DEFAULT_PORT, RVC_ID, worldLabel, type RvcConfigSection } from './config.ts';
+import { configGroups, DEFAULT_PORT, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
 import { RvcEngine, RvcError, type EngineState } from './engine.ts';
 import { RvcInstaller } from './install.ts';
 import { readConvertJob, startConvertServer, type ConvertDeps, type ConvertJob, type ConvertServerHandle } from './server.ts';
@@ -31,24 +31,34 @@ export interface RvcWorldOptions {
   runtimesRoot: () => string;
 }
 
-/** 在 `<runtimesRoot>/gpt-sovits/<版本>/<档>/runtime/python.exe` 里挑一个最新的可用运行时。 */
-export function findRuntimeDir(runtimesRoot: string): string {
+/** 在 `<runtimesRoot>/gpt-sovits/<版本>/<档>/runtime/python.exe` 里挑一个可用运行时。
+ *  `auto`/`cuda` 优先 CUDA 档（auto 没有 CUDA 运行时则回退 CPU），`cpu` 只用 CPU 档。 */
+export function findRuntimeDir(
+  runtimesRoot: string,
+  preferred: RvcTier = 'auto',
+): { dir: string; tier: 'cuda' | 'cpu' } {
   const root = join(runtimesRoot, 'gpt-sovits');
-  if (!existsSync(root)) return '';
-  let best = '';
-  let bestTime = 0;
+  const fallback: { dir: string; tier: 'cuda' | 'cpu' } = { dir: '', tier: preferred === 'cpu' ? 'cpu' : 'cuda' };
+  if (!existsSync(root)) return fallback;
   let versions: string[] = [];
-  try { versions = readdirSync(root); } catch { return ''; }
-  for (const version of versions) {
-    for (const tier of ['cuda', 'cpu']) {
+  try { versions = readdirSync(root); } catch { return fallback; }
+  const order: Array<'cuda' | 'cpu'> = preferred === 'cpu' ? ['cpu'] : ['cuda', 'cpu'];
+  const ranked = versions.map((version) => {
+    let time = 0;
+    for (const tier of order) {
+      try { time = Math.max(time, statSync(join(root, version, tier, 'cortico-runtime.json')).mtimeMs); } catch {
+        try { time = Math.max(time, statSync(join(root, version, tier)).mtimeMs); } catch { /* 未装这一档 */ }
+      }
+    }
+    return { version, time };
+  }).sort((a, b) => b.time - a.time);
+  for (const { version } of ranked) {
+    for (const tier of order) {
       const dir = join(root, version, tier);
-      if (!existsSync(join(dir, 'runtime', 'python.exe'))) continue;
-      let time = 0;
-      try { time = statSync(join(dir, 'cortico-runtime.json')).mtimeMs; } catch { time = statSync(dir).mtimeMs; }
-      if (time > bestTime) { best = dir; bestTime = time; }
+      if (existsSync(join(dir, 'runtime', 'python.exe'))) return { dir, tier };
     }
   }
-  return best;
+  return fallback;
 }
 
 /** 音色目录里第一个 `.pth`（去掉扩展名）；没有返回空。 */
@@ -84,6 +94,8 @@ export class RvcWorld implements World {
   private voicesDir = '';
   private pythonPath = '';
   private runtimeDir = '';
+  /** 实际用的运行时档（`''` 表示自备运行时，判断不了）。 */
+  private runtimeTier: 'cuda' | 'cpu' | '' = '';
   /** 最近一次面板转换的结果，面板渲染用。 */
   private lastConvert: { at: number; ms: number; bytes: number; savedPath: string | null; voice: string; format: string } | null = null;
 
@@ -125,17 +137,28 @@ export class RvcWorld implements World {
     this.log = host.log;
     this.stopped = false;
     this.launchDetail = '';
+    this.setup();
+    // 就绪可能要十几秒；先让 World 挂上，接口立刻能答 `ready=false`。
+    this.bootEngine();
+    // 已有的派生 venv 不必等用户点安装：后台探一次，面板直接显示就绪。
+    void this.venv?.check();
+    if (this.opts.cfg.httpApi) void this.startHttp();
+  }
+
+  /** 按当前配置解析路径并（重）建 installer / venv / engine；改推理档后重启引擎会再走一遍。 */
+  private setup(): void {
     const paths = this.paths();
     this.codeDir = paths.codeDir;
     this.assetsDir = paths.assetsDir;
     this.voicesDir = paths.voicesDir;
     this.pythonPath = paths.pythonPath;
     this.runtimeDir = paths.runtimeDir;
+    this.runtimeTier = paths.runtimeTier;
     this.installer = new RvcInstaller(paths.assetsDir, paths.voicesDir);
     this.venv = new RvcVenv({
       pythonPath: paths.pythonPath,
       basePython: paths.runtimeDir ? join(paths.runtimeDir, 'runtime', 'python.exe') : '',
-      log: this.log,
+      log: this.log ?? undefined,
     });
     this.engine = new RvcEngine({
       pythonPath: paths.pythonPath,
@@ -145,13 +168,8 @@ export class RvcWorld implements World {
       scriptPath: WORKER_SCRIPT,
       voice: this.opts.cfg.voice.trim() || firstVoice(paths.voicesDir),
       runtimeDir: paths.runtimeDir || undefined,
-      log: this.log,
+      log: this.log ?? undefined,
     });
-    // 就绪可能要十几秒；先让 World 挂上，接口立刻能答 `ready=false`。
-    this.bootEngine();
-    // 已有的派生 venv 不必等用户点安装：后台探一次，面板直接显示就绪。
-    void this.venv.check();
-    if (this.opts.cfg.httpApi) void this.startHttp();
   }
 
   async stop(): Promise<void> {
@@ -186,15 +204,20 @@ export class RvcWorld implements World {
     return { ready: !!this.engine?.ready(), device: st?.device ?? null, model: st?.model ?? null };
   }
 
-  private paths(): { codeDir: string; pythonPath: string; runtimeDir: string; voicesDir: string; assetsDir: string } {
+  private paths(): { codeDir: string; pythonPath: string; runtimeDir: string; runtimeTier: 'cuda' | 'cpu' | ''; voicesDir: string; assetsDir: string } {
     const dataDir = this.opts.dataDir;
-    const runtimeDir = this.opts.cfg.runtimeDir.trim() || findRuntimeDir(this.opts.runtimesRoot());
+    // 自备运行时判断不了档位；托管运行时按配置的推理档挑（auto 优先 CUDA）。
+    const own = this.opts.cfg.runtimeDir.trim();
+    const picked = own
+      ? { dir: own, tier: '' as const }
+      : findRuntimeDir(this.opts.runtimesRoot(), this.opts.cfg.tier);
     return {
       // 代码随包走（vendor/rvc，只读）；权重与音色在数据目录。
       codeDir: this.opts.cfg.codeDir.trim() || join(this.opts.packageDir, 'vendor', 'rvc'),
       assetsDir: this.opts.cfg.assetsDir.trim() || join(dataDir, 'assets'),
       pythonPath: this.opts.cfg.pythonPath.trim() || join(dataDir, 'venv', 'Scripts', 'python.exe'),
-      runtimeDir,
+      runtimeDir: picked.dir,
+      runtimeTier: picked.tier,
       voicesDir: this.opts.cfg.voicesDir.trim() || join(dataDir, 'voices'),
     };
   }
@@ -295,6 +318,8 @@ export class RvcWorld implements World {
     return {
       phase: st?.phase ?? 'stopped',
       ready: this.health().ready,
+      tier: this.opts.cfg.tier,
+      runtimeTier: this.runtimeTier,
       device: st?.device ?? null,
       model: st?.model ?? null,
       startMs: st?.startMs ?? null,
@@ -345,6 +370,9 @@ export class RvcWorld implements World {
   private async restartEngine(): Promise<void> {
     await this.engine?.stop();
     if (this.stopped) return;
+    // 可能改过推理档/运行时：按当前配置重建 venv 与引擎（venv 的 base 变了会在下次安装时重建）。
+    this.setup();
+    void this.venv?.check();
     this.bootEngine();
   }
 
