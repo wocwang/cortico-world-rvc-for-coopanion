@@ -5,11 +5,15 @@
  * 为 base（`--system-site-packages`，白拿 torch / torchaudio / ffmpeg / CUDA）。这份运行时本来由
  * gpt-sovits 插件下载；没装它的时候，这里照同一份清单自己下一份，装好的目录布局与它完全一致
  * （含 `cortico-runtime.json`），三个插件共用同一份，谁先装都一样。
+ *
+ * 下载实测（2026-10-29，国内家宽直连）：魔搭 CDN 单连接被限到约 0.1–0.3 MB/s，6 个连接并行能到 5–6 MB/s，
+ * 所以大文件按 64 MB 一片、最多 8 路并行；每片各自断点续传，拼成整包后再校验大小与 SHA-256。
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { once } from 'node:events';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs';
+import { join, resolve, dirname, basename } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
 
 export const RUNTIME_ID = 'gpt-sovits';
@@ -26,6 +30,10 @@ export interface RuntimeAsset {
   bytes: number;
   sha256: string;
   sources: readonly string[];
+  /** 解压后大约占多少字节（实测 CPU 档 2.06 GB、显卡档 10.5 GB），磁盘预检用。 */
+  extractBytes?: number;
+  /** 分片数；不填按 64 MB 一片。测试注入小文件时用，省得造几十 MB 的样例。 */
+  segments?: number;
 }
 
 /** 显卡档只有魔搭放整包（GitHub 单附件 2 GiB 上限，那边是分片）；CPU 档两处都有。 */
@@ -34,12 +42,14 @@ export const RUNTIME_ASSETS: Readonly<Record<'cuda' | 'cpu', RuntimeAsset>> = {
     file: CUDA_FILE,
     bytes: 4140732064,
     sha256: '87c775a93f9b13195b83bc2901a6176f771e31076bc051acf07a5ccca1db7a78',
+    extractBytes: 11300000000,
     sources: [`${MS_OWN}/runtime/${CUDA_FILE}`],
   },
   cpu: {
     file: CPU_FILE,
     bytes: 1036310624,
     sha256: '9ce348074e941388544b4db072ee0b9cfc50c9bd420e61f13ee9364fe90152e1',
+    extractBytes: 2210000000,
     sources: [`${MS_OWN}/runtime/${CPU_FILE}`, `${GH_OWN}/${CPU_FILE}`],
   },
 };
@@ -62,6 +72,20 @@ export function runtimeReady(dir: string): boolean {
 }
 
 const PROBE_TIMEOUT_MS = 15_000;
+/** 一片 64 MB：1 GB 的 CPU 档 16 片，4.1 GB 的显卡档 65 片，慢连接不至于拖死整包。 */
+const SEGMENT_BYTES = 64 * 1024 * 1024;
+/** 同时在跑的分片数。实测 6 路就能跑满带宽，8 路留点余量。 */
+const SEGMENT_PARALLEL = 8;
+/** 小于这个就不折腾分片了，单连接直下。 */
+const SEGMENT_MIN_BYTES = 32 * 1024 * 1024;
+/** 多久没收到一个字节算「连接卡死」。魔搭 CDN 会偶发不动，掐断重连能接着下。 */
+const IDLE_TIMEOUT_MS = 45_000;
+/** 一个来源最多试几次。 */
+const ATTEMPTS = 3;
+
+const sizeOf = (file: string): number => {
+  try { return statSync(file).size; } catch { return 0; }
+};
 
 /** Windows 10 起自带 bsdtar，能解 zip；PATH 上靠前的 Git tar 不认 zip，所以写全路径。 */
 function extract(archive: string, into: string): Promise<void> {
@@ -75,52 +99,237 @@ function extract(archive: string, into: string): Promise<void> {
   });
 }
 
-/** 下载一个文件；`resume` 时从已有字节接着下（魔搭签名地址会过期，重试拿到的是新签名）。 */
-async function download(url: string, dest: string, progress: (bytes: number) => void, signal: AbortSignal, resume = false): Promise<void> {
-  const existing = resume && existsSync(dest) ? statSync(dest).size : 0;
-  const res = await fetch(url, {
-    signal,
-    redirect: 'follow',
-    headers: existing > 0 ? { range: `bytes=${existing}-` } : undefined,
-  });
-  if (!res.ok || !res.body) {
-    if (res.status === 416 && existing > 0) return;
-    throw new Error(`HTTP ${res.status}`);
-  }
-  const append = existing > 0 && res.status === 206;
-  if (!append && existing > 0) rmSync(dest, { force: true });
-  const out = createWriteStream(dest, { flags: append ? 'a' : 'w' });
-  try {
-    for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-      const buf = Buffer.from(chunk);
-      progress(buf.length);
-      if (!out.write(buf)) await new Promise<void>((done) => out.once('drain', done));
-    }
-  } catch (err) {
-    out.destroy();
-    throw err;
-  }
-  await new Promise<void>((done, fail) => { out.end(() => done()); out.once('error', fail); });
+/** 服务器不理 Range（回 200 而不是 206）：分片白搭，退回去单连接整段下。 */
+class NoRangeError extends Error {}
+/** 校验失败：数据本身不对，必须扔掉重下，不能续传。 */
+class VerifyError extends Error {}
+
+/** `fetch failed` 本身没有信息量；把 undici 塞在 cause 里的真正原因（ECONNREFUSED、挂断）带出来。 */
+function describe(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause instanceof Error && cause.message) return `${err.message}（${cause.message}）`;
+  if (typeof cause === 'string' && cause) return `${err.message}（${cause}）`;
+  return err.message;
 }
 
-/** 下载前看一眼目标盘剩余空间：要「下载 + 解压」双份余量，不然会下到 100% 才在解压那步失败。 */
-function assertFreeSpace(dir: string, needBytes: number): void {
+/**
+ * 一个地址下到 `dest`，`existing` 是 `dest` 里已经有的字节数（续传起点）。
+ * `range` 给出这次要的绝对区间（分片用）：给了就必须拿到 206，否则抛 `NoRangeError`，
+ * 免得把错位的字节拼进分片。每收到一块就重置空闲计时，卡住不动会掐断这次连接。
+ */
+async function pull(opts: {
+  url: string;
+  dest: string;
+  existing: number;
+  range?: { from: number; to: number };
+  onBytes: (size: number) => void;
+  signal: AbortSignal;
+}): Promise<void> {
+  const { url, dest, existing, range, onBytes, signal } = opts;
+  const header = range ? `bytes=${range.from}-${range.to - 1}` : existing > 0 ? `bytes=${existing}-` : undefined;
+  const idle = new AbortController();
+  let timer: NodeJS.Timeout | null = null;
+  const arm = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => idle.abort(), IDLE_TIMEOUT_MS);
+  };
+  try {
+    arm();
+    const res = await fetch(url, {
+      signal: AbortSignal.any([signal, idle.signal]),
+      redirect: 'follow',
+      headers: header ? { range: header } : undefined,
+    });
+    arm();
+    if (res.status === 416 && existing > 0) { await res.body?.cancel(); return; }
+    if (range && res.status !== 206) {
+      await res.body?.cancel();
+      throw new NoRangeError('服务器不支持分段下载');
+    }
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+    const append = existing > 0 && res.status === 206;
+    if (!append && existing > 0) rmSync(dest, { force: true });
+    const out = createWriteStream(dest, { flags: append ? 'a' : 'w' });
+    let written = append ? existing : 0;
+    try {
+      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+        const buf = Buffer.from(chunk);
+        // 等磁盘落盘（背压）不算「连接空闲」：这段时间掐掉空闲计时，写完再重新起表。
+        if (!out.write(buf)) {
+          if (timer) { clearTimeout(timer); timer = null; }
+          await once(out, 'drain');
+        }
+        arm();
+        written += buf.length;
+        onBytes(written);
+      }
+    } catch (err) {
+      out.destroy();
+      throw err;
+    }
+    await new Promise<void>((done, fail) => {
+      out.once('error', fail);
+      out.end(() => done());
+    });
+  } catch (err) {
+    if (idle.signal.aborted && !signal.aborted) {
+      throw new Error(`连接 ${IDLE_TIMEOUT_MS / 1000} 秒没有数据，已断开重试`);
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+interface Segment { file: string; start: number; end: number }
+
+/** 分片计划：每片一个 `<归档>.<i>.part`，片内自带续传位置。 */
+function segmentPlan(total: number, archive: string, segments?: number): Segment[] {
+  const count = Math.max(1, segments ?? Math.ceil(total / SEGMENT_BYTES));
+  const size = Math.ceil(total / count);
+  const plan: Segment[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const start = i * size;
+    if (start >= total) break;
+    plan.push({ file: `${archive}.${i}.part`, start, end: Math.min(total, start + size) });
+  }
+  return plan;
+}
+
+/** 分片依次拼成归档，拼完一片就删一片（磁盘最多多占一片，不再需要整包副本）。 */
+async function joinSegments(archive: string, plan: Segment[]): Promise<void> {
+  const out = createWriteStream(archive, { flags: 'w' });
+  try {
+    for (const part of plan) {
+      for await (const chunk of createReadStream(part.file)) {
+        if (!out.write(chunk as Buffer)) await once(out, 'drain');
+      }
+      rmSync(part.file, { force: true });
+    }
+  } finally {
+    await new Promise<void>((done, fail) => {
+      out.once('error', fail);
+      out.end(() => done());
+    });
+  }
+}
+
+/** 并行下所有分片；全部到位后拼成归档。任一片失败就掐掉其他片，交给上层重试。 */
+async function downloadSegments(
+  url: string,
+  archive: string,
+  total: number,
+  segments: number | undefined,
+  progress: (bytes: number) => void,
+  signal: AbortSignal,
+  onPhase?: (text: string) => void,
+): Promise<void> {
+  const plan = segmentPlan(total, archive, segments);
+  const got = plan.map((part) => Math.min(sizeOf(part.file), part.end - part.start));
+  const report = (): void => progress(got.reduce((a, b) => a + b, 0));
+  report();
+  const group = new AbortController();
+  const merged = AbortSignal.any([signal, group.signal]);
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (!merged.aborted) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= plan.length) return;
+      const part = plan[index]!;
+      if (got[index]! >= part.end - part.start) continue;
+      await pull({
+        url,
+        dest: part.file,
+        existing: got[index]!,
+        range: { from: part.start + got[index]!, to: part.end },
+        onBytes: (size) => { got[index] = size; report(); },
+        signal: merged,
+      });
+    }
+  };
+  const results = await Promise.allSettled(Array.from({ length: Math.min(SEGMENT_PARALLEL, plan.length) }, worker));
+  group.abort();
+  const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (failed) throw failed.reason;
+  const short = plan.find((part, i) => got[i] !== part.end - part.start);
+  if (short) throw new Error(`分片 ${short.file} 没下满（${got[plan.indexOf(short)]}/${short.end - short.start}）`);
+  // 分片都齐了：进度已经到了总量，但还要拼成归档才作数；拼接期间告诉面板在做什么。
+  onPhase?.('正在拼接归档');
+  await joinSegments(archive, plan);
+  progress(total);
+  clearSegments(archive); // 上次取消留下的、不在本次计划里的旧分片
+  onPhase?.('');
+}
+
+/** 下载失败/回退到单连接时把手里的分片删掉：不然会混进最终解压目录。 */
+function clearSegments(archive: string): void {
+  const dir = dirname(archive);
+  const prefix = `${basename(archive)}.`;
+  try {
+    for (const name of readdirSync(dir)) {
+      if (name.startsWith(prefix)) rmSync(join(dir, name), { force: true });
+    }
+  } catch {
+    /* 目录不在了就算了 */
+  }
+}
+
+/** 大文件走分片并行，服务器不支持 Range 就退回单连接整段下。 */
+async function downloadAuto(
+  url: string,
+  archive: string,
+  total: number,
+  segments: number | undefined,
+  progress: (bytes: number) => void,
+  signal: AbortSignal,
+  onPhase?: (text: string) => void,
+): Promise<void> {
+  // `segments` 显式给定时（测试）不管文件多小都走分片，好用小样例跑完整流程。
+  if (segments !== undefined || total >= SEGMENT_MIN_BYTES) {
+    try {
+      await downloadSegments(url, archive, total, segments, progress, signal, onPhase);
+      return;
+    } catch (err) {
+      if (signal.aborted || !(err instanceof NoRangeError)) throw err;
+      clearSegments(archive);
+      progress(0);
+    }
+  }
+  const existing = Math.min(sizeOf(archive), total);
+  await pull({ url, dest: archive, existing, onBytes: progress, signal });
+}
+
+/** 剩余空间；拿不到就返回 null：宁可继续，也不因为探测失败拦住用户。 */
+function freeBytes(dir: string): number | null {
   try {
     const stats = statfsSync(dir);
-    const free = Number(stats.bavail) * Number(stats.bsize);
-    const need = Math.ceil(needBytes * 2.2) + 512 * 1024 * 1024;
-    if (free < need) {
-      const gb = (n: number): string => (n / 1024 ** 3).toFixed(1);
-      throw new Error(`磁盘空间不足：还要约 ${gb(need)} GB（下载 + 解压），目标盘只剩 ${gb(free)} GB`);
-    }
-  } catch (err) {
-    if (err instanceof Error && err.message.startsWith('磁盘空间不足')) throw err;
+    return Number(stats.bavail) * Number(stats.bsize);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 下载前看一眼目标盘：要「压缩包 + 解压后目录」一起放得下，不然会下到 100% 才在解压那步失败。
+ * 注意目标目录这时还不存在（statfs 会 ENOENT），所以拿已经建好的 `.partial` 探。
+ */
+function assertFreeSpace(dir: string, asset: RuntimeAsset): void {
+  const free = freeBytes(dir);
+  if (free === null) return;
+  const unpacked = asset.extractBytes ?? asset.bytes * 3;
+  const need = Math.ceil(asset.bytes * 1.2) + unpacked + 512 * 1024 * 1024;
+  if (free < need) {
+    const gb = (n: number): string => (n / 1024 ** 3).toFixed(1);
+    throw new Error(
+      `磁盘空间不足：这一档下载 ${gb(asset.bytes)} GB、解压后约 ${gb(unpacked)} GB，要预留 ${gb(need)} GB；目标盘只剩 ${gb(free)} GB。可以清一下盘，或在配置里指一个别处的「共享运行时目录」`,
+    );
   }
 }
 
 async function sha256File(path: string): Promise<string> {
   const hash = createHash('sha256');
-  const { createReadStream } = await import('node:fs');
   await new Promise<void>((done, fail) => {
     const stream = createReadStream(path);
     stream.on('data', (chunk) => hash.update(chunk));
@@ -187,36 +396,52 @@ export class RuntimeInstall {
     return this.running;
   }
 
+  /** 归档与分片已经落在盘上的字节数（不含解压出来的东西）。 */
+  private diskBytes(archive: string): number {
+    const whole = Math.min(sizeOf(archive), this.asset.bytes);
+    if (whole > 0) return whole;
+    const plan = segmentPlan(this.asset.bytes, archive, this.asset.segments);
+    return plan.reduce((n, part) => n + Math.min(sizeOf(part.file), part.end - part.start), 0);
+  }
+
   private async work(signal: AbortSignal): Promise<void> {
     const dir = this.dir();
     const partial = `${dir}.partial`;
-    rmSync(partial, { recursive: true, force: true });
     mkdirSync(partial, { recursive: true });
     const archive = join(partial, this.asset.file);
-    assertFreeSpace(dir, this.asset.bytes);
+    // 只留这一档的归档与分片（跨次运行还能续传）；上次解压出来的残骸、别的包都清掉。
+    for (const name of readdirSync(partial)) {
+      if (name === this.asset.file || name.startsWith(`${this.asset.file}.`)) continue;
+      rmSync(join(partial, name), { recursive: true, force: true });
+    }
+    if (sizeOf(archive) > this.asset.bytes) rmSync(archive, { force: true });
+    assertFreeSpace(partial, this.asset);
     const errors: string[] = [];
     let ok = false;
     for (const url of this.asset.sources) {
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
+      for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
         try {
-          // 续传：断点前已下的字节继续用，重试会重新拿一次签名地址。
-          this.st.done = existsSync(archive) ? statSync(archive).size : 0;
-          await download(url, archive, (n) => { this.st.done += n; }, signal, true);
-          if (statSync(archive).size !== this.asset.bytes) throw new Error(`大小 ${statSync(archive).size}，应为 ${this.asset.bytes}`);
+          this.st.detail = attempt > 1 ? `${this.asset.file}（第 ${attempt} 次重试）` : this.asset.file;
+          this.st.done = this.diskBytes(archive);
+          await downloadAuto(url, archive, this.asset.bytes, this.asset.segments, (n) => { this.st.done = n; }, signal, (text) => {
+            this.st.detail = text || this.asset.file;
+          });
+          if (statSync(archive).size !== this.asset.bytes) throw new VerifyError(`大小 ${statSync(archive).size}，应为 ${this.asset.bytes}`);
           if (await sha256File(archive) !== this.asset.sha256) {
             rmSync(archive, { force: true });
-            throw new Error('SHA-256 不符');
+            throw new VerifyError('SHA-256 不符');
           }
           ok = true;
           break;
         } catch (err) {
           if (signal.aborted) throw err;
-          errors.push(`${url}${attempt > 1 ? `（第 ${attempt} 次）` : ''}：${err instanceof Error ? err.message : String(err)}`);
+          if (err instanceof VerifyError) rmSync(archive, { force: true });
+          errors.push(`${new URL(url).host}${attempt > 1 ? `（第 ${attempt} 次）` : ''}：${describe(err)}`);
         }
       }
       if (ok) break;
     }
-    if (!ok) throw new Error(errors.slice(-6).join('\n') || '没有下载来源');
+    if (!ok) throw new Error(`共享运行时下载失败：${errors.slice(-6).join('；') || '没有下载来源'}`);
     this.st.detail = '正在解压';
     await extract(archive, partial);
     rmSync(archive, { force: true });
