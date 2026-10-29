@@ -90,9 +90,9 @@ export class RvcVenv {
     }
     if (await this.probe()) { this.st = { phase: 'ready', detail: null }; return; }
     const { pythonPath, basePython } = this.opts;
-    // 没有 base 就长不出 venv：先把「装 gpt-sovits 运行时」这条讲清楚，别只报 pip 错。
+    // 没有 base 就长不出 venv：面板的「一键安装」会先下一份共享运行时，这里只说清还差什么。
     if (!existsSync(basePython) && !existsSync(pythonPath)) {
-      this.st = { phase: 'error', detail: `找不到 gpt-sovits 运行时（${basePython || '未填运行时目录'}），先装 gpt-sovits，或在配置里填「运行时目录」` };
+      this.st = { phase: 'error', detail: `还没有共享运行时（${basePython || '未填运行时目录'}）：点面板「安装」，会先下载运行时（CPU 约 1 GB / 显卡约 4 GB），或在配置里填「运行时目录」` };
       return;
     }
     if (!existsSync(pythonPath)) {

@@ -4,7 +4,7 @@ import type { Language } from 'cortico/core/language.ts';
 const TEXT = {
   zh: {
     serviceTitle: '服务',
-    serviceHint: 'RVC 推理服务、依赖与权重的状态；首次使用先点「一键安装」。占用：GPU 档约 0.6–0.8 GB 显存，CPU 档约 1–2 GB 内存。',
+    serviceHint: 'RVC 推理服务、依赖与权重的状态；首次使用先点「一键安装」。占用：显卡档约 1 GB 显存、内存约 2.5 GB（实测），CPU 档内存约 2–3 GB；启动约 25–30 秒。可与 gpt-sovits（说话）、DiffSinger 唱歌插件配合使用。',
     convertTitle: '变声',
     convertHint: '上传一段音频，换成桌宠的音色；试听后可再落盘。',
     voicesTitle: '音色',
@@ -72,7 +72,7 @@ const TEXT = {
   },
   en: {
     serviceTitle: 'Service',
-    serviceHint: 'RVC inference service, dependencies and weights. Click "Install" on first use.',
+    serviceHint: 'RVC inference service, dependencies and weights. Click "Install" on first use. Footprint: about 1 GB VRAM and 2.5 GB RAM on the GPU tier (measured), 2–3 GB RAM on the CPU tier; startup takes 25–30 s. Works together with gpt-sovits (speech) and the DiffSinger singing plugin.',
     convertTitle: 'Convert',
     convertHint: 'Upload a clip and get it back in the pet voice; preview, then keep the file.',
     voicesTitle: 'Voices',

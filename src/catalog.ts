@@ -38,13 +38,13 @@ const HF_MIRROR = 'https://hf-mirror.com';
 const HF = 'https://huggingface.co';
 const UPSTREAM_PATH = 'lj1995/VoiceConversionWebUI/resolve/main';
 
-/** 一个文件：自有魔搭 → hf-mirror → huggingface。`remote` 是上游仓库里的相对路径。 */
-function pinned(path: string, remote: string, bytes: number, sha256: string, mirrorPath = path): PinnedFile {
+/** 上游资产（hubert / rmvpe）：自有魔搭仓库没放这两个，走 hf-mirror 再退官方 HF。 */
+function pinnedUpstream(path: string, remote: string, bytes: number, sha256: string): PinnedFile {
   return {
     path,
     bytes,
     sha256,
-    sources: [`${MS_OWN}/${mirrorPath}`, `${HF_MIRROR}/${remote}`, `${HF}/${remote}`],
+    sources: [`${HF_MIRROR}/${remote}`, `${HF}/${remote}`],
   };
 }
 
@@ -54,10 +54,10 @@ function pinned(path: string, remote: string, bytes: number, sha256: string, mir
  * - `rmvpe/rmvpe.pt`：F0 提取器。
  */
 export const ASSET_FILES: readonly PinnedFile[] = [
-  pinned('hubert_base/config.json', `${UPSTREAM_PATH}/hubert_base/config.json`, 1492, '0346950779dfb7f9316fa74ed846e2b8a22a08eedfdc5387b73f327cb1a4a7cf'),
-  pinned('hubert_base/preprocessor_config.json', `${UPSTREAM_PATH}/hubert_base/preprocessor_config.json`, 225, '7c1976a680fb7acc757cd36fb08eef878fa36c70b4c9d2d595df9c608bbbbf0e'),
-  pinned('hubert_base/pytorch_model.bin', `${UPSTREAM_PATH}/hubert_base/pytorch_model.bin`, 189206711, 'cc8c20f4b90a520757260197a3ff2505705a7adbd20ad9eeaa4e1a9b38442ef5'),
-  pinned('rmvpe/rmvpe.pt', `${UPSTREAM_PATH}/rmvpe.pt`, 181184272, '6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193'),
+  pinnedUpstream('hubert_base/config.json', `${UPSTREAM_PATH}/hubert_base/config.json`, 1492, '0346950779dfb7f9316fa74ed846e2b8a22a08eedfdc5387b73f327cb1a4a7cf'),
+  pinnedUpstream('hubert_base/preprocessor_config.json', `${UPSTREAM_PATH}/hubert_base/preprocessor_config.json`, 225, '7c1976a680fb7acc757cd36fb08eef878fa36c70b4c9d2d595df9c608bbbbf0e'),
+  pinnedUpstream('hubert_base/pytorch_model.bin', `${UPSTREAM_PATH}/hubert_base/pytorch_model.bin`, 189206711, 'cc8c20f4b90a520757260197a3ff2505705a7adbd20ad9eeaa4e1a9b38442ef5'),
+  pinnedUpstream('rmvpe/rmvpe.pt', `${UPSTREAM_PATH}/rmvpe.pt`, 181184272, '6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193'),
 ];
 
 /** 自训音色，落到 `<dataDir>/voices`：自有魔搭仓库 → GitHub Release。索引落盘统一改名成同名 `.index`。 */

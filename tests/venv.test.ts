@@ -29,7 +29,7 @@ describe('派生 venv', () => {
     await venv.ensure();
     const state = venv.state();
     expect(state.phase).toBe('error');
-    expect(state.detail).toContain('gpt-sovits 运行时');
+    expect(state.detail).toContain('还没有共享运行时');
   });
 
   it('取消未开始的任务不会改状态', () => {

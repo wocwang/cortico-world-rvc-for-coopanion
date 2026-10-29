@@ -8,6 +8,7 @@
  * 本 World 不注册工具、不发事件：文字由 gpt-sovits 管，QQ 消息由 QQ 插件管。
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -18,6 +19,7 @@ import { RvcEngine, RvcError, type EngineState } from './engine.ts';
 import { RvcInstaller } from './install.ts';
 import { readConvertJob, startConvertServer, type ConvertDeps, type ConvertJob, type ConvertServerHandle } from './server.ts';
 import { RvcVenv } from './venv.ts';
+import { RuntimeInstall, installedTiers } from './runtime.ts';
 import { importVoiceFile, listVoices } from './voices.ts';
 import { panelText } from './webui/text.ts';
 
@@ -78,6 +80,20 @@ export function hasUvr5(codeDir: string): boolean {
   return !!codeDir && existsSync(join(codeDir, 'tools', 'uvr5'));
 }
 
+/**
+ * 有没有 NVIDIA 显卡：`auto` 档要先知道装哪一档共享运行时（显卡档 4 GB，CPU 档 1 GB）。
+ * 查不到就按 CPU 处理——反正装错了也只是慢，不会跑不起来。
+ */
+export function hasNvidia(): boolean {
+  if (process.platform !== 'win32') return false;
+  try {
+    execFileSync('nvidia-smi', ['-L'], { stdio: 'ignore', timeout: 4000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export class RvcWorld implements World {
   readonly id = RVC_ID;
   private readonly opts: RvcWorldOptions;
@@ -94,6 +110,9 @@ export class RvcWorld implements World {
   private voicesDir = '';
   private pythonPath = '';
   private runtimeDir = '';
+  /** 共享运行时（gpt-sovits 的运行时包）——没有就自己下一份，三个插件共用。 */
+  private runtime: RuntimeInstall | null = null;
+  private runtimesRoot = '';
   /** 实际用的运行时档（`''` 表示自备运行时，判断不了）。 */
   private runtimeTier: 'cuda' | 'cpu' | '' = '';
   /** 最近一次面板转换的结果，面板渲染用。 */
@@ -154,6 +173,8 @@ export class RvcWorld implements World {
     this.pythonPath = paths.pythonPath;
     this.runtimeDir = paths.runtimeDir;
     this.runtimeTier = paths.runtimeTier;
+    this.runtimesRoot = paths.runtimesRoot;
+    this.runtime = new RuntimeInstall({ root: paths.runtimesRoot, tier: this.wantedTier(), log: this.log ?? undefined });
     this.installer = new RvcInstaller(paths.assetsDir, paths.voicesDir);
     this.venv = new RvcVenv({
       pythonPath: paths.pythonPath,
@@ -204,14 +225,16 @@ export class RvcWorld implements World {
     return { ready: !!this.engine?.ready(), device: st?.device ?? null, model: st?.model ?? null };
   }
 
-  private paths(): { codeDir: string; pythonPath: string; runtimeDir: string; runtimeTier: 'cuda' | 'cpu' | ''; voicesDir: string; assetsDir: string } {
+  private paths(): { codeDir: string; pythonPath: string; runtimeDir: string; runtimeTier: 'cuda' | 'cpu' | ''; voicesDir: string; assetsDir: string; runtimesRoot: string } {
     const dataDir = this.opts.dataDir;
+    const runtimesRoot = this.opts.runtimesRoot();
     // 自备运行时判断不了档位；托管运行时按配置的推理档挑（auto 优先 CUDA）。
     const own = this.opts.cfg.runtimeDir.trim();
     const picked = own
       ? { dir: own, tier: '' as const }
-      : findRuntimeDir(this.opts.runtimesRoot(), this.opts.cfg.tier);
+      : findRuntimeDir(runtimesRoot, this.opts.cfg.tier);
     return {
+      runtimesRoot,
       // 代码随包走（vendor/rvc，只读）；权重与音色在数据目录。
       codeDir: this.opts.cfg.codeDir.trim() || join(this.opts.packageDir, 'vendor', 'rvc'),
       assetsDir: this.opts.cfg.assetsDir.trim() || join(dataDir, 'assets'),
@@ -220,6 +243,12 @@ export class RvcWorld implements World {
       runtimeTier: picked.tier,
       voicesDir: this.opts.cfg.voicesDir.trim() || join(dataDir, 'voices'),
     };
+  }
+
+  /** 要装哪一档运行时：显式选 CPU 就 CPU；auto / cuda 看有没有 NVIDIA（没显卡就装 CPU 档）。 */
+  private wantedTier(): 'cuda' | 'cpu' {
+    if (this.opts.cfg.tier === 'cpu') return 'cpu';
+    return hasNvidia() ? 'cuda' : 'cpu';
   }
 
   private async startHttp(): Promise<void> {
@@ -290,7 +319,7 @@ export class RvcWorld implements World {
   private async invoke(panel: string, method: string, args: unknown[] = []): Promise<unknown> {
     if (method === 'state' || method === 'install' || method === 'cancel' || method === 'restart') {
       if (method === 'install') this.startSetup();
-      else if (method === 'cancel') { this.installer?.cancel(); this.venv?.cancel(); }
+      else if (method === 'cancel') { this.runtime?.cancel(); this.installer?.cancel(); this.venv?.cancel(); }
       else if (method === 'restart') void this.restartEngine();
       return this.status();
     }
@@ -320,6 +349,8 @@ export class RvcWorld implements World {
       ready: this.health().ready,
       tier: this.opts.cfg.tier,
       runtimeTier: this.runtimeTier,
+      runtime: this.runtime?.status() ?? null,
+      runtimeTiers: installedTiers(this.runtimesRoot),
       device: st?.device ?? null,
       model: st?.model ?? null,
       startMs: st?.startMs ?? null,
@@ -346,7 +377,7 @@ export class RvcWorld implements World {
     return this.opts.cfg.voice.trim() || voices[0]?.name || '';
   }
 
-  /** 面板点「一键安装」：先停引擎，再建派生 venv、补依赖、下权重，装完自动重拉引擎。 */
+  /** 面板点「一键安装」：先停引擎，再（缺的话）下共享运行时、建派生 venv、补依赖、下权重，装完自动重拉引擎。 */
   private startSetup(): void {
     const installer = this.installer;
     const venv = this.venv;
@@ -356,10 +387,22 @@ export class RvcWorld implements World {
       // worker 在跑时会占住 venv 里的 .pyd/.dll，pip 覆盖不了这些文件；先停掉再装。
       await this.engine?.stop();
       if (this.stopped) return;
-      await venv.ensure();
+      // 没用自备运行时、部署里也没有 gpt-sovits 运行时：自己下一份（CPU 档约 1 GB / 显卡档约 4 GB），
+      // 布局和 gpt-sovits 装的一模一样，三个插件共用同一份，谁先装都一样。
+      const runtime = this.runtime;
+      if (runtime && !runtime.ready() && !this.opts.cfg.runtimeDir.trim()) {
+        const ok = await runtime.ensure();
+        if (this.stopped) return;
+        if (!ok) {
+          this.log?.warn('共享运行时没装成，先不建派生 venv', { detail: runtime.status().detail });
+          return;
+        }
+        this.setup();
+      }
+      await this.venv?.ensure();
       if (this.stopped) return;
-      if (venv.state().phase !== 'ready') {
-        this.log?.warn('RVC 依赖没装好，先不下载权重', { detail: venv.state().detail });
+      if (this.venv?.state().phase !== 'ready') {
+        this.log?.warn('RVC 依赖没装好，先不下载权重', { detail: this.venv?.state().detail });
         return;
       }
       await installer.install();
