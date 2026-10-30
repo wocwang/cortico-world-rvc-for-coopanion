@@ -1,6 +1,6 @@
 {
   "name": "@wocwang/cortico-world-rvc-for-coopanion",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "type": "module",
   "description": "Cortico World for Coopanion: voice conversion with RVC — upload any audio and get it back in the pet's voice, plus a local HTTP endpoint (127.0.0.1:9881) for other plugins",
   "author": "wocwang",
@@ -38,11 +38,11 @@
     "locales": {
       "zh": {
         "displayName": "RVC唱歌-大肥鱼",
-        "description": "把任意一段音频换成桌宠的音色，也能整首歌翻唱：自动分离人声与伴奏 → 只把主唱换成音色 → 混回完整的一首歌。上传音频、可选变调、试听与落盘，全程在本机推理。和 gpt-sovits（说话）、DiffSinger 唱歌是同一套本机声音链路，三个插件可以配合使用——既能给 QQ 语音「出口变声」，也能把唱出来的干声换成这里的音色。占用约 1 GB 显存、2.5 GB 内存（显卡档实测）。内置示例音色「星落落大肥鱼」（仅供个人非商业使用，注明音源即可），也支持导入自备 .pth / .index。另开一个只监听本机的 HTTP 接口（默认 127.0.0.1:9881），其他插件可以用 POST /convert 直接拿到变声后的音频。只做推理，不做训练。"
+        "description": "RVC 变声：① 一键换声——上传任意一段音频，换成桌宠的音色，支持变调、索引率、保护清辅音，可试听再落盘；② 一键翻唱——整首歌自动分离人声与伴奏，只把主唱换成音色再混回整首，显卡档分离 + 变声都跑 GPU，几分钟一首；③ 插件联动与 QQ——gpt-sovits 可以把要说的话先换成这里的音色，再由聊天出口发到 QQ 语音；DiffSinger 唱出来的干声也能换成同一音色。插件之间通过只监听本机的 127.0.0.1:9881 接口（POST /convert）对接，全程本机推理、不上传云端。内置「星落落大肥鱼」与自训「小肥鱼」两个音色，也可导入自备 .pth/.index；内置音色仅供个人非商业使用，注明音源即可。只做推理不做训练；显卡档实测约 1 GB 显存 / 2.5 GB 内存。"
       },
       "en": {
         "displayName": "RVC Singing - DaFeiyu",
-        "description": "Turns any audio clip into the pet's voice, and can cover a whole song: it separates vocals from the instrumental, converts only the lead vocal, then mixes them back into one track. Upload, optional pitch shift, preview and save, all inferred on your own machine. It is part of the same local voice chain as gpt-sovits (speech) and DiffSinger singing, and the three plugins can run together — this one can post-process the voice sent to QQ, or convert the dry vocal that the singing plugin produces. About 1 GB VRAM and 2.5 GB RAM on the GPU tier (measured). Ships the built-in \"Xingluoluo DaFeiyu\" voice (personal non-commercial use only; credit the source) and accepts your own .pth / .index. Also serves a loopback-only HTTP endpoint (127.0.0.1:9881 by default) so other plugins can POST /convert and get the converted audio back. Inference only, no training."
+        "description": "RVC voice conversion in three parts. 1) One-click conversion: upload any audio clip and get it back in the pet's voice, with pitch, index rate and consonant protection, preview before saving. 2) One-click cover: drop in a whole song — it separates vocals from the instrumental, converts only the lead vocal, then mixes them back into one track; on the GPU tier both separation and conversion run on the GPU, a few minutes per song. 3) Plugin integration and QQ: gpt-sovits can speak through this voice before the chat outlet sends it to QQ, and DiffSinger's dry vocal can be converted to the same voice. Plugins talk to each other through a loopback-only endpoint at 127.0.0.1:9881 (POST /convert); everything is inferred on your own machine and never uploaded. Ships the built-in \"Xingluoluo DaFeiyu\" voice and the self-trained \"XiaoFeiyu\"; you can also import your own .pth/.index. Built-in voices are for personal non-commercial use only — credit the source. Inference only, no training; about 1 GB VRAM / 2.5 GB RAM on the GPU tier (measured)."
       }
     },
     "tags": [
