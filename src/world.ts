@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
 import type { Logger, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { configGroups, DEFAULT_PORT, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
+import { UVR_MODEL_FILE } from './catalog.ts';
 import { RvcEngine, RvcError, type EngineState } from './engine.ts';
 import { RvcInstaller } from './install.ts';
 import { readConvertJob, startConvertServer, type ConvertDeps, type ConvertJob, type ConvertServerHandle } from './server.ts';
@@ -75,9 +76,14 @@ export function firstVoice(voicesDir: string): string {
   }
 }
 
-/** 推理代码里有没有 `tools/uvr5`：没有就把 `separator=uvr5` 标成不可用。 */
-export function hasUvr5(codeDir: string): boolean {
-  return !!codeDir && existsSync(join(codeDir, 'tools', 'uvr5'));
+/** 人声分离模型装没装：没装就把 `separator=uvr5` 与「翻唱」标成不可用。 */
+export function hasUvr5(uvrDir: string): boolean {
+  if (!uvrDir) return false;
+  try {
+    return statSync(join(uvrDir, UVR_MODEL_FILE)).size > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -110,6 +116,7 @@ export class RvcWorld implements World {
   private codeDir = '';
   private assetsDir = '';
   private voicesDir = '';
+  private uvrDir = '';
   private pythonPath = '';
   private runtimeDir = '';
   /** 共享运行时（gpt-sovits 的运行时包）——没有就自己下一份，三个插件共用。 */
@@ -119,6 +126,11 @@ export class RvcWorld implements World {
   private runtimeTier: 'cuda' | 'cpu' | '' = '';
   /** 最近一次面板转换的结果，面板渲染用。 */
   private lastConvert: { at: number; ms: number; bytes: number; savedPath: string | null; voice: string; format: string } | null = null;
+  /** 最近一次「翻唱」（整首歌）的结果，面板渲染用。 */
+  private lastCover: {
+    at: number; ms: number; bytes: number; savedPath: string | null; voice: string; format: string;
+    stages?: { separate?: number; convert?: number; mix?: number }; peakScale?: number;
+  } | null = null;
 
   constructor(opts: RvcWorldOptions) {
     this.opts = opts;
@@ -146,6 +158,7 @@ export class RvcWorld implements World {
       panels: [
         { id: 'service', title: t.serviceTitle, description: t.serviceHint, getMethods: ['state'] },
         { id: 'convert', title: t.convertTitle, description: t.convertHint, getMethods: ['state'] },
+        { id: 'cover', title: t.coverTitle, description: t.coverHint, getMethods: ['state'] },
         { id: 'voices', title: t.voicesTitle, description: t.voicesHint, getMethods: ['state', 'voices'] },
       ],
       invoke: async (panel, method, args) => this.invoke(panel, method, args),
@@ -157,7 +170,8 @@ export class RvcWorld implements World {
   async start(host: WorldHost): Promise<void> {
     this.log = host.log;
     this.stopped = false;
-    this.engineHeld = false;
+    // 「随软件自动启动」关掉时，把引擎按「用户手动停过」处理，等面板点启动。
+    this.engineHeld = this.opts.cfg.autoStart === false;
     this.launchDetail = '';
     this.setup();
     // 就绪可能要十几秒；先让 World 挂上，接口立刻能答 `ready=false`。
@@ -173,15 +187,17 @@ export class RvcWorld implements World {
     this.codeDir = paths.codeDir;
     this.assetsDir = paths.assetsDir;
     this.voicesDir = paths.voicesDir;
+    this.uvrDir = paths.uvrDir;
     this.pythonPath = paths.pythonPath;
     this.runtimeDir = paths.runtimeDir;
     this.runtimeTier = paths.runtimeTier;
     this.runtimesRoot = paths.runtimesRoot;
     this.runtime = new RuntimeInstall({ root: paths.runtimesRoot, tier: this.wantedTier(), log: this.log ?? undefined });
-    this.installer = new RvcInstaller(paths.assetsDir, paths.voicesDir);
+    this.installer = new RvcInstaller(paths.assetsDir, paths.voicesDir, paths.uvrDir);
     this.venv = new RvcVenv({
       pythonPath: paths.pythonPath,
       basePython: paths.runtimeDir ? join(paths.runtimeDir, 'runtime', 'python.exe') : '',
+      gpu: paths.runtimeTier === 'cuda',
       log: this.log ?? undefined,
     });
     this.engine = new RvcEngine({
@@ -189,6 +205,7 @@ export class RvcWorld implements World {
       codeDir: paths.codeDir,
       voicesDir: paths.voicesDir,
       assetsDir: paths.assetsDir,
+      uvrModel: join(paths.uvrDir, UVR_MODEL_FILE),
       scriptPath: WORKER_SCRIPT,
       voice: this.opts.cfg.voice.trim() || firstVoice(paths.voicesDir),
       runtimeDir: paths.runtimeDir || undefined,
@@ -229,7 +246,7 @@ export class RvcWorld implements World {
     return { ready: !!this.engine?.ready(), device: st?.device ?? null, model: st?.model ?? null };
   }
 
-  private paths(): { codeDir: string; pythonPath: string; runtimeDir: string; runtimeTier: 'cuda' | 'cpu' | ''; voicesDir: string; assetsDir: string; runtimesRoot: string } {
+  private paths(): { codeDir: string; pythonPath: string; runtimeDir: string; runtimeTier: 'cuda' | 'cpu' | ''; voicesDir: string; assetsDir: string; uvrDir: string; runtimesRoot: string } {
     const dataDir = this.opts.dataDir;
     const runtimesRoot = this.opts.runtimesRoot();
     // 自备运行时判断不了档位；托管运行时按配置的推理档挑（auto 优先 CUDA）。
@@ -246,6 +263,8 @@ export class RvcWorld implements World {
       runtimeDir: picked.dir,
       runtimeTier: picked.tier,
       voicesDir: this.opts.cfg.voicesDir.trim() || join(dataDir, 'voices'),
+      // 分离模型不放 assets：那是 RVC 自己的权重目录，分离是另一个模型。
+      uvrDir: join(dataDir, 'uvr5'),
     };
   }
 
@@ -260,7 +279,7 @@ export class RvcWorld implements World {
       ready: () => !!this.engine?.ready(),
       stateText: () => this.engine?.state().detail ?? (this.launchDetail || 'RVC 引擎启动中'),
       health: () => this.health(),
-      uvr5: () => hasUvr5(this.codeDir),
+      uvr5: () => hasUvr5(this.uvrDir),
       convert: (job) => this.convert(job),
       log: this.log ?? silentLogger,
     };
@@ -279,28 +298,49 @@ export class RvcWorld implements World {
     }
   }
 
-  /** 一次转换：临时文件进、临时文件出；`save=1` 时另存到 `<dataDir>/out`。 */
+  /** 一次转换：临时文件进、临时文件出；`save=1` 时另存到 `<dataDir>/out`。
+   *  `separator=uvr5` 时先分离人声再变声，回的是变声后的人声（伴奏不混）。 */
   private async convert(job: ConvertJob): Promise<{ audio: Buffer; savedPath?: string }> {
     const engine = this.engine;
     if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+    if (job.separator === 'uvr5' && !hasUvr5(this.uvrDir)) {
+      throw new RvcError('param', '人声分离模型未安装；请先在服务页点「一键安装」（约 64 MB）');
+    }
     const tmpDir = join(this.opts.dataDir, 'tmp');
     mkdirSync(tmpDir, { recursive: true });
     const id = randomUUID();
     const ext = extname(job.filename).toLowerCase() || '.wav';
     const input = join(tmpDir, `${id}${ext}`);
+    const vocals = join(tmpDir, `${id}.vocals.wav`);
     const output = join(tmpDir, `${id}.${job.format}`);
     writeFileSync(input, job.file);
     const at = Date.now();
     try {
-      const done = await engine.convert({
-        input,
-        output,
-        voice: job.voice,
-        pitch: job.pitch,
-        indexRate: job.indexRate,
-        protect: job.protect,
-        format: job.format,
-      });
+      let done;
+      if (job.separator === 'uvr5') {
+        await engine.separate({ input, output: vocals });
+        done = await engine.convert({
+          input: vocals,
+          output,
+          voice: job.voice,
+          pitch: job.pitch,
+          indexRate: job.indexRate,
+          protect: job.protect,
+          format: job.format,
+          chunk: job.chunk,
+        });
+      } else {
+        done = await engine.convert({
+          input,
+          output,
+          voice: job.voice,
+          pitch: job.pitch,
+          indexRate: job.indexRate,
+          protect: job.protect,
+          format: job.format,
+          chunk: job.chunk,
+        });
+      }
       const audio = readFileSync(output);
       let savedPath: string | undefined;
       if (job.save) {
@@ -316,17 +356,96 @@ export class RvcWorld implements World {
       return { audio, savedPath };
     } finally {
       rmSync(input, { force: true });
+      rmSync(vocals, { force: true });
       rmSync(output, { force: true });
     }
   }
 
+  /** 面板「翻唱」：整首歌进，整首歌唱完的出声（分离 → 变声 → 混音）。 */
+  private async coverFromPanel(args: unknown[]): Promise<unknown> {
+    const fileName = typeof args[0] === 'string' ? args[0] : '';
+    const base64 = typeof args[1] === 'string' ? args[1] : '';
+    const raw = (args[2] && typeof args[2] === 'object' ? args[2] : {}) as Record<string, unknown>;
+    const engine = this.engine;
+    if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+    if (!base64) throw new RvcError('param', '缺少音频内容');
+    if (!hasUvr5(this.uvrDir)) {
+      throw new RvcError('param', '人声分离模型未安装；请先在服务页点「一键安装」（约 64 MB）');
+    }
+    const fields: Record<string, string> = {};
+    for (const key of ['voice', 'pitch', 'indexRate', 'protect', 'format', 'chunk']) {
+      const value = raw[key];
+      if (value !== undefined && value !== null && value !== '') fields[key] = String(value);
+    }
+    let job: ConvertJob;
+    try {
+      job = readConvertJob({ fields, file: { filename: fileName || 'song.wav', data: Buffer.from(base64, 'base64') } }, { uvr5: true });
+    } catch (err) {
+      throw new RvcError('param', err instanceof Error ? err.message : String(err));
+    }
+    const vocalGain = Number(raw.vocalGain ?? 0);
+    if (!Number.isFinite(vocalGain) || vocalGain < -12 || vocalGain > 12) {
+      throw new RvcError('param', '人声增益必须在 -12..12 分贝');
+    }
+    if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+
+    const tmpDir = join(this.opts.dataDir, 'tmp');
+    mkdirSync(tmpDir, { recursive: true });
+    const id = randomUUID();
+    const ext = extname(fileName).toLowerCase() || '.wav';
+    const input = join(tmpDir, `${id}${ext}`);
+    const output = join(tmpDir, `${id}.${job.format}`);
+    writeFileSync(input, job.file);
+    const at = Date.now();
+    try {
+      const done = await engine.cover({
+        input,
+        output,
+        voice: job.voice,
+        pitch: job.pitch,
+        indexRate: job.indexRate,
+        protect: job.protect,
+        format: job.format,
+        vocalGain,
+        chunk: job.chunk,
+      });
+      const audio = readFileSync(output);
+      const outDir = join(this.opts.dataDir, 'out');
+      mkdirSync(outDir, { recursive: true });
+      const savedPath = join(outDir, `cover-${stamp()}.${job.format}`);
+      writeFileSync(savedPath, audio);
+      this.lastCover = {
+        at, ms: done.ms, bytes: audio.length, savedPath,
+        voice: job.voice || engine.state().model || '', format: job.format,
+        stages: done.stages, peakScale: done.peakScale,
+      };
+      return { $binary: { mime: job.format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+    } finally {
+      rmSync(input, { force: true });
+      rmSync(output, { force: true });
+    }
+  }
+
+  /** 面板发起的变声/翻唱：后台跑，面板立刻返回，用户可以切到别的页；结果用 `takeResult` 取。 */
+  private job: { kind: 'convert' | 'cover'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null = null;
+  private jobResult: { mime: string; base64: string; savedPath: string | null; ms: number } | null = null;
+
   private async invoke(panel: string, method: string, args: unknown[] = []): Promise<unknown> {
-    if (method === 'state' || method === 'install' || method === 'cancel' || method === 'restart' || method === 'start' || method === 'stop') {
+    if (method === 'state' || method === 'install' || method === 'cancel' || method === 'restart' || method === 'start' || method === 'stop' || method === 'takeResult') {
       if (method === 'install') this.startSetup();
       else if (method === 'cancel') { this.runtime?.cancel(); this.installer?.cancel(); this.venv?.cancel(); }
       else if (method === 'restart') void this.restartEngine();
       else if (method === 'start') this.startEngine();
       else if (method === 'stop') await this.stopEngine();
+      else if (method === 'takeResult') {
+        const result = this.jobResult;
+        this.jobResult = null;
+        return result ?? { error: '没有可取的结果' };
+      }
+      return this.status();
+    }
+    if (method === 'convert' || method === 'cover') {
+      this.beginJob(method, args);
       return this.status();
     }
     if (method === 'voices') return { voices: listVoices(this.voicesDir) };
@@ -342,8 +461,28 @@ export class RvcWorld implements World {
         return { error: err instanceof Error ? err.message : String(err) };
       }
     }
-    if (method === 'convert') return this.convertFromPanel(args);
     return { error: `unknown method: ${panel}.${method}` };
+  }
+
+  /** 把变声/翻唱放到后台跑：面板拿到的是即时状态，不用在页面上等。 */
+  private beginJob(kind: 'convert' | 'cover', args: unknown[]): void {
+    if (this.job?.phase === 'working') throw new RvcError('param', '已有任务在跑，等它结束再试');
+    const at = Date.now();
+    this.job = { kind, at, phase: 'working', detail: kind === 'cover' ? '分离人声' : '变声' };
+    this.jobResult = null;
+    const task = kind === 'cover' ? this.coverFromPanel(args) : this.convertFromPanel(args);
+    task.then((res) => {
+      const bin = (res as { $binary?: { mime: string; base64: string } }).$binary;
+      const last = kind === 'cover' ? this.lastCover : this.lastConvert;
+      if (bin) {
+        this.jobResult = { mime: bin.mime, base64: bin.base64, savedPath: last?.savedPath ?? null, ms: last?.ms ?? 0 };
+        this.job = { kind, at, phase: 'done', detail: '完成', ms: last?.ms ?? 0 };
+      } else {
+        this.job = { kind, at, phase: 'error', detail: '失败', error: '没有拿到音频' };
+      }
+    }).catch((err) => {
+      this.job = { kind, at, phase: 'error', detail: '失败', error: err instanceof Error ? err.message : String(err) };
+    });
   }
 
   /** 面板与状态行看到的一切。 */
@@ -367,14 +506,19 @@ export class RvcWorld implements World {
       codeDir: this.codeDir,
       assetsDir: this.assetsDir,
       voicesDir: this.voicesDir,
+      uvrDir: this.uvrDir,
       pythonPath: this.pythonPath,
       runtimeDir: this.runtimeDir,
-      uvr5: hasUvr5(this.codeDir),
+      uvr5: hasUvr5(this.uvrDir),
+      uvr: this.installer?.uvr.status() ?? { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' },
       venv: this.venv?.state() ?? { phase: 'absent', detail: 'World 未启动' },
       install: this.installer?.state() ?? { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' },
       voiceCount: voices.length,
       defaultVoice: this.defaultVoice(voices),
       lastConvert: this.lastConvert,
+      lastCover: this.lastCover,
+      job: this.job,
+      resultReady: this.jobResult !== null,
     };
   }
 
@@ -464,14 +608,14 @@ export class RvcWorld implements World {
     if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
     if (!base64) throw new RvcError('param', '缺少音频内容');
     const fields: Record<string, string> = { save: '1' };
-    for (const key of ['voice', 'pitch', 'indexRate', 'protect', 'format', 'separator']) {
+    for (const key of ['voice', 'pitch', 'indexRate', 'protect', 'format', 'separator', 'chunk']) {
       const value = raw[key];
       if (value !== undefined && value !== null && value !== '') fields[key] = String(value);
     }
     // 先按接口同一套规则校验参数，再问引擎：填错了立刻能看到原因。
     let job: ConvertJob;
     try {
-      job = readConvertJob({ fields, file: { filename: fileName || 'input.wav', data: Buffer.from(base64, 'base64') } }, { uvr5: hasUvr5(this.codeDir) });
+      job = readConvertJob({ fields, file: { filename: fileName || 'input.wav', data: Buffer.from(base64, 'base64') } }, { uvr5: hasUvr5(this.uvrDir) });
     } catch (err) {
       throw new RvcError('param', err instanceof Error ? err.message : String(err));
     }

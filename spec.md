@@ -11,9 +11,9 @@
   所以 RVC 面板里的「上传音频 → 变声 → 试听/落盘」走 **RVC 自己的 `POST /convert`**（multipart 上传音频），
   不是走 `/audio/speech`。外部程序要用也一样：直接调 `9881/convert`。
 - 本机没有现成 RVC 运行时或权重（已扫 `D:\RVC1006` 不存在），T0 需下载推理代码 + hubert/rmvpe。
-- 「RVC 快」的前提是**不分离人声**：对 TTS 产物（本来是干净单人声）分离纯属浪费；
-  只有用户上传带伴奏的素材时才需要 `separator=uvr5`，而 UVR5 依赖 gpt-sovits 运行时的 `tools/uvr5`
-  （旧运行时包不含，缺了就把该选项标成不可用）。
+- 「RVC 快」的前提是**不分离人声**：对 TTS 产物（本来是干净人声）分离纯属浪费；只有上传带伴奏的素材、
+  或整首歌翻唱时才走 `separator=uvr5`。分离模型（UVR-MDX-NET-Inst_HQ_3，ONNX）随安装流程单独下到
+  `<dataDir>/uvr5`，推理用包内 `vendor/uvr/mdx.py` + 运行时自带的 `onnxruntime`，**不依赖** gpt-sovits 的 `tools/uvr5`。
 
 ## 2. 已确认决策
 
@@ -28,8 +28,10 @@
 1. 独立 world 插件：`kind = "world"`，只做音频进、音频出；不处理文字、不直接发 QQ 消息。
 2. 本机 HTTP 接口（默认 `127.0.0.1:9881`）：`GET /health`、`POST /convert`；单 GPU 串行队列。
 3. 自带面板：服务状态、依赖与权重安装进度、音色列表、变调、索引率、保护清辅音、上传试听与落盘、日志。
-4. 资产：`hubert_base.pt`、`rmvpe.pt`、示例音色（`.pth` / 可选 `.index`）的下载、校验、断点续传；支持导入自备权重。
-5. 与 gpt-sovits 联动：在它的「与其他插件联动」页加一张 RVC 子卡（检测/端点/超时/变调/索引率/一键写入/试听），
+4. 翻唱（整首歌）：面板一个入口做「分离人声/伴奏 → 人声变声 → 混回整首」，同时把接口的
+   `separator=uvr5` 补齐（接口只回变声后的人声，整曲混音只在面板走）。
+5. 资产：`hubert_base.pt`、`rmvpe.pt`、示例音色（`.pth` / 可选 `.index`）、分离模型的下载、校验、断点续传；支持导入自备权重。
+6. 与 gpt-sovits 联动：在它的「与其他插件联动」页加一张 RVC 子卡（检测/端点/超时/变调/索引率/一键写入/试听），
    并在其 HTTP 语音接口出口串一次后处理。
 
 ## 4. 非目标
@@ -68,7 +70,7 @@ RVC 面板「上传变声」 --world 内部直接调 convert--> RVC(9881) --> �
 | `pitch` | int | `0` | 半音，−24..24 |
 | `indexRate` | float | `0.3` | 0..1；该音色没有 `.index` 时忽略 |
 | `protect` | float | `0.33` | 0..0.5，保护清辅音 |
-| `separator` | string | `off` | `off` / `uvr5`（缺 `tools/uvr5` 时 400） |
+| `separator` | string | `off` | `off` / `uvr5`（先分离人声再变声，回的是人声；分离模型没装时 400） |
 | `format` | string | `wav` | `wav` / `mp3` |
 | `save` | 0/1 | `0` | 落盘到插件数据目录；仍然返回音频，另加 `X-Rvc-Saved` 头 |
 

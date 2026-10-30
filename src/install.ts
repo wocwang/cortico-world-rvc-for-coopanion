@@ -12,7 +12,7 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync,
 import { dirname, join } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { ASSET_FILES, VOICE_FILES, type PinnedFile } from './catalog.ts';
+import { ASSET_FILES, UVR_FILES, VOICE_FILES, type PinnedFile } from './catalog.ts';
 
 export type InstallPhase = 'absent' | 'working' | 'ready' | 'error';
 
@@ -154,41 +154,45 @@ export class FileSetJob {
   }
 }
 
-/** 资产（hubert + rmvpe）与示例音色两个任务，按顺序跑，面板只看这一份汇总状态。 */
+/** 资产（hubert + rmvpe）、示例音色、人声分离模型三个任务，按顺序跑，面板只看这一份汇总状态。 */
 export class RvcInstaller {
   readonly assets: FileSetJob;
   readonly voices: FileSetJob;
+  readonly uvr: FileSetJob;
   private running: Promise<void> | null = null;
 
-  constructor(assetsDir: string, voicesDir: string) {
+  constructor(assetsDir: string, voicesDir: string, uvrDir: string) {
     this.assets = new FileSetJob(assetsDir, ASSET_FILES);
     this.voices = new FileSetJob(voicesDir, VOICE_FILES);
+    this.uvr = new FileSetJob(uvrDir, UVR_FILES);
   }
 
   state(): InstallState {
-    const a = this.assets.status();
-    const v = this.voices.status();
-    const phase: InstallPhase = a.phase === 'error' || v.phase === 'error'
+    const jobs = [this.assets.status(), this.voices.status(), this.uvr.status()];
+    const phase: InstallPhase = jobs.some((j) => j.phase === 'error')
       ? 'error'
-      : a.phase === 'working' || v.phase === 'working'
+      : jobs.some((j) => j.phase === 'working')
         ? 'working'
-        : a.phase === 'ready' && v.phase === 'ready'
+        : jobs.every((j) => j.phase === 'ready')
           ? 'ready'
           : 'absent';
     return {
       phase,
-      done: a.done + v.done,
-      total: a.total + v.total,
-      detail: phase === 'error' ? (a.detail ?? v.detail) : (a.phase === 'working' ? a.detail : v.detail),
+      done: jobs.reduce((n, j) => n + j.done, 0),
+      total: jobs.reduce((n, j) => n + j.total, 0),
+      detail: phase === 'error'
+        ? (jobs.find((j) => j.phase === 'error')?.detail ?? null)
+        : (jobs.find((j) => j.phase === 'working')?.detail ?? null),
     };
   }
 
-  /** 装完资产再装音色；任一步失败都停下并记在状态里（不抛）。 */
+  /** 装完资产再装音色、最后分离模型；任一步失败都停下并记在状态里（不抛）。 */
   install(): Promise<void> {
     if (this.running) return this.running;
     this.running = (async () => {
       await this.assets.install();
       if (this.assets.status().phase === 'ready') await this.voices.install();
+      if (this.voices.status().phase === 'ready') await this.uvr.install();
     })().finally(() => { this.running = null; });
     return this.running;
   }
@@ -196,5 +200,6 @@ export class RvcInstaller {
   cancel(): void {
     this.assets.cancel();
     this.voices.cancel();
+    this.uvr.cancel();
   }
 }

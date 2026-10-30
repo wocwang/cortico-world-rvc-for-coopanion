@@ -37,6 +37,8 @@ export interface RvcVenvOptions {
   pythonPath: string;
   /** base 运行时的 python.exe；派生 venv 从它长出来。 */
   basePython: string;
+  /** 显卡档：额外装 onnxruntime-gpu，让分离也走显卡（装不上就继续 CPU）。 */
+  gpu?: boolean;
   log?: Logger;
 }
 
@@ -88,7 +90,11 @@ export class RvcVenv {
         return;
       }
     }
-    if (await this.probe()) { this.st = { phase: 'ready', detail: null }; return; }
+    if (await this.probe()) {
+      if (this.opts.gpu) await this.installGpuOrt();
+      this.st = { phase: 'ready', detail: null };
+      return;
+    }
     const { pythonPath, basePython } = this.opts;
     // 没有 base 就长不出 venv：面板的「一键安装」会先下一份共享运行时，这里只说清还差什么。
     if (!existsSync(basePython) && !existsSync(pythonPath)) {
@@ -109,8 +115,24 @@ export class RvcVenv {
       code = await this.exec(pythonPath, [...base, '-i', PIP_OFFICIAL], PIP_TIMEOUT_MS);
     }
     if (code !== 0) { this.st = { phase: 'error', detail: `装依赖失败：${this.lastLine()}` }; return; }
+    if (this.opts.gpu) await this.installGpuOrt();
     if (await this.probe()) this.st = { phase: 'ready', detail: null };
     else this.st = { phase: 'error', detail: `依赖装完了但 import 不过：${this.lastLine()}` };
+  }
+
+  /**
+   * 显卡档补一份 onnxruntime-gpu，人声分离也走显卡。装不上只警告、不影响 CPU 出活，
+   * 所以版本钉死、失败不回滚，面板仍是 ready。
+   */
+  private async installGpuOrt(): Promise<void> {
+    this.st = { phase: 'working', detail: '安装显卡分离（onnxruntime-gpu）' };
+    const base = ['-I', '-X', 'utf8', '-u', '-m', 'pip', 'install', '--no-warn-script-location', ...PIP_NET_ARGS, 'onnxruntime-gpu==1.22.0'];
+    let code = await this.exec(this.opts.pythonPath, [...base, '-i', PIP_MIRROR], PIP_TIMEOUT_MS);
+    if (code !== 0) {
+      this.opts.log?.warn('onnxruntime-gpu 镜像失败，改走官方 PyPI', { tail: this.tail.slice(-3) });
+      code = await this.exec(this.opts.pythonPath, [...base, '-i', PIP_OFFICIAL], PIP_TIMEOUT_MS);
+    }
+    if (code !== 0) this.opts.log?.warn('onnxruntime-gpu 没装上，分离继续用 CPU', { tail: this.tail.slice(-3) });
   }
 
   /** venv 根：`<root>/Scripts/python.exe` 往上两级。 */

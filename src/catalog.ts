@@ -90,3 +90,24 @@ export const VOICE_FILES: readonly PinnedFile[] = [
 /** 两类资产总字节，面板显示总量用。 */
 export const ASSET_BYTES = ASSET_FILES.reduce((n, f) => n + f.bytes, 0);
 export const VOICE_BYTES = VOICE_FILES.reduce((n, f) => n + f.bytes, 0);
+
+/**
+ * 人声分离模型，落到 `<dataDir>/uvr5`：UVR-MDX-NET-Inst_HQ_3（UVR 项目训练，MIT），
+ * 63.7 MB。国内优先 hf-mirror（两个镜像仓库同一份文件，SHA-256 相同），官方 HF 只当兜底。
+ * 不随包分发；第一次点「一键安装」时下。
+ */
+export const UVR_MODEL_FILE = 'UVR-MDX-NET-Inst_HQ_3.onnx';
+const UVR_REMOTE = 'UVR-MDX-NET-Inst_HQ_3.onnx';
+export const UVR_FILES: readonly PinnedFile[] = [
+  {
+    path: UVR_MODEL_FILE,
+    bytes: 66759214,
+    sha256: '317554b07fe1ea5279a77f2b1520a41ea4b93432560c4ffd08792c30fddf9adc',
+    sources: [
+      `${HF_MIRROR}/seanghay/uvr_models/resolve/main/${UVR_REMOTE}`,
+      `${HF_MIRROR}/Blane187/all_public_uvr_models/resolve/main/${UVR_REMOTE}`,
+      `${HF}/seanghay/uvr_models/resolve/main/${UVR_REMOTE}`,
+    ],
+  },
+];
+export const UVR_BYTES = UVR_FILES.reduce((n, f) => n + f.bytes, 0);

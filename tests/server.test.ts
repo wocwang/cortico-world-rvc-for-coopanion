@@ -146,17 +146,17 @@ describe('RVC 本机接口', () => {
     }
   });
 
-  it('separator=uvr5 按推理代码能力给不同提示', async () => {
+  it('separator=uvr5：模型没装 400，装了就走同一套转换', async () => {
     const missing = await boot({ uvr5: false });
     const a = await post(missing.base, form({ separator: 'uvr5' }));
     expect(a.status).toBe(400);
-    expect(((await a.json()) as { error: string }).error).toContain('tools/uvr5');
+    expect(((await a.json()) as { error: string }).error).toContain('人声分离模型');
     await handle?.close();
 
     const present = await boot({ uvr5: true });
     const b = await post(present.base, form({ separator: 'uvr5' }));
-    expect(b.status).toBe(400);
-    expect(((await b.json()) as { error: string }).error).toContain('还没接上推理');
+    expect(b.status).toBe(200);
+    expect(present.jobs[0]).toMatchObject({ separator: 'uvr5' });
   });
 
   it('错误映射：未就绪 409、解码失败 400、推理失败 502', async () => {

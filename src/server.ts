@@ -25,9 +25,13 @@ export interface ConvertJob {
   pitch: number;
   indexRate: number;
   protect: number;
+  /** `uvr5` 先分离人声再变声，回的是变声后的人声（不含伴奏）。 */
+  separator: 'off' | 'uvr5';
   format: 'wav' | 'mp3';
   /** 落盘到插件数据目录，另外返回路径。 */
   save: boolean;
+  /** 长音频是否切片；false 为整段一次进模型。 */
+  chunk: boolean;
 }
 
 export interface ConvertOutcome {
@@ -43,7 +47,7 @@ export interface ConvertDeps {
   stateText(): string;
   /** 引擎状态：设备、当前音色。 */
   health(): { ready: boolean; device: string | null; model: string | null };
-  /** 推理代码里有没有 `tools/uvr5`：没有就禁用 `separator=uvr5`。 */
+  /** 人声分离模型装没装：没装就禁用 `separator=uvr5`。 */
   uvr5(): boolean;
   /** 真正做转换；失败抛 `RvcError`。 */
   convert(job: ConvertJob): Promise<ConvertOutcome>;
@@ -137,15 +141,15 @@ export function readConvertJob(multipart: MultipartBody, opts: { uvr5?: boolean 
   if (protect < 0 || protect > PROTECT_MAX) throw new RvcHttpError(400, `protect 必须在 0..${PROTECT_MAX}`);
   const separator = (fields.separator ?? 'off').trim() || 'off';
   if (separator !== 'off' && separator !== 'uvr5') throw new RvcHttpError(400, `未知的 separator：${separator}`);
-  if (separator === 'uvr5') {
-    throw new RvcHttpError(400, opts.uvr5
-      ? 'separator=uvr5 还没接上推理，请先自行分离人声（separator=off）'
-      : '本机 RVC 代码没有 tools/uvr5，人声分离不可用；请上传干净人声（separator=off）');
+  if (separator === 'uvr5' && !opts.uvr5) {
+    throw new RvcHttpError(400, '人声分离模型未安装；请先在服务页点「一键安装」（约 64 MB），或上传干净人声（separator=off）');
   }
   const format = (fields.format ?? 'wav').trim() || 'wav';
   if (format !== 'wav' && format !== 'mp3') throw new RvcHttpError(400, `未知的 format：${format}`);
   const saveRaw = (fields.save ?? '0').trim() || '0';
   if (saveRaw !== '0' && saveRaw !== '1') throw new RvcHttpError(400, 'save 只能是 0 或 1');
+  const chunkRaw = (fields.chunk ?? '1').trim() || '1';
+  if (!['0', '1', 'true', 'false'].includes(chunkRaw.toLowerCase())) throw new RvcHttpError(400, 'chunk 只能是 0/1');
   return {
     file: file.data,
     filename: file.filename || `input${ext}`,
@@ -153,8 +157,10 @@ export function readConvertJob(multipart: MultipartBody, opts: { uvr5?: boolean 
     pitch,
     indexRate,
     protect,
+    separator: separator === 'uvr5' ? 'uvr5' : 'off',
     format,
     save: saveRaw === '1',
+    chunk: chunkRaw !== '0' && chunkRaw.toLowerCase() !== 'false',
   };
 }
 

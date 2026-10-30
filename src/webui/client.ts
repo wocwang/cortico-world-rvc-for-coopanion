@@ -29,6 +29,10 @@ interface ConvertDone {
   voice: string;
   format: string;
 }
+interface CoverDone extends ConvertDone {
+  stages?: { separate?: number; convert?: number; mix?: number };
+  peakScale?: number;
+}
 interface PanelState {
   phase: 'stopped' | 'starting' | 'ready' | 'error';
   ready: boolean;
@@ -41,10 +45,29 @@ interface PanelState {
   tail: string[];
   uvr5: boolean;
   venv: JobState;
+  uvr: JobState;
   install: JobState;
   voiceCount: number;
   defaultVoice: string;
   lastConvert: ConvertDone | null;
+  lastCover: CoverDone | null;
+  job: { kind: 'convert' | 'cover'; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null;
+  resultReady: boolean;
+}
+interface JobResult {
+  mime?: string;
+  base64?: string;
+  savedPath?: string | null;
+  ms?: number;
+  error?: string;
+}
+
+/** base64 → Blob：后台任务的结果从 `takeResult` 拿回来，不再用 `invokeBinary`。 */
+function blobFromBase64(base64: string, mime: string): Blob {
+  const raw = atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
 }
 interface VoiceRow {
   name: string;
@@ -136,6 +159,7 @@ const servicePanel: WebUiPanel = {
     const engineRow = row(sheet, ui, t.rowEngine);
     const depsRow = row(sheet, ui, t.rowDeps);
     const weightsRow = row(sheet, ui, t.rowWeights);
+    const uvrRow = row(sheet, ui, t.rowUvr);
     const voiceRow = row(sheet, ui, t.rowVoice);
     const apiRow = row(sheet, ui, t.rowApi);
 
@@ -192,6 +216,13 @@ const servicePanel: WebUiPanel = {
       weightsRow.detail.textContent = s.install.detail ?? `${ui.fmt.bytes(s.install.done)} / ${ui.fmt.bytes(s.install.total)}`;
       bar.el.hidden = s.install.phase !== 'working';
       if (s.install.phase === 'working') bar.setValue(s.install.done ?? 0, s.install.total || 1);
+      // 分离模型
+      setPill(
+        uvrRow.pill,
+        s.uvr.phase === 'working' ? `${t.working} ${s.uvr.total ? `${Math.round((s.uvr.done ?? 0) / s.uvr.total * 100)}%` : ''}` : t[phaseKey(s.uvr.phase)],
+        toneOf(s.uvr.phase),
+      );
+      uvrRow.detail.textContent = s.uvr.detail ?? `${ui.fmt.bytes(s.uvr.done)} / ${ui.fmt.bytes(s.uvr.total)}`;
       const allReady = s.venv.phase === 'ready' && s.install.phase === 'ready';
       installBtn.textContent = allReady ? t.install : t.installSize(ui.fmt.bytes(s.install.total ?? 0));
       installBtn.disabled = busy || allReady;
@@ -247,6 +278,10 @@ const convertPanel: WebUiPanel = {
     protect.max = '0.5';
     protect.step = '0.01';
     const format = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
+    const chunk = ui.select({
+      value: 'chunk',
+      options: [{ value: 'chunk', label: t.chunkSlice }, { value: 'full', label: t.chunkFull }],
+    });
 
     const knobs = ui.h('div', 'rvc-grid');
     knobs.append(
@@ -254,6 +289,7 @@ const convertPanel: WebUiPanel = {
       ui.field(t.indexRate, indexRate),
       ui.field(t.protect, protect),
       ui.field(t.format, format),
+      ui.field(t.chunkMode, chunk),
     );
 
     const convertBtn = ui.button(t.convert, { variant: 'primary', size: 'sm', onClick: () => void run() });
@@ -289,43 +325,253 @@ const convertPanel: WebUiPanel = {
       // 「默认」是跟随配置/目录第一个的动态项，把实际音色带上，免得和下面的显式项看起来一样。
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
       fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
-      convertBtn.disabled = !s.ready;
+      convertBtn.disabled = !s.ready || s.job?.phase === 'working';
       if (!s.ready && s.detail) msg.textContent = s.detail;
     }
+
+    let tookResult = false;
 
     async function run(): Promise<void> {
       msg.textContent = '';
       msg.classList.remove('bad');
       if (!file) { msg.textContent = t.pickFileFirst; msg.classList.add('bad'); return; }
       if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
-      const busy = ui.busy(t.convertTitle, t.converting);
+      tookResult = false;
+      msg.textContent = t.converting;
       convertBtn.disabled = true;
       try {
         const base64 = toBase64(new Uint8Array(await file.arrayBuffer()));
-        const blob = await ctx.invokeBinary('convert', [file.name, base64, {
+        // 后台跑：这里立刻返回，用户可以切到别的页；结果由定时刷新取回。
+        await ctx.invoke('convert', [file.name, base64, {
           voice: voiceSelect.value,
           pitch: Number(pitch.value),
           indexRate: Number(indexRate.value),
           protect: Number(protect.value),
           format: format.value,
+          chunk: chunk.value === 'chunk',
         }]);
-        if (url) URL.revokeObjectURL(url);
-        url = URL.createObjectURL(blob);
-        audio.src = url;
-        audio.hidden = false;
-        dl.href = url;
-        dl.download = `rvc.${format.value}`;
-        dl.hidden = false;
-        const done = (await ctx.invoke<PanelState>('state')).lastConvert;
-        resultLine.textContent = done
-          ? [t.convertDone(ui.fmt.duration(done.ms), ui.fmt.bytes(done.bytes)), done.savedPath ? t.saved(done.savedPath) : ''].filter(Boolean).join(' · ')
-          : '';
       } catch (err) {
         msg.textContent = errText(err);
         msg.classList.add('bad');
-      } finally {
-        busy.dispose();
         convertBtn.disabled = !state?.ready;
+      }
+    }
+
+    /** 轮询状态时把后台任务收尾：出错显示原因，完成就把音频取回来。 */
+    async function settle(s: PanelState): Promise<void> {
+      const job = s.job;
+      if (!job) return;
+      if (job.phase === 'working') {
+        msg.textContent = job.detail || t.converting;
+        msg.classList.remove('bad');
+        return;
+      }
+      if (tookResult) return;
+      tookResult = true;
+      if (job.phase === 'error') {
+        msg.textContent = job.error || '转换失败';
+        msg.classList.add('bad');
+        return;
+      }
+      if (!s.resultReady) return;
+      const r = await ctx.invoke<JobResult>('takeResult');
+      if (r.error || !r.base64) {
+        msg.textContent = r.error ?? '没有拿到音频';
+        msg.classList.add('bad');
+        return;
+      }
+      msg.textContent = '';
+      const blob = blobFromBase64(r.base64, r.mime ?? 'audio/wav');
+      if (url) URL.revokeObjectURL(url);
+      url = URL.createObjectURL(blob);
+      audio.src = url;
+      audio.hidden = false;
+      dl.href = url;
+      dl.download = `rvc.${format.value}`;
+      dl.hidden = false;
+      const done = s.lastConvert;
+      resultLine.textContent = done
+        ? [t.convertDone(ui.fmt.duration(done.ms), ui.fmt.bytes(done.bytes)), done.savedPath ? t.saved(done.savedPath) : ''].filter(Boolean).join(' · ')
+        : '';
+    }
+
+    const refresh = async (): Promise<void> => {
+      try {
+        const [s, v] = await Promise.all([ctx.invoke<PanelState>('state'), ctx.invoke<VoicesResp>('voices')]);
+        render(s, v.voices ?? []);
+        await settle(s);
+      } catch (err) { if (!state) msg.textContent = errText(err); }
+    };
+    void refresh();
+    ctx.interval(() => void refresh(), 3000);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// 翻唱（整首歌）
+// ---------------------------------------------------------------------------
+
+const coverPanel: WebUiPanel = {
+  mount(ctx) {
+    const { ui } = ctx;
+    const t = panelText(ctx.language);
+    const msg = ui.msgline();
+    let state: PanelState | null = null;
+    let file: File | null = null;
+    let url: string | null = null;
+    ctx.own(disposable(() => { if (url) URL.revokeObjectURL(url); }));
+
+    const sheet = ui.section(t.coverTitle, t.coverHint);
+    const fileInput = ui.input({});
+    fileInput.type = 'file';
+    fileInput.accept = 'audio/*,.wav,.flac,.mp3,.ogg,.m4a';
+    const voiceSelect = ui.select({ options: [] });
+
+    const pitch = ui.input({ type: 'number', value: '0' });
+    pitch.min = '-24';
+    pitch.max = '24';
+    pitch.step = '1';
+    const indexRate = ui.input({ type: 'number', value: '0.3' });
+    indexRate.min = '0';
+    indexRate.max = '1';
+    indexRate.step = '0.05';
+    const protect = ui.input({ type: 'number', value: '0.33' });
+    protect.min = '0';
+    protect.max = '0.5';
+    protect.step = '0.01';
+    const vocalGain = ui.input({ type: 'number', value: '0' });
+    vocalGain.min = '-12';
+    vocalGain.max = '12';
+    vocalGain.step = '1';
+    const format = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
+    const chunk = ui.select({
+      value: 'chunk',
+      options: [{ value: 'chunk', label: t.chunkSlice }, { value: 'full', label: t.chunkFull }],
+    });
+
+    const knobs = ui.h('div', 'rvc-grid');
+    knobs.append(
+      ui.field(t.pitch, pitch),
+      ui.field(t.indexRate, indexRate),
+      ui.field(t.protect, protect),
+      ui.field(t.vocalGain, vocalGain),
+      ui.field(t.format, format),
+      ui.field(t.chunkMode, chunk),
+    );
+
+    const coverBtn = ui.button(t.cover, { variant: 'primary', size: 'sm', onClick: () => void run() });
+    const acts = ui.actions();
+    acts.append(coverBtn);
+
+    sheet.append(
+      ui.h('div', 'rvc-detail', t.coverStagesHint),
+      ui.field(t.file, fileInput),
+      ui.h('div', 'rvc-detail', t.fileHint),
+      ui.field(t.voice, voiceSelect),
+      knobs,
+      acts,
+    );
+
+    const audio = ui.h('audio', 'rvc-audio');
+    audio.controls = true;
+    audio.hidden = true;
+    const resultLine = ui.h('div', 'rvc-detail');
+    const dl = ui.h('a', 'btn sm', t.download);
+    dl.hidden = true;
+
+    ctx.root.append(sheet, audio, resultLine, dl, msg);
+
+    fileInput.addEventListener('change', () => {
+      file = fileInput.files?.[0] ?? null;
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (file) resultLine.textContent = `${file.name} · ${ui.fmt.bytes(file.size)}`;
+    });
+
+    function render(s: PanelState, voices: VoiceRow[]): void {
+      state = s;
+      const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
+      fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
+      coverBtn.disabled = !s.ready || !s.uvr5 || s.job?.phase === 'working';
+      if (!s.ready && s.detail) msg.textContent = s.detail;
+      else if (!s.uvr5) msg.textContent = t.coverNeedsUvr;
+    }
+
+    let tookResult = false;
+
+    async function run(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!file) { msg.textContent = t.pickFileFirst; msg.classList.add('bad'); return; }
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!state?.uvr5) { msg.textContent = t.coverNeedsUvr; msg.classList.add('bad'); return; }
+      tookResult = false;
+      msg.textContent = t.covering;
+      coverBtn.disabled = true;
+      try {
+        const base64 = toBase64(new Uint8Array(await file.arrayBuffer()));
+        // 后台跑：分离 + 变声 + 混音都在 World 里，页面可以随时切走。
+        await ctx.invoke('cover', [file.name, base64, {
+          voice: voiceSelect.value,
+          pitch: Number(pitch.value),
+          indexRate: Number(indexRate.value),
+          protect: Number(protect.value),
+          vocalGain: Number(vocalGain.value),
+          format: format.value,
+          chunk: chunk.value === 'chunk',
+        }]);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+        coverBtn.disabled = !(state?.ready && state?.uvr5);
+      }
+    }
+
+    async function settle(s: PanelState): Promise<void> {
+      const job = s.job;
+      if (!job) return;
+      if (job.phase === 'working') {
+        msg.textContent = job.detail || t.covering;
+        msg.classList.remove('bad');
+        return;
+      }
+      if (tookResult) return;
+      tookResult = true;
+      if (job.phase === 'error') {
+        msg.textContent = job.error || '翻唱失败';
+        msg.classList.add('bad');
+        return;
+      }
+      if (!s.resultReady) return;
+      const r = await ctx.invoke<JobResult>('takeResult');
+      if (r.error || !r.base64) {
+        msg.textContent = r.error ?? '没有拿到音频';
+        msg.classList.add('bad');
+        return;
+      }
+      msg.textContent = '';
+      const blob = blobFromBase64(r.base64, r.mime ?? 'audio/wav');
+      if (url) URL.revokeObjectURL(url);
+      url = URL.createObjectURL(blob);
+      audio.src = url;
+      audio.hidden = false;
+      dl.href = url;
+      dl.download = `cover.${format.value}`;
+      dl.hidden = false;
+      const done = s.lastCover;
+      if (done) {
+        const stages = done.stages
+          ? t.coverStages(
+              ui.fmt.duration(done.stages.separate ?? 0),
+              ui.fmt.duration(done.stages.convert ?? 0),
+              ui.fmt.duration(done.stages.mix ?? 0),
+            )
+          : '';
+        resultLine.textContent = [
+          t.coverDone(ui.fmt.duration(done.ms), ui.fmt.bytes(done.bytes), stages),
+          done.peakScale !== undefined && done.peakScale < 1 ? t.peakScaled : '',
+          done.savedPath ? t.saved(done.savedPath) : '',
+        ].filter(Boolean).join(' · ');
       }
     }
 
@@ -333,6 +579,7 @@ const convertPanel: WebUiPanel = {
       try {
         const [s, v] = await Promise.all([ctx.invoke<PanelState>('state'), ctx.invoke<VoicesResp>('voices')]);
         render(s, v.voices ?? []);
+        await settle(s);
       } catch (err) { if (!state) msg.textContent = errText(err); }
     };
     void refresh();
@@ -430,6 +677,7 @@ const bundle: WebUiClientBundle = {
   panels: {
     service: servicePanel,
     convert: convertPanel,
+    cover: coverPanel,
     voices: voicesPanel,
   },
 };

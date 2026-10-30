@@ -9,6 +9,8 @@ export type RvcTier = 'auto' | 'cuda' | 'cpu';
 /** config.json 的 `worlds.rvc` 段。 */
 export interface RvcConfigSection {
   enabled: boolean;
+  /** 随 Coopanion 启动时自动拉起引擎；关掉就等面板点「启动引擎」。 */
+  autoStart: boolean;
   /** 推理档；改档后重建派生 venv 并重启引擎生效。 */
   tier: RvcTier;
   /**
@@ -55,6 +57,7 @@ export const DEFAULT_PORT = 9881;
 
 export const RVC_DEFAULTS: RvcConfigSection = {
   enabled: false,
+  autoStart: true,
   tier: 'auto',
   codeDir: '',
   assetsDir: '',
@@ -80,6 +83,7 @@ const TEXT = {
     title: 'RVC 变声',
     groupConvert: { title: '变声参数', description: '推理档、默认音色与三个推理参数；面板上传时还可以逐次覆盖。' },
     groupService: { title: '运行与接口', description: '推理代码、派生 venv 与音色目录，以及给其他插件用的本机 HTTP 接口。' },
+    autoStart: { title: '随软件自动启动', description: '开启后 Coopanion 启动时会自动拉起 RVC 引擎（约 0.7 GB 显存 / 2.5 GB 内存）；关闭后等你在「服务」页点「启动引擎」。手动点过「启动引擎」不受这个开关影响。' },
     tier: { title: '推理档', description: '自动：检测到 NVIDIA 显卡就用显卡档，否则 CPU 档。显卡档的派生 venv 基于 CUDA 运行时，变声快很多（约 0.6–0.8 GB 显存）；CPU 档约 1–2 GB 内存。改档后在面板点「重启引擎」生效，切档会自动重建 venv。' },
     tierAuto: '自动',
     tierCuda: '显卡（NVIDIA）',
@@ -101,6 +105,7 @@ const TEXT = {
     title: 'RVC Voice Changer',
     groupConvert: { title: 'Conversion', description: 'Inference tier, default voice and the three inference knobs; the panel can override them per upload.' },
     groupService: { title: 'Runtime and API', description: 'Inference code, derived venv, voices folder, and the loopback HTTP endpoint for other plugins.' },
+    autoStart: { title: 'Start with Coopanion', description: 'When on, the RVC engine starts automatically when Coopanion launches (about 0.7 GB VRAM / 2.5 GB RAM). When off, wait for Start engine on the Service tab. A manual Start engine is not affected by this switch.' },
     tier: { title: 'Inference tier', description: 'Auto uses the GPU tier when an NVIDIA GPU is detected, otherwise CPU. The GPU tier builds the derived venv on the CUDA runtime and is much faster (about 0.6–0.8 GB VRAM); the CPU tier uses about 1–2 GB RAM. After changing this, click Restart engine — switching tiers rebuilds the venv automatically.' },
     tierAuto: 'Auto',
     tierCuda: 'GPU (NVIDIA)',
@@ -148,6 +153,7 @@ export function configGroups(language: Language): ConfigGroup[] {
         title: t.groupService.title,
         description: t.groupService.description,
         properties: {
+          [`${K}.autoStart`]: { type: 'boolean', title: t.autoStart.title, description: t.autoStart.description, 'x-hot': true },
           [`${K}.codeDir`]: { type: 'string', title: t.codeDir.title, description: t.codeDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.assetsDir`]: { type: 'string', title: t.assetsDir.title, description: t.assetsDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.pythonPath`]: { type: 'string', title: t.pythonPath.title, description: t.pythonPath.description, 'x-path': { kind: 'file', extensions: ['.exe'] }, 'x-hot': true },

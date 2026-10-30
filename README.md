@@ -1,9 +1,10 @@
 # RVC唱歌-大肥鱼 — Coopanion World
 
-把任意一段音频换成桌宠的音色。全程本机推理，不上传任何录音。
+把任意一段音频换成桌宠的音色；也能整首歌翻唱：分离人声与伴奏 → 主唱换音色 → 混回完整的一首歌。全程本机推理，不上传任何录音。
 
-- `POST /convert`（`multipart/form-data`，默认 `127.0.0.1:9881`）：上传音频，拿回变声后的 wav/mp3。
-- 面板：服务状态、变调、索引率、保护清辅音、上传试听与落盘（T3 起）。
+- `POST /convert`（`multipart/form-data`，默认 `127.0.0.1:9881`）：上传音频，拿回变声后的 wav/mp3；
+  `separator=uvr5` 时先分离人声再变声，回的是人声（不含伴奏）。
+- 面板：服务状态、变声、**翻唱**（整首歌）、音色管理；翻唱时自动分离、变声、混音并落盘。
 - 只做**推理**，不做训练；不处理文字、不发 QQ 消息。
 
 ## 和其他两个插件一起用
@@ -47,7 +48,7 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
 | `pitch` | `0` | 半音，−24..24 |
 | `indexRate` | `0.3` | 0..1，音色没有 `.index` 时忽略 |
 | `protect` | `0.33` | 0..0.5 |
-| `separator` | `off` | `off`；`uvr5` 在缺 `tools/uvr5` 时回 400 |
+| `separator` | `off` | `off`；`uvr5` 先分离人声再变声（回的是人声；分离模型没装时 400） |
 | `format` | `wav` | `wav` / `mp3` |
 | `save` | `0` | `1` 时另存到插件数据目录，响应带 `X-Rvc-Saved` |
 
@@ -57,32 +58,56 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
 
 ## 面板
 
-- **服务**：引擎 / 派生 venv / 权重 / 音色 / 接口五行状态，一键安装、取消与重启引擎，日志尾部。
-  一键安装先建派生 venv 并补 `faiss-cpu`、`praat-parselmouth`，再下约 692 MB 权重，装完自动重拉引擎。
+- **服务**：引擎 / 派生 venv / 权重 / 分离模型 / 音色 / 接口六行状态，一键安装、取消、重启、启停引擎，日志尾部。
+  一键安装先建派生 venv 并补 `faiss-cpu`、`praat-parselmouth`，再下约 692 MB 权重与 64 MB 分离模型，装完自动重拉引擎。
 - **变声**：上传音频 → 变调 / 索引率 / 保护清辅音 → 试听 → 下载；结果同时存到 `<插件数据目录>/out`。
+- **翻唱（分离 + 变声 + 混音）**：上传整首歌 → ① 分离人声/伴奏 → ② 主唱变声 → ③ 混回整首（人声增益 -12..12 dB，默认按原电平）
+  → 试听 / 下载，结果存到 `out/cover-*.wav|mp3`；面板显示分离 / 变声 / 混音三段耗时，防削波时说明整体压低了音量。
+  变声与翻唱都在后台跑：点完可以切到别的页，回来时进度和结果都在。
+  页内直接列出三段各自的设备、耗时与占用，见下表。
 - **音色**：列出 `.pth` / `.index`，导入自备权重，一键设为默认。
 
-面板产物是 `dist/webui.js` + `dist/webui.css`（`pnpm run build`，esbuild 打包，约 13 kB）；
+### 翻唱三段：设备、占用、效果（实测）
+
+| 步骤 | 设备 | 占用 | 耗时 | 效果与局限 |
+| --- | --- | --- | --- | --- |
+| ① 分离 | 显卡（onnxruntime-gpu）或 CPU | 模型 63.7 MB；显卡档另装 `onnxruntime-gpu` 约 215 MB；2 分钟歌进程内存峰值约 3.0 GB（含 torch/onnx 基线） | 12.3 s 音频：显卡 1.3 s（9.5× 实时）/ CPU 9.5 s（1.3× 实时）；120 s 音频 CPU 51–54 s | 拆成人声与伴奏。缺 CUDA/cuDNN 或显存不够时自动退回 CPU；人声可能带少量伴奏残响，伴奏里也可能残留人声尾音 |
+| ② 变声 | 显卡或 CPU | 显卡档显存峰值 545–773 MB、内存约 2.5 GB；CPU 档内存约 1–2 GB | 显卡热态 5.4 s 音频 0.33 s（约 16× 实时）；CPU 12.3 s 音频 7 s（约 0.57× 实时） | 音色与音高替换。整首歌一次性进 HuBERT 很吃显存：显卡被别的插件占满时（本机 12 GB 用到 10.9 GB）2 分钟以上的人声会 CUDA OOM，翻唱前先停掉其他显卡插件 |
+| ③ 混音 | CPU（numpy） | 3 份 float32，约 85 MB / 4 分钟音频 | 12 s 的歌 0.04 s | 按原人声 RMS 叠回伴奏，可加 −12..12 dB 人声增益；总峰值超过 0.99 时整体等比压回，不削波 |
+
+显卡全链路：显卡档会给人声分离也装上 `onnxruntime-gpu`（约 215 MB，阿里云镜像，装不上自动留在 CPU），
+分离、变声都跑显卡，混音仍是毫秒级 CPU；显卡被占满或显存不够时，分离会自动退回 CPU 重跑，不让翻唱失败。
+
+面板产物是 `dist/webui.js` + `dist/webui.css`（`pnpm run build`，esbuild 打包，约 19 kB）；
 上传走 World 内部调用 `convert`：base64 进、`$binary` 出，不经 gpt-sovits。配置组走框架自带配置视图。
 
 ## 运行时
 
 - RVC 推理代码：`RVC-Project/Retrieval-based-Voice-Conversion-WebUI` @ `81eed5e`（无 fairseq，HuBERT 走 transformers）。
   瘦身副本随包分发在 `vendor/rvc`（`infer`、`configs`、`i18n` 的 `zh_CN`/`en_US` 语言包、几个 `tools/*.py`），
-  29 个文件 / 约 0.26 MB；整包 tgz 约 100 kB（解包 391 kB，含面板 bundle）。
+  29 个文件 / 约 0.26 MB；整包 tgz 约 218 kB（解包 700 kB，含面板 bundle 与分离代码）。
 - **权重不进包**：`hubert_base`（transformers 三件套）、`rmvpe.pt`、示例音色共约 692 MB，首次安装时下到
   `<插件数据目录>/assets` 与 `<插件数据目录>/voices`：先写 `.partial` 再校验 SHA-256 才改名，断点续传；
   来源顺序为自有 ModelScope 仓库 → GitHub Release（示例音色）/ hf-mirror → huggingface（上游资产）。
   也可把现成的 `.pth` / `.index` 直接放进 `voices` 目录。
+- **人声分离**（翻唱用）：`UVR-MDX-NET-Inst_HQ_3.onnx`（UVR 项目训练，MIT，63.7 MB），下到 `<插件数据目录>/uvr5`；
+  来源 hf-mirror 的两个镜像仓库，SHA-256 与 UVR 官方发布一致。推理代码是包内的 `vendor/uvr/mdx.py`
+  （移植自 python-audio-separator 0.9.0，MIT，只留 MDX-Net ONNX 路径），跑在运行时自带的 `onnxruntime` 上，
+  **不新增 pip 依赖**、不改共享运行时。
 - 解释器：从共享运行时派生的私有 venv（`--system-site-packages`），只补 `faiss-cpu`、`praat-parselmouth`；
   **不复制、也不修改**共享运行时。共享运行时优先复用部署里 `runtimes/gpt-sovits/` 下的任意一档（谁装的都行），
   没有的话点面板「安装」会自己下一份（`auto` 检测到 NVIDIA 就下显卡档约 4 GB，否则 CPU 档约 1 GB，
   装到同一位置，和 gpt-sovits / 唱歌插件共用），所以不装 gpt-sovits 插件也能单用。
   下载按 64 MB 一片、最多 8 路并行（魔搭单连接会被限到约 0.3 MB/s，并行实测 5–7 MB/s），分片各自断点续传，
   拼好后校验大小与 SHA-256 才解压落位；磁盘余量不够会在下载前直接报出来。
+- 长音频两种模式（面板逐次可选）：**切片**按 20 秒一片跑 RVC（每片带 0.3 秒重叠、交叉淡入淡出，
+  按绝对时间轴裁/补到应有长度，长歌拼完不会人声比伴奏慢），省显存；**整段**一次进模型，更快更连贯但吃显存。
+  `convert` 与 `cover` 都支持，接口对应 `chunk=1|0`（默认 1），worker 日志会打「切片 i/n」。
 - 常驻 worker + 启动预热：显卡档热态 5.4 秒音频 0.33 秒，显存峰值 545–773 MB；
   CPU 档热态 12.3 秒音频 7 秒（约 0.57× 实时。Ryzen 9 8945HX 16 核 / 31 GB 内存实测，
   换低压轻薄本核显机大约慢一倍）。worker 只从 `assetsDir` 读权重，不写 `vendor`。
+- 翻唱整链（CPU 档实测）：12.31 秒的歌分离 8.8 s + 变声 7.7 s + 混音 0.04 s；分离固定跑 CPU 的
+  onnxruntime，一首 4 分钟的歌分离约 2 分钟、变声约 2.5 分钟。混音时按原人声电平叠回伴奏，峰值超 0.99 整体压回。
 
 ## 示例音色
 
@@ -119,4 +144,5 @@ pnpm exec tsx scripts/smoke.mts
 
 ## 许可
 
-MIT，见 `LICENSE`。
+MIT，见 `LICENSE`。第三方声明见 `vendor/uvr/NOTICE.md`：分离代码来自 python-audio-separator 0.9.0（MIT）
+与 Ultimate Vocal Remover（MIT），分离模型由 UVR 项目训练、另行下载、不随包分发。

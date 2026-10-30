@@ -9,6 +9,8 @@
  * - worker → engine：`{"type":"result","id":1,"ok":true,"ms":123,"sampleRate":40000}`
  * - worker → engine：`{"type":"result","id":1,"ok":false,"kind":"decode|infer","error":"..."}`
  * - engine → worker：`{"op":"convert","id":1,"input":"...","output":"...","voice":"...","pitch":0,...}`
+ * - engine → worker：`{"op":"separate","id":2,"input":"...","output":"..."}`
+ * - engine → worker：`{"op":"cover","id":3,"input":"...","output":"...","voice":"...","vocalGain":0,...}`
  * - engine → worker：`{"op":"shutdown"}`
  * worker 的日志一律走 stderr，stdout 只放协议行。
  */
@@ -33,6 +35,8 @@ export interface EngineOptions {
   voicesDir: string;
   /** 模型资产目录（`hubert_base/`、`rmvpe/`）。 */
   assetsDir: string;
+  /** 人声分离模型（`UVR-MDX-NET-Inst_HQ_3.onnx`）；空表示没装。 */
+  uvrModel?: string;
   /** worker.py 的绝对路径。 */
   scriptPath: string;
   /** 启动时就载入的音色（.pth 文件名去掉扩展名）；空为目录里第一个。 */
@@ -66,15 +70,49 @@ export interface ConvertRequest {
   indexRate: number;
   protect: number;
   format: 'wav' | 'mp3';
+  /** 长音频是否切片（默认切）；关掉就整段一次进模型，快但吃显存。 */
+  chunk?: boolean;
+}
+
+/** 整首歌：分离 → 变声 → 混回。 */
+export interface CoverRequest {
+  input: string;
+  output: string;
+  voice?: string;
+  pitch: number;
+  indexRate: number;
+  protect: number;
+  format: 'wav' | 'mp3';
+  /** 人声增益，分贝；0 为按原人声电平混。 */
+  vocalGain?: number;
+  /** 长音频是否切片（默认切）。 */
+  chunk?: boolean;
+}
+
+export interface SeparateRequest {
+  input: string;
+  /** 人声输出路径。 */
+  output: string;
+  /** 伴奏输出路径；空则不写。 */
+  instrumental?: string;
 }
 
 export interface ConvertDone {
   ms: number;
   sampleRate: number;
+  /** 整首歌流程的分段耗时：分离 / 变声 / 混音（毫秒）。 */
+  stages?: { separate?: number; convert?: number; mix?: number };
+  /** 混音时为了不削波整体缩小的倍率（1 表示没缩）。 */
+  peakScale?: number;
 }
 
-const DEFAULT_TIMEOUT_MS = 180_000;
+/** 长音频会切片（每 20 秒一片），5 分钟的音频在 CPU 上也可能几分钟，给足上限。 */
+const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_START_TIMEOUT_MS = 180_000;
+/** 分离一首歌要跑完整条 MDX 流（4 分钟约 2 分钟 CPU），单独给长上限。 */
+const SEPARATE_TIMEOUT_MS = 900_000;
+/** 分离 + 变声 + 混音：一首 4 分钟的歌约 5 分钟，给足余量。 */
+const COVER_TIMEOUT_MS = 1_800_000;
 const TAIL_LINES = 40;
 
 interface Pending {
@@ -152,12 +190,35 @@ export class RvcEngine {
 
   /** 转一条；引擎未就绪时抛 `unavailable`，worker 报解码失败为 `decode`，其余为 `infer`。 */
   async convert(req: ConvertRequest): Promise<ConvertDone> {
+    return this.run('convert', {
+      input: req.input, output: req.output, voice: req.voice ?? '',
+      pitch: req.pitch, indexRate: req.indexRate, protect: req.protect, format: req.format,
+      chunk: req.chunk === false ? 0 : 1,
+    }, this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  }
+
+  /** 只分离（`POST /convert?separator=uvr5` 的第一段）。 */
+  async separate(req: SeparateRequest): Promise<ConvertDone> {
+    return this.run('separate', {
+      input: req.input, output: req.output, instrumental: req.instrumental ?? '',
+    }, SEPARATE_TIMEOUT_MS);
+  }
+
+  /** 整首歌：分离 → 变声 → 混回。 */
+  async cover(req: CoverRequest): Promise<ConvertDone> {
+    return this.run('cover', {
+      input: req.input, output: req.output, voice: req.voice ?? '',
+      pitch: req.pitch, indexRate: req.indexRate, protect: req.protect,
+      format: req.format, vocalGain: req.vocalGain ?? 0, chunk: req.chunk === false ? 0 : 1,
+    }, COVER_TIMEOUT_MS);
+  }
+
+  private async run(op: 'convert' | 'separate' | 'cover', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
     if (!this.ready()) throw new RvcError('unavailable', this.st.detail ?? 'RVC 引擎未就绪');
     const id = ++this.seq;
     const run = () => new Promise<ConvertDone>((resolve, reject) => {
       const child = this.child;
       if (!child?.stdin?.writable) { reject(new RvcError('unavailable', 'RVC worker 已退出')); return; }
-      const timeoutMs = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new RvcError('infer', `RVC 推理超过 ${Math.round(timeoutMs / 1000)} 秒`));
@@ -165,11 +226,7 @@ export class RvcEngine {
       }, timeoutMs);
       timer.unref();
       this.pending.set(id, { resolve, reject, timer });
-      const line = JSON.stringify({
-        op: 'convert', id,
-        input: req.input, output: req.output, voice: req.voice ?? '',
-        pitch: req.pitch, indexRate: req.indexRate, protect: req.protect, format: req.format,
-      });
+      const line = JSON.stringify({ op, id, ...payload });
       try {
         child.stdin.write(`${line}\n`);
       } catch (err) {
@@ -209,6 +266,7 @@ export class RvcEngine {
         // 代码目录在扩展包里，别在里面写 __pycache__。
         PYTHONDONTWRITEBYTECODE: '1',
         RVC_DEFAULT_VOICE: this.opts.voice ?? '',
+        RVC_UVR_MODEL: this.opts.uvrModel ?? '',
         PATH: this.searchPath(),
       },
     });
@@ -295,6 +353,8 @@ export class RvcEngine {
         pending.resolve({
           ms: typeof msg.ms === 'number' ? msg.ms : 0,
           sampleRate: typeof msg.sampleRate === 'number' ? msg.sampleRate : 0,
+          stages: msg.stages && typeof msg.stages === 'object' ? msg.stages as ConvertDone['stages'] : undefined,
+          peakScale: typeof msg.peakScale === 'number' ? msg.peakScale : undefined,
         });
       } else {
         const kind = msg.kind === 'decode' ? 'decode' : msg.kind === 'param' ? 'param' : 'infer';
