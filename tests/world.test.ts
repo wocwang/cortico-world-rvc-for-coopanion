@@ -45,6 +45,7 @@ function pth(): Buffer {
 interface State {
   phase: string;
   ready: boolean;
+  detail: string;
   venv: { phase: string; detail: string | null };
   install: { phase: string; done: number; total: number };
   voicesDir: string;
@@ -115,5 +116,24 @@ describe('World 面板数据面', () => {
     await expect(invoke('convert', ['a.wav', pth().toString('base64'), { pitch: 99 }])).rejects.toThrow('pitch 必须是');
     await expect(invoke('convert', ['a.wav', pth().toString('base64'), { separator: 'uvr5' }])).rejects.toThrow('tools/uvr5');
     await expect(invoke('convert', ['a.wav', pth().toString('base64')])).rejects.toThrow(/未就绪|未启动|不存在/);
+  });
+
+  it('面板可以手动启停引擎', async () => {
+    const { invoke } = await makeWorld();
+    const stopped = (await invoke('stop')) as State;
+    expect(stopped.phase).toBe('stopped');
+    expect(stopped.ready).toBe(false);
+    // 这里的 python 路径故意不存在：点启动后必然报错，但状态必须离开 stopped。
+    await invoke('start');
+    let s = (await invoke('state')) as State;
+    for (let i = 0; i < 50 && s.phase === 'stopped'; i += 1) {
+      await new Promise((r) => setTimeout(r, 20));
+      s = (await invoke('state')) as State;
+    }
+    expect(s.phase).toBe('error');
+    expect(s.detail).toContain('Python 解释器不存在');
+    // 再点停止：回到 stopped，且之后自动重拉不会把它顶回去（这里只看状态回落）。
+    const again = (await invoke('stop')) as State;
+    expect(again.phase).toBe('stopped');
   });
 });

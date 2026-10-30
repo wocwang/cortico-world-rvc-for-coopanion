@@ -147,8 +147,10 @@ const servicePanel: WebUiPanel = {
     const installBtn = ui.button(t.install, { variant: 'primary', size: 'sm', onClick: () => void call('install') });
     const cancelBtn = ui.button(t.cancel, { size: 'sm', onClick: () => void call('cancel') });
     const restartBtn = ui.button(t.restart, { size: 'sm', onClick: () => void call('restart') });
+    const startBtn = ui.button(t.startEngine, { variant: 'primary', size: 'sm', onClick: () => void call('start') });
+    const stopBtn = ui.button(t.stopEngine, { size: 'sm', onClick: () => void call('stop') });
     const acts = ui.actions();
-    acts.append(installBtn, cancelBtn, restartBtn);
+    acts.append(installBtn, cancelBtn, restartBtn, startBtn, stopBtn);
 
     const log = ui.h('pre', 'rvc-log');
     log.hidden = true;
@@ -166,17 +168,22 @@ const servicePanel: WebUiPanel = {
 
     function render(s: PanelState): void {
       state = s;
+      const busy = s.venv.phase === 'working' || s.install.phase === 'working';
       // 引擎
+      const running = s.phase === 'ready' || s.phase === 'starting';
       setPill(engineRow.pill, t[phaseKey(s.phase)], toneOf(s.phase));
       const who = [s.device, s.model].filter(Boolean).join(' · ');
       const started = s.phase === 'ready' && s.startMs ? t.startedIn(Math.round(s.startMs / 1000)) : '';
       engineRow.detail.textContent = [who || s.detail, started].filter(Boolean).join(' · ');
-      restartBtn.disabled = s.phase === 'starting';
+      restartBtn.disabled = s.phase === 'starting' || busy;
+      // 未跑着（或启动中）时给「启动」；跑着时给「停止」——用户自行启停，装依赖期间不让点。
+      startBtn.hidden = running;
+      startBtn.disabled = busy;
+      stopBtn.hidden = !running;
       // 依赖（派生 venv）
       setPill(depsRow.pill, t[phaseKey(s.venv.phase)], toneOf(s.venv.phase));
       depsRow.detail.textContent = s.venv.detail ?? (s.venv.phase === 'ready' ? '' : t.depsAbsent);
       // 权重
-      const busy = s.venv.phase === 'working' || s.install.phase === 'working';
       setPill(
         weightsRow.pill,
         s.install.phase === 'working' ? `${t.working} ${s.install.total ? `${Math.round((s.install.done ?? 0) / s.install.total * 100)}%` : ''}` : t[phaseKey(s.install.phase)],

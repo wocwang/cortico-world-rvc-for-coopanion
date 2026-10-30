@@ -104,6 +104,8 @@ export class RvcWorld implements World {
   private server: ConvertServerHandle | null = null;
   private starting: Promise<void> | null = null;
   private stopped = true;
+  /** 用户在面板上手动停了引擎：自动重拉（装完依赖、切档后）都要让位给这个意图。 */
+  private engineHeld = false;
   private launchDetail = '';
   private codeDir = '';
   private assetsDir = '';
@@ -155,6 +157,7 @@ export class RvcWorld implements World {
   async start(host: WorldHost): Promise<void> {
     this.log = host.log;
     this.stopped = false;
+    this.engineHeld = false;
     this.launchDetail = '';
     this.setup();
     // 就绪可能要十几秒；先让 World 挂上，接口立刻能答 `ready=false`。
@@ -206,10 +209,11 @@ export class RvcWorld implements World {
     this.starting = null;
   }
 
-  /** 拉起/重拉引擎；失败原因进 `launchDetail`，面板与接口据此解释。 */
-  private bootEngine(): void {
+  /** 拉起/重拉引擎；失败原因进 `launchDetail`，面板与接口据此解释。`auto=false` 用于「重启引擎」这类明确动作。 */
+  private bootEngine(auto = true): void {
     const engine = this.engine;
     if (!engine) return;
+    if (auto && this.engineHeld) return;
     this.starting = engine.start()
       .then(() => { this.launchDetail = ''; })
       .catch((err: unknown) => {
@@ -317,10 +321,12 @@ export class RvcWorld implements World {
   }
 
   private async invoke(panel: string, method: string, args: unknown[] = []): Promise<unknown> {
-    if (method === 'state' || method === 'install' || method === 'cancel' || method === 'restart') {
+    if (method === 'state' || method === 'install' || method === 'cancel' || method === 'restart' || method === 'start' || method === 'stop') {
       if (method === 'install') this.startSetup();
       else if (method === 'cancel') { this.runtime?.cancel(); this.installer?.cancel(); this.venv?.cancel(); }
       else if (method === 'restart') void this.restartEngine();
+      else if (method === 'start') this.startEngine();
+      else if (method === 'stop') await this.stopEngine();
       return this.status();
     }
     if (method === 'voices') return { voices: listVoices(this.voicesDir) };
@@ -414,6 +420,8 @@ export class RvcWorld implements World {
   }
 
   private async restartEngine(): Promise<void> {
+    // 「重启」是明确的启动意图：手动停过的印记在这里清掉。
+    this.engineHeld = false;
     await this.engine?.stop();
     if (this.stopped) return;
     // 可能改过推理档/运行时：按当前配置重建 venv 与引擎（venv 的 base 变了会自动重建）。
@@ -423,13 +431,28 @@ export class RvcWorld implements World {
     await venv.check();
     if (this.stopped) return;
     if (venv.state().phase === 'ready') {
-      this.bootEngine();
+      this.bootEngine(false);
       return;
     }
     // 切了推理档或依赖没装：重建派生 venv，装完再拉起引擎，面板能看到「安装中」。
     void venv.ensure().then(() => {
-      if (!this.stopped && venv.state().phase === 'ready') this.bootEngine();
+      if (!this.stopped && venv.state().phase === 'ready') this.bootEngine(false);
     });
+  }
+
+  /** 面板「启动引擎」：清掉手动停止的印记，按当前配置重拉。 */
+  private startEngine(): void {
+    this.engineHeld = false;
+    this.launchDetail = '';
+    if (!this.engine) this.setup();
+    this.bootEngine(false);
+  }
+
+  /** 面板「停止引擎」：立刻释放显存/内存；之后装依赖、切档都不会再把引擎拉起来，直到用户再点启动。 */
+  private async stopEngine(): Promise<void> {
+    this.engineHeld = true;
+    this.launchDetail = '';
+    await this.engine?.stop();
   }
 
   /** 面板上传一条音频：走和 HTTP 接口同一套校验与本机文件转换，回二进制。 */
