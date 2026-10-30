@@ -78,6 +78,11 @@ export class RvcVenv {
     if (this.st.phase === 'working') this.st = { phase: 'absent', detail: '已取消' };
   }
 
+  /** 面板卸载掉派生 venv 后调用：清掉缓存状态，下次安装会重建。 */
+  reset(): void {
+    this.st = { phase: 'absent', detail: null };
+  }
+
   private async run(): Promise<void> {
     this.tail = [];
     this.st = { phase: 'working', detail: '检查依赖' };

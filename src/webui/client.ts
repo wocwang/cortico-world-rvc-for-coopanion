@@ -61,6 +61,11 @@ interface JobResult {
   ms?: number;
   error?: string;
 }
+interface StorageItem {
+  id: string;
+  bytes: number;
+  shared: boolean;
+}
 
 /** base64 → Blob：后台任务的结果从 `takeResult` 拿回来，不再用 `invokeBinary`。 */
 function blobFromBase64(base64: string, mime: string): Blob {
@@ -188,7 +193,75 @@ const servicePanel: WebUiPanel = {
       },
     });
 
-    ctx.root.append(sheet, acts, logToggle, log, msg);
+    // 占用与清理：列 RVC 自己的文件与可释放空间；共享运行时只显示、不提供卸载。
+    const store = ui.section(t.storageTitle, t.storageHint);
+    const storeList = ui.h('div');
+    const storeTotal = ui.h('div', 'rvc-detail');
+    store.append(storeList, storeTotal);
+
+    let armed: string | null = null;
+    const storeNames: Record<string, string> = {
+      runtime: t.storeRuntime,
+      venv: t.storeVenv,
+      assets: t.storeAssets,
+      voices: t.storeVoices,
+      uvr5: t.storeUvr,
+    };
+
+    function renderStorage(items: StorageItem[]): void {
+      storeList.textContent = '';
+      let free = 0;
+      for (const item of items) {
+        const line = row(storeList, ui, storeNames[item.id] ?? item.id);
+        setPill(line.pill, ui.fmt.bytes(item.bytes), item.shared ? 'warn' : 'off');
+        if (item.shared) {
+          line.detail.textContent = t.storeShared;
+          continue;
+        }
+        free += item.bytes;
+        const btn = ui.button(armed === item.id ? t.storeConfirm : t.storeUninstall, {
+          size: 'sm',
+          onClick: () => void remove(item.id),
+        });
+        line.acts.append(btn);
+      }
+      storeTotal.textContent = `${t.storeFree} ${ui.fmt.bytes(free)}`;
+    }
+
+    async function loadStorage(): Promise<void> {
+      try {
+        const res = await ctx.invoke<{ items: StorageItem[] }>('storage');
+        renderStorage(res.items ?? []);
+      } catch (err) {
+        storeTotal.textContent = errText(err);
+      }
+    }
+
+    /** 两段式卸载：第一次点只进入「确认」，再点一次才真的删。 */
+    async function remove(id: string): Promise<void> {
+      if (armed !== id) {
+        armed = id;
+        msg.textContent = t.storeConfirmHint;
+        msg.classList.remove('bad');
+        await loadStorage();
+        return;
+      }
+      armed = null;
+      msg.textContent = '';
+      try {
+        const res = await ctx.invoke<PanelState & { storage?: StorageItem[] }>('uninstall', [id]);
+        render(res);
+        if (res.storage) renderStorage(res.storage);
+        msg.textContent = t.storeRemoved;
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      }
+      await loadStorage();
+    }
+
+    ctx.root.append(sheet, acts, logToggle, log, store, msg);
+    void loadStorage();
 
     function render(s: PanelState): void {
       state = s;

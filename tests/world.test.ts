@@ -106,6 +106,23 @@ describe('World 面板数据面', () => {
     expect(state.uvr5).toBe(true);
   });
 
+  it('能统计占用、卸载自己的模型；共享运行时拒绝卸载', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    mkdirSync(join(dataDir, 'uvr5'), { recursive: true });
+    writeFileSync(join(dataDir, 'uvr5', 'UVR-MDX-NET-Inst_HQ_3.onnx'), Buffer.alloc(4096));
+    mkdirSync(join(dataDir, 'assets'), { recursive: true });
+    writeFileSync(join(dataDir, 'assets', 'hubert.pt'), Buffer.alloc(2048));
+    const store = (await invoke('storage')) as { items: Array<{ id: string; bytes: number; shared: boolean }> };
+    expect(store.items.find((i) => i.id === 'uvr5')?.bytes).toBeGreaterThan(0);
+    expect(store.items.find((i) => i.id === 'assets')?.bytes).toBeGreaterThan(0);
+    expect(store.items.find((i) => i.id === 'runtime')?.shared).toBe(true);
+    await expect(invoke('uninstall', ['runtime'])).rejects.toThrow('共用');
+    await invoke('uninstall', ['uvr5']);
+    expect((await invoke('state') as State).uvr5).toBe(false);
+    const after = (await invoke('storage')) as { items: Array<{ id: string; bytes: number }> };
+    expect(after.items.find((i) => i.id === 'uvr5')?.bytes).toBe(0);
+  });
+
   it('导入 .pth 后出现在列表里，并成为默认音色', async () => {
     const { invoke } = await makeWorld();
     const res = (await invoke('import', ['my.pth', pth().toString('base64')])) as { name: string; voices: Array<{ name: string }> };

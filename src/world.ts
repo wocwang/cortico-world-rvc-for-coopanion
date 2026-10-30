@@ -9,7 +9,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { extname, join } from 'node:path';
+import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
@@ -448,6 +448,8 @@ export class RvcWorld implements World {
       this.beginJob(method, args);
       return this.status();
     }
+    if (method === 'storage') return { items: this.storage() };
+    if (method === 'uninstall') return this.uninstall(String(args[0] ?? ''));
     if (method === 'voices') return { voices: listVoices(this.voicesDir) };
     if (method === 'import') {
       const fileName = typeof args[0] === 'string' ? args[0] : '';
@@ -462,6 +464,37 @@ export class RvcWorld implements World {
       }
     }
     return { error: `unknown method: ${panel}.${method}` };
+  }
+
+  /** 占用统计：只报 id 与字节数，名字由面板翻。`shared` 的项不归 RVC 管，不能在这里删。 */
+  private storage(): Array<{ id: string; bytes: number; shared: boolean }> {
+    return [
+      { id: 'runtime', bytes: this.runtimeDir ? dirBytes(this.runtimeDir) : 0, shared: true },
+      { id: 'venv', bytes: dirBytes(dirname(dirname(this.pythonPath))), shared: false },
+      { id: 'assets', bytes: dirBytes(this.assetsDir), shared: false },
+      { id: 'voices', bytes: dirBytes(this.voicesDir), shared: false },
+      { id: 'uvr5', bytes: dirBytes(this.uvrDir), shared: false },
+    ];
+  }
+
+  /** 面板「卸载」：停引擎后删掉 RVC 自己的文件；共享运行时属于 gpt-sovits，不在这里动。 */
+  private async uninstall(id: string): Promise<Record<string, unknown>> {
+    if (this.job?.phase === 'working') throw new RvcError('param', '有任务在跑，等它结束再卸载');
+    if (id === 'runtime') throw new RvcError('param', '共享运行时由 gpt-sovits / 唱歌插件共用，不能在 RVC 里卸载');
+    const targets: Record<string, string> = {
+      venv: dirname(dirname(this.pythonPath)),
+      assets: this.assetsDir,
+      voices: this.voicesDir,
+      uvr5: this.uvrDir,
+    };
+    const target = targets[id];
+    if (!target) throw new RvcError('param', `未知的模型：${id}`);
+    await this.engine?.stop();
+    rmSync(target, { recursive: true, force: true });
+    if (id === 'venv') this.venv?.reset();
+    this.launchDetail = '已卸载，点「一键安装」可重新装回';
+    this.log?.info('卸载 RVC 数据', { id, path: target });
+    return { ...this.status(), storage: this.storage() };
   }
 
   /** 把变声/翻唱放到后台跑：面板拿到的是即时状态，不用在页面上等。 */
@@ -630,6 +663,40 @@ function stamp(): string {
   const d = new Date();
   const p = (n: number): string => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/** 递归统计目录字节数；读不到的文件跳过，不抛。 */
+function dirBytes(path: string): number {
+  try {
+    const st = statSync(path);
+    if (!st.isDirectory()) return st.size;
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  const stack = [path];
+  while (stack.length) {
+    const dir = stack.pop() as string;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.isFile()) {
+        try {
+          total += statSync(full).size;
+        } catch {
+          // 读不到（正在写/已删）就不计入
+        }
+      }
+    }
+  }
+  return total;
 }
 
 const silentLogger: Logger = {
