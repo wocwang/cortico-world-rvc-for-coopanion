@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.6 — 2026-10-30
+
+- 打包排除 `__pycache__` / `*.pyc`：0.4.5 的 tarball 误带了 `vendor/uvr/__pycache__/mdx.cpython-312.pyc`，
+  换个 Python 小版本就是废文件。功能无变化。
+
 ## 0.4.5 — 2026-10-30
 
 - 人声分离也能走显卡：显卡档的派生 venv 会补一份 `onnxruntime-gpu==1.22.0`（阿里云镜像，约 215 MB，
