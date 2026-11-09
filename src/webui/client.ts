@@ -42,6 +42,16 @@ interface MixDone {
   format: string;
   peakScale?: number;
 }
+interface RangeDone {
+  at: number;
+  ms: number;
+  bytes: number;
+  savedPath: string | null;
+  format: string;
+  start: number;
+  end: number;
+  pitch: number;
+}
 interface SessionSummary {
   id: string;
   createdAt: string;
@@ -64,8 +74,24 @@ interface RefineSession {
   id: string;
   engine: { kind: string; voice: string; modelSampleRate: number };
   source: { durationSec: number; inputPeak: number; format: string };
+  converted: {
+    path: string;
+    sampleRate: number;
+    channels: number;
+    defaults: { pitch: number; indexRate: number; protect: number; chunk: boolean };
+  };
+  segments: Array<{ id: string; start: number; end: number; revision: number; kind: string }>;
   mix: SessionMix;
   outputs: Array<{ format: string; path: string; at: string }>;
+}
+interface PeaksResp {
+  id?: string;
+  sampleRate: number;
+  frames: number;
+  durationSec: number;
+  buckets: number;
+  min: number[];
+  max: number[];
 }
 interface RefineState {
   root: string;
@@ -97,7 +123,8 @@ interface PanelState {
   lastConvert: ConvertDone | null;
   lastCover: CoverDone | null;
   lastMix: MixDone | null;
-  job: { kind: 'convert' | 'cover' | 'remix'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null;
+  lastRange: RangeDone | null;
+  job: { kind: 'convert' | 'cover' | 'remix' | 'range'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null;
   resultReady: boolean;
 }
 interface JobResult {
@@ -605,6 +632,14 @@ const coverPanel: WebUiPanel = {
     let settledKey = '';
     /** 只让最后一次 refineState 请求落地，避免切会话时被慢响应弹回去。 */
     let refineSeq = 0;
+    /** 波形包络与当前拖选（秒）。 */
+    let peaks: PeaksResp | null = null;
+    let peaksKey = '';
+    let peaksSeq = 0;
+    let selStart = 0;
+    let selEnd = 0;
+    let rangeParamsKey = '';
+    let previewTimer = 0;
 
     const refineSheet = ui.section(t.refineTitle, t.refineHint);
     const sessionSelect = ui.select({
@@ -612,6 +647,13 @@ const coverPanel: WebUiPanel = {
       onChange: (value) => {
         selectedId = value;
         mixKey = '';
+        rangeParamsKey = '';
+        peaks = null;
+        peaksKey = '';
+        selStart = 0;
+        selEnd = 0;
+        updateRangeLine();
+        drawWave();
         void loadRefine(value);
       },
     });
@@ -622,6 +664,33 @@ const coverPanel: WebUiPanel = {
     const mixFormat = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
     const mixKnobs = ui.h('div', 'rvc-grid');
     mixKnobs.append(vocalGainDb.field, instGainDb.field, fadeIn.field, fadeOut.field, ui.field(t.format, mixFormat));
+
+    // 选段重跑：波形上拖出 [a,b)，只重渲这一段，区间外样本保持不变。
+    const waveSheet = ui.section(t.rangeTitle, t.rangeHint);
+    const canvas = ui.h('canvas', 'rvc-wave');
+    const rangeLine = ui.h('div', 'rvc-detail');
+    const rangePitch = ui.input({ value: '0' });
+    rangePitch.type = 'number';
+    rangePitch.min = '-24';
+    rangePitch.max = '24';
+    rangePitch.step = '1';
+    const rangeIndex = ui.input({ value: '0.3' });
+    rangeIndex.type = 'number';
+    rangeIndex.min = '0';
+    rangeIndex.max = '1';
+    rangeIndex.step = '0.05';
+    const rangeProtect = ui.input({ value: '0.33' });
+    rangeProtect.type = 'number';
+    rangeProtect.min = '0';
+    rangeProtect.max = '0.5';
+    rangeProtect.step = '0.01';
+    const rangeKnobs = ui.h('div', 'rvc-grid');
+    rangeKnobs.append(ui.field(t.pitch, rangePitch), ui.field(t.indexRate, rangeIndex), ui.field(t.protect, rangeProtect));
+    const rerunRangeBtn = ui.button(t.rangeRerun, { variant: 'primary', size: 'sm', onClick: () => void runRange() });
+    const auditionBtn = ui.button(t.rangeAudition, { size: 'sm', onClick: () => void auditionRange() });
+    const rangeActs = ui.actions();
+    rangeActs.append(rerunRangeBtn, auditionBtn);
+    waveSheet.append(canvas, rangeLine, rangeKnobs, rangeActs);
 
     const remixBtn = ui.button(t.remix, { variant: 'primary', size: 'sm', onClick: () => void runRemix() });
     const deleteBtn = ui.button(t.sessionDelete, { size: 'sm', onClick: () => void deleteCurrent() });
@@ -634,7 +703,8 @@ const coverPanel: WebUiPanel = {
     const mixLine = ui.h('div', 'rvc-detail');
     refineSheet.append(ui.field(t.session, sessionSelect), mixKnobs, refineActs, refineDisk, refineLine, mixLine);
 
-    ctx.root.append(sheet, audio, resultLine, dl, refineSheet, msg);
+    ctx.root.append(sheet, audio, resultLine, dl, refineSheet, waveSheet, msg);
+    ctx.own(disposable(() => { stopPreviewTimer(); }));
 
     fileInput.addEventListener('change', () => {
       file = fileInput.files?.[0] ?? null;
@@ -689,6 +759,25 @@ const coverPanel: WebUiPanel = {
           setSlider(fadeOut, session.mix.fadeOutSec);
         }
       }
+      if (session) {
+        const defaults = session.converted.defaults;
+        const pk = `${session.id}:${defaults.pitch}:${defaults.indexRate}:${defaults.protect}`;
+        if (pk !== rangeParamsKey) {
+          rangeParamsKey = pk;
+          rangePitch.value = String(defaults.pitch);
+          rangeIndex.value = String(defaults.indexRate);
+          rangeProtect.value = String(defaults.protect);
+        }
+      }
+      if (selectedId && peaksKey !== selectedId) void loadPeaks(selectedId);
+      if (!selectedId) {
+        peaks = null;
+        peaksKey = '';
+        selStart = 0;
+        selEnd = 0;
+        updateRangeLine();
+        drawWave();
+      }
       const busy = state?.job?.phase === 'working';
       sessionSelect.disabled = busy || !r.sessions.length;
       vocalGainDb.input.disabled = busy || !session;
@@ -696,7 +785,12 @@ const coverPanel: WebUiPanel = {
       fadeIn.input.disabled = busy || !session;
       fadeOut.input.disabled = busy || !session;
       mixFormat.disabled = busy || !session;
+      rangePitch.disabled = busy || !session || !state?.ready;
+      rangeIndex.disabled = busy || !session || !state?.ready;
+      rangeProtect.disabled = busy || !session || !state?.ready;
       remixBtn.disabled = busy || !session || !state?.ready;
+      rerunRangeBtn.disabled = busy || !session || !state?.ready;
+      auditionBtn.disabled = busy || !session || !state?.ready;
       deleteBtn.disabled = busy || !session;
       cleanupBtn.disabled = busy;
       refineDisk.textContent = t.refineDisk(r.days, r.maxGb);
@@ -705,6 +799,7 @@ const coverPanel: WebUiPanel = {
             session.engine.kind,
             session.engine.voice ? t.voiceLabel(session.engine.voice) : '',
             session.engine.modelSampleRate ? `${session.engine.modelSampleRate} Hz` : '',
+            t.rangeSegments(session.segments.length),
           ].filter(Boolean).join(' · ')
         : t.noSession;
     }
@@ -812,11 +907,220 @@ const coverPanel: WebUiPanel = {
       }
     }
 
+    function fmtSeconds(value: number): string {
+      return `${value.toFixed(2)}s`;
+    }
+
+    function stopPreviewTimer(): void {
+      if (previewTimer) {
+        cancelAnimationFrame(previewTimer);
+        previewTimer = 0;
+      }
+    }
+
+    /** 把 min/max 包络画成波形，并在选区上盖一层半透明块。 */
+    function drawWave(): void {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.round((rect.width || 600) * dpr));
+      const height = Math.max(1, Math.round((rect.height || 96) * dpr));
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      const paint = canvas.getContext('2d');
+      if (!paint) return;
+      paint.clearRect(0, 0, width, height);
+      const mid = height / 2;
+      paint.strokeStyle = 'rgba(127,127,127,.35)';
+      paint.beginPath();
+      paint.moveTo(0, mid);
+      paint.lineTo(width, mid);
+      paint.stroke();
+      if (!peaks || !peaks.max.length) return;
+      const count = peaks.max.length;
+      const bar = width / count;
+      paint.fillStyle = 'rgba(120,170,255,.75)';
+      for (let i = 0; i < count; i += 1) {
+        const high = Math.max(0, Math.min(1, peaks.max[i]));
+        const low = Math.max(-1, Math.min(0, peaks.min[i]));
+        const top = mid - high * mid * 0.92;
+        const bottom = mid - low * mid * 0.92;
+        paint.fillRect(i * bar, top, Math.max(1, bar * 0.9), Math.max(1, bottom - top));
+      }
+      if (peaks.durationSec > 0 && selEnd - selStart > 0.001) {
+        const x1 = (selStart / peaks.durationSec) * width;
+        const x2 = (selEnd / peaks.durationSec) * width;
+        paint.fillStyle = 'rgba(255,196,84,.28)';
+        paint.fillRect(x1, 0, Math.max(1, x2 - x1), height);
+        paint.strokeStyle = 'rgba(255,196,84,.9)';
+        paint.strokeRect(x1 + 0.5, 0.5, Math.max(1, x2 - x1 - 1), height - 1);
+      }
+    }
+
+    function updateRangeLine(): void {
+      if (!selectedId) {
+        rangeLine.textContent = t.rangeNoSession;
+        return;
+      }
+      if (!peaks) {
+        rangeLine.textContent = t.rangeLoading;
+        return;
+      }
+      if (selEnd - selStart < 0.05) {
+        rangeLine.textContent = t.rangeNoSelection;
+        return;
+      }
+      rangeLine.textContent = t.rangeSelection(fmtSeconds(selStart), fmtSeconds(selEnd), fmtSeconds(selEnd - selStart));
+    }
+
+    async function loadPeaks(id: string): Promise<void> {
+      const seq = ++peaksSeq;
+      try {
+        const r = await ctx.invoke<PeaksResp>('refinePeaks', [id]);
+        if (seq !== peaksSeq) return;
+        peaks = r;
+        peaksKey = id;
+        if (selEnd > r.durationSec) {
+          selEnd = r.durationSec;
+          if (selStart > selEnd) selStart = 0;
+        }
+        updateRangeLine();
+        drawWave();
+      } catch (err) {
+        if (seq !== peaksSeq) return;
+        peaks = null;
+        // 记住这次 id，别让 3 秒轮询反复重试同一个失败请求；切会话或重跑后会重新拉。
+        peaksKey = id;
+        rangeLine.textContent = errText(err);
+        drawWave();
+      }
+    }
+
+    function timeAt(event: PointerEvent): number {
+      const rect = canvas.getBoundingClientRect();
+      const duration = peaks?.durationSec ?? 0;
+      if (rect.width <= 0) return 0;
+      const ratio = (event.clientX - rect.left) / rect.width;
+      return Math.min(duration, Math.max(0, ratio * duration));
+    }
+
+    let dragging = false;
+    let dragAnchor = 0;
+    canvas.addEventListener('pointerdown', (event) => {
+      if (!peaks) return;
+      dragging = true;
+      dragAnchor = timeAt(event);
+      selStart = dragAnchor;
+      selEnd = dragAnchor;
+      canvas.setPointerCapture(event.pointerId);
+      updateRangeLine();
+      drawWave();
+    });
+    canvas.addEventListener('pointermove', (event) => {
+      if (!dragging) return;
+      const now = timeAt(event);
+      selStart = Math.min(dragAnchor, now);
+      selEnd = Math.max(dragAnchor, now);
+      updateRangeLine();
+      drawWave();
+    });
+    canvas.addEventListener('pointerup', (event) => {
+      if (!dragging) return;
+      dragging = false;
+      const now = timeAt(event);
+      selStart = Math.min(dragAnchor, now);
+      selEnd = Math.max(dragAnchor, now);
+      // 单击给 0.5 秒默认选区，省得「点了没反应」。
+      if (peaks && selEnd - selStart < 0.05) selEnd = Math.min(peaks.durationSec, selStart + 0.5);
+      updateRangeLine();
+      drawWave();
+    });
+    canvas.addEventListener('pointercancel', () => { dragging = false; });
+    window.addEventListener('resize', drawWave);
+    ctx.own(disposable(() => { window.removeEventListener('resize', drawWave); }));
+
+    async function runRange(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      if (!peaks || selEnd - selStart < 0.05) { msg.textContent = t.rangeSelectFirst; msg.classList.add('bad'); return; }
+      settledKey = '';
+      mixLine.textContent = '';
+      msg.textContent = t.rangeRunning;
+      rerunRangeBtn.disabled = true;
+      try {
+        await ctx.invoke('rangeConvert', [selectedId, {
+          startSec: selStart,
+          endSec: selEnd,
+          pitch: Number(rangePitch.value),
+          indexRate: Number(rangeIndex.value),
+          protect: Number(rangeProtect.value),
+          format: mixFormat.value,
+        }]);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+        rerunRangeBtn.disabled = !state?.ready;
+      }
+    }
+
+    /** 用当前滑杆参数混出临时成品，只播放选区那一段。 */
+    async function auditionRange(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      if (!peaks || selEnd - selStart < 0.05) { msg.textContent = t.rangeSelectFirst; msg.classList.add('bad'); return; }
+      const from = selStart;
+      const to = selEnd;
+      msg.textContent = t.previewing;
+      auditionBtn.disabled = true;
+      try {
+        const r = await ctx.invoke<JobResult>('refinePreview', [selectedId, {
+          vocalGainDb: Number(vocalGainDb.input.value),
+          instGainDb: Number(instGainDb.input.value),
+          fadeInSec: Number(fadeIn.input.value),
+          fadeOutSec: Number(fadeOut.input.value),
+          format: mixFormat.value,
+        }]);
+        if (r.error || !r.base64) throw new Error(r.error ?? '没有拿到音频');
+        const blob = blobFromBase64(r.base64, r.mime ?? 'audio/wav');
+        if (url) URL.revokeObjectURL(url);
+        url = URL.createObjectURL(blob);
+        audio.src = url;
+        audio.hidden = false;
+        msg.textContent = '';
+        const playSpan = (): void => {
+          audio.currentTime = from;
+          void audio.play().catch(() => undefined);
+          stopPreviewTimer();
+          const tick = (): void => {
+            if (audio.paused) { previewTimer = 0; return; }
+            if (audio.currentTime >= to) {
+              audio.pause();
+              audio.currentTime = from;
+              previewTimer = 0;
+              return;
+            }
+            previewTimer = requestAnimationFrame(tick);
+          };
+          previewTimer = requestAnimationFrame(tick);
+        };
+        if (audio.readyState >= 1) playSpan();
+        else audio.addEventListener('loadedmetadata', playSpan, { once: true });
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      } finally {
+        auditionBtn.disabled = !(state?.ready && selectedId);
+      }
+    }
+
     async function settle(s: PanelState): Promise<void> {
       const job = s.job;
-      if (!job || (job.kind !== 'cover' && job.kind !== 'remix')) return;
+      if (!job || (job.kind !== 'cover' && job.kind !== 'remix' && job.kind !== 'range')) return;
       if (job.phase === 'working') {
-        msg.textContent = job.detail || (job.kind === 'remix' ? t.remixing : t.covering);
+        msg.textContent = job.detail || (job.kind === 'range' ? t.rangeRunning : job.kind === 'remix' ? t.remixing : t.covering);
         msg.classList.remove('bad');
         return;
       }
@@ -824,7 +1128,7 @@ const coverPanel: WebUiPanel = {
       if (job.phase === 'error') {
         if (settledKey !== key) {
           settledKey = key;
-          msg.textContent = job.error || (job.kind === 'remix' ? '重新混音失败' : '翻唱失败');
+          msg.textContent = job.error || (job.kind === 'range' ? '选段重跑失败' : job.kind === 'remix' ? '重新混音失败' : '翻唱失败');
           msg.classList.add('bad');
         }
         return;
@@ -843,6 +1147,27 @@ const coverPanel: WebUiPanel = {
       url = URL.createObjectURL(blob);
       audio.src = url;
       audio.hidden = false;
+      if (job.kind === 'range') {
+        const done = s.lastRange;
+        dl.href = url;
+        dl.download = done
+          ? `refine-${done.start.toFixed(1)}-${done.end.toFixed(1)}.${done.format}`
+          : `refine.${mixFormat.value}`;
+        dl.hidden = false;
+        mixLine.textContent = done
+          ? t.rangeDone(
+              ui.fmt.duration(done.ms),
+              ui.fmt.bytes(done.bytes),
+              fmtSeconds(done.start),
+              fmtSeconds(done.end),
+              done.savedPath ?? r.savedPath ?? '',
+            )
+          : '';
+        // conv.wav 已经换过一段，波形要重新拉；选区保留，方便连续微调。
+        peaksKey = '';
+        void loadPeaks(selectedId);
+        return;
+      }
       if (job.kind === 'remix') {
         const done = s.lastMix;
         dl.href = url;

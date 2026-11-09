@@ -133,6 +133,48 @@ export interface ConvertDone {
   rmsRatio?: number;
   /** 翻唱/重混：成品时长（秒）。 */
   durationSec?: number;
+  /** 区间重跑：实际拼回的样本区间与预期长度。 */
+  spliced?: { start: number; end: number; expected: number };
+  /** 区间重跑：峰值补偿倍率（只衰减不放大）。 */
+  peakFactor?: number;
+  /** 波形包络：每个桶的 min/max 与总帧数。 */
+  peaks?: { buckets: number; frames: number; min: number[]; max: number[] };
+}
+
+/** 只重跑一段时间：读会话人声分轨的窗口，换参数重渲后拼回 conv。 */
+export interface RangeConvertRequest {
+  /** 分离人声（44.1 kHz）。 */
+  stem: string;
+  /** 变声结果（44.1 kHz mono），原地改写。 */
+  conv: string;
+  startSec: number;
+  endSec: number;
+  /** 窗口上下文（秒，默认 0.5）；只用于给模型听感，不写回。 */
+  contextSec?: number;
+  /** 选区边缘交叉淡化（秒，默认 0.3），在选区内部完成。 */
+  seamSec?: number;
+  outSr?: number;
+  voice?: string;
+  pitch: number;
+  indexRate: number;
+  protect: number;
+  /** 首次翻唱的整轨输入峰值；用于复现同样的音量。 */
+  inputPeak: number;
+}
+
+export interface PeaksRequest {
+  path: string;
+  /** 包络桶数（默认 1200）。 */
+  buckets?: number;
+}
+
+export interface PeaksDone {
+  sampleRate: number;
+  frames: number;
+  durationSec: number;
+  buckets: number;
+  min: number[];
+  max: number[];
 }
 
 /** 长音频会切片（每 20 秒一片），5 分钟的音频在 CPU 上也可能几分钟，给足上限。 */
@@ -144,6 +186,11 @@ const SEPARATE_TIMEOUT_MS = 900_000;
 const COVER_TIMEOUT_MS = 1_800_000;
 /** 重混只读文件、不跑模型；长音频也在秒级到分钟级。 */
 const REMIX_TIMEOUT_MS = 300_000;
+/** 区间重跑至少给 2 分钟，再按窗口时长加；20 秒窗口不必等 10 分钟。 */
+const RANGE_BASE_TIMEOUT_MS = 120_000;
+const RANGE_PER_SECOND_MS = 4_000;
+/** 波形包络只读文件。 */
+const PEAKS_TIMEOUT_MS = 60_000;
 const TAIL_LINES = 40;
 
 interface Pending {
@@ -254,7 +301,38 @@ export class RvcEngine {
     }, REMIX_TIMEOUT_MS);
   }
 
-  private async run(op: 'convert' | 'separate' | 'cover' | 'remix', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
+  /** 只重跑一段时间并拼回 conv；超时按窗口时长给，不按整首给。 */
+  async convertRange(req: RangeConvertRequest): Promise<ConvertDone> {
+    const span = Math.max(0, req.endSec - req.startSec);
+    const timeout = Math.min(
+      COVER_TIMEOUT_MS,
+      RANGE_BASE_TIMEOUT_MS + Math.ceil(span * RANGE_PER_SECOND_MS),
+    );
+    return this.run('convertRange', {
+      stem: req.stem, conv: req.conv, startSec: req.startSec, endSec: req.endSec,
+      contextSec: req.contextSec ?? 0.5, seamSec: req.seamSec ?? 0.3,
+      outSr: req.outSr ?? 44100, voice: req.voice ?? '',
+      pitch: req.pitch, indexRate: req.indexRate, protect: req.protect,
+      inputPeak: req.inputPeak,
+    }, timeout);
+  }
+
+  /** 波形包络（min/max），面板拖选用。 */
+  async peaks(req: PeaksRequest): Promise<PeaksDone> {
+    const done = await this.run('peaks', { path: req.path, buckets: req.buckets ?? 1200 }, PEAKS_TIMEOUT_MS);
+    const peaks = done.peaks;
+    if (!peaks) throw new RvcError('infer', 'RVC 没有返回波形数据');
+    return {
+      sampleRate: done.sampleRate,
+      frames: peaks.frames,
+      durationSec: done.durationSec ?? 0,
+      buckets: peaks.buckets,
+      min: peaks.min,
+      max: peaks.max,
+    };
+  }
+
+  private async run(op: 'convert' | 'separate' | 'cover' | 'remix' | 'convertRange' | 'peaks', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
     if (!this.ready()) throw new RvcError('unavailable', this.st.detail ?? 'RVC 引擎未就绪');
     const id = ++this.seq;
     const run = () => new Promise<ConvertDone>((resolve, reject) => {
@@ -400,6 +478,9 @@ export class RvcEngine {
           modelSampleRate: typeof msg.modelSampleRate === 'number' ? msg.modelSampleRate : undefined,
           rmsRatio: typeof msg.rmsRatio === 'number' ? msg.rmsRatio : undefined,
           durationSec: typeof msg.durationSec === 'number' ? msg.durationSec : undefined,
+          spliced: msg.spliced && typeof msg.spliced === 'object' ? msg.spliced as ConvertDone['spliced'] : undefined,
+          peakFactor: typeof msg.peakFactor === 'number' ? msg.peakFactor : undefined,
+          peaks: msg.peaks && typeof msg.peaks === 'object' ? msg.peaks as ConvertDone['peaks'] : undefined,
         });
       } else {
         const kind = msg.kind === 'decode' ? 'decode' : msg.kind === 'param' ? 'param' : 'infer';

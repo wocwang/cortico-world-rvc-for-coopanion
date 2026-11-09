@@ -17,6 +17,10 @@ stdout 只放协议行（原 fd 被 dup 出来单独写，其余输出统统改�
    "sessionDir":"<dataDir>/sessions/20261109-221501-a1b2"}
   {"op":"remix","id":4,"vocals":"conv.wav","inst":"inst.wav","output":"mix.wav",
    "format":"wav","vocalGain":0,"instGain":0,"fadeIn":0,"fadeOut":0,"rmsRatio":1.0}
+  {"op":"convertRange","id":5,"stem":"stems/vocals.wav","conv":"vocals/conv.wav",
+   "startSec":32.0,"endSec":41.0,"contextSec":0.5,"seamSec":0.3,"outSr":44100,
+   "voice":"daifeiyu","pitch":2,"indexRate":0.3,"protect":0.33,"inputPeak":0.91}
+  {"op":"peaks","id":6,"path":"vocals/conv.wav","buckets":1200}
   {"op":"shutdown"}
 
 回复：
@@ -689,6 +693,210 @@ def main() -> int:
             "durationSec": round(duration, 3),
         })
 
+    def convert_range(req: dict) -> None:
+        """只重跑一段时间，拼回 conv.wav；选区外的样本一个都不动。
+
+        窗口比选区多读 `contextSec`（默认 0.5 秒）给模型上下文，但只把 `[startSec, endSec)`
+        的结果写回去。交叉淡化放在选区**内部**，因此选区外逐样本不变，接缝又不会爆音。
+        """
+        import shutil
+        import tempfile
+        from math import gcd
+
+        import numpy as np
+        import soundfile as sf
+        from scipy.signal import resample_poly
+
+        req_id = req.get("id")
+
+        def as_float(value, default):
+            try:
+                result = float(value)
+                return result if np.isfinite(result) else default
+            except (TypeError, ValueError):
+                return default
+
+        voice_name = (req.get("voice") or "").strip() or default_voice
+        stem = req.get("stem") or ""
+        conv_path = req.get("conv") or ""
+        if not stem or not os.path.isfile(stem):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到人声分轨：%s" % stem})
+            return
+        if not conv_path or not os.path.isfile(conv_path):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到变声结果：%s" % conv_path})
+            return
+        try:
+            load_voice(voice_name)
+        except Exception as error:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": str(error)})
+            return
+
+        start_sec = as_float(req.get("startSec"), None)
+        end_sec = as_float(req.get("endSec"), None)
+        if start_sec is None or end_sec is None or start_sec < 0 or end_sec - start_sec < 0.05:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "选段无效：需要 startSec ≥ 0 且 endSec - startSec ≥ 0.05 秒"})
+            return
+        out_sr = int(as_float(req.get("outSr"), 44100))
+        if out_sr <= 0:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "输出采样率无效"})
+            return
+        context = min(5.0, max(0.0, as_float(req.get("contextSec"), 0.5)))
+        seam_sec = min(2.0, max(0.0, as_float(req.get("seamSec"), 0.3)))
+
+        try:
+            conv, _ = sf.read(conv_path, dtype="float32", always_2d=False)
+            if conv.ndim > 1:
+                conv = conv.mean(axis=1)
+            conv = np.asarray(conv, dtype=np.float32)
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到变声结果：%s" % conv_path})
+            return
+        total = int(conv.shape[0])
+        # 一律先换成整数样本再算长度与偏移，避免浮点累计误差。
+        a = max(0, min(int(round(start_sec * out_sr)), total))
+        b = max(a, min(int(round(end_sec * out_sr)), total))
+        expected = b - a
+        if expected < 1:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "选段超出音频长度"})
+            return
+
+        try:
+            stem_info = sf.info(stem)
+            stem_sr = int(stem_info.samplerate) or out_sr
+            stem_duration = int(stem_info.frames) / float(stem_sr)
+            win_start_sec = max(0.0, start_sec - context)
+            win_end_sec = min(stem_duration, end_sec + context)
+            read_start = max(0, int(round(win_start_sec * stem_sr)))
+            read_frames = max(1, int(round(win_end_sec * stem_sr)) - read_start)
+            window, window_sr = sf.read(stem, start=read_start, frames=read_frames, dtype="float32", always_2d=True)
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到人声分轨：%s" % stem})
+            return
+        mono = window.mean(axis=1).astype(np.float32)
+        if int(window_sr) != out_sr:
+            g = gcd(int(window_sr), out_sr)
+            mono = resample_poly(mono, out_sr // g, int(window_sr) // g).astype(np.float32)
+
+        # 选区在窗口里的起点；模型输出与输入窗口等长，按这个偏移取回 [a, b)。
+        offset = max(0, int(round(a - win_start_sec * out_sr)))
+        target_peak = 0.0
+        target = mono[offset:offset + expected]
+        if target.size:
+            target_peak = float(np.abs(target).max())
+        input_peak = as_float(req.get("inputPeak"), 0.0) or 0.0
+        factor = 1.0
+        if input_peak > 1e-6 and target_peak > 0:
+            factor = min(1.0, target_peak / input_peak)
+
+        began = time.time()
+        warm = tempfile.mkdtemp(prefix="rvc-range-")
+        win_path = os.path.join(warm, "window.wav")
+        try:
+            sf.write(win_path, mono, out_sr, subtype="PCM_16")
+            # run_vc 直接返回 (sampleRate, int16 波形)；失败时第二项是 None。
+            sample_rate, piece = run_vc(
+                win_path,
+                int(as_float(req.get("pitch"), 0)),
+                as_float(req.get("indexRate"), 0.3),
+                as_float(req.get("protect"), 0.33),
+                True,
+            )
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
+            return
+        finally:
+            shutil.rmtree(warm, ignore_errors=True)
+        if piece is None:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": str(sample_rate)[-1500:]})
+            return
+
+        model_sr, piece = int(sample_rate), np.asarray(piece)
+        if piece.ndim > 1:
+            piece = piece.mean(axis=1)
+        piece = piece.astype(np.float32) / 32768.0 if piece.dtype.kind in "iu" else piece.astype(np.float32)
+        if model_sr != out_sr:
+            g = gcd(model_sr, out_sr)
+            piece = resample_poly(piece, out_sr // g, model_sr // g).astype(np.float32)
+        piece = piece[offset:offset + expected] if piece.size > offset else np.zeros(0, dtype=np.float32)
+        if piece.size < expected:
+            piece = np.pad(piece, (0, expected - piece.size))
+        piece = piece * factor
+
+        # 交叉淡化只作用于选区内：区间外一个样本都不改写。
+        old = conv[a:b].astype(np.float32, copy=True)
+        seam = min(int(round(seam_sec * out_sr)), expected // 2)
+        if seam > 0:
+            w = np.ones(expected, dtype=np.float32)
+            w[:seam] = np.linspace(0.0, 1.0, seam, endpoint=False, dtype=np.float32)
+            w[-seam:] = np.linspace(1.0, 0.0, seam, dtype=np.float32)
+            conv[a:b] = old * (1.0 - w) + piece * w
+        else:
+            conv[a:b] = piece
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(conv_path)), exist_ok=True)
+            # 先留一份上一次的整轨，写坏了还能手动找回。
+            shutil.copyfile(conv_path, conv_path + ".bak")
+            tmp = conv_path + ".part.wav"
+            sf.write(tmp, conv, out_sr, subtype="FLOAT")
+            if int(sf.info(tmp).frames) != total:
+                raise ValueError("拼接后的长度与原文件不一致")
+            os.replace(tmp, conv_path)
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "写回失败：%s" % traceback.format_exc()[-800:]})
+            return
+        emit({
+            "type": "result",
+            "id": req_id,
+            "ok": True,
+            "ms": int((time.time() - began) * 1000),
+            "sampleRate": out_sr,
+            "durationSec": round(total / float(out_sr), 3),
+            "peakFactor": round(factor, 4),
+            "spliced": {"start": a, "end": b, "expected": expected},
+        })
+
+    def peaks(req: dict) -> None:
+        """返回波形绘制用的 min/max 包络（约 1200 个桶），面板拖选用。"""
+        import numpy as np
+        import soundfile as sf
+
+        req_id = req.get("id")
+        path = req.get("path") or ""
+        if not path or not os.path.isfile(path):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到音频：%s" % path})
+            return
+        began = time.time()
+        try:
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+            mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+            n = int(mono.shape[0])
+            buckets = int(np.clip(int(req.get("buckets") or 1200), 64, 4000))
+            edges = np.linspace(0, n, buckets + 1).astype(np.int64)
+            low = []
+            high = []
+            for i in range(buckets):
+                s, e = int(edges[i]), int(edges[i + 1])
+                if e <= s:
+                    low.append(0.0)
+                    high.append(0.0)
+                    continue
+                seg = mono[s:e]
+                low.append(round(float(seg.min()), 4))
+                high.append(round(float(seg.max()), 4))
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读取波形失败：%s" % traceback.format_exc()[-800:]})
+            return
+        emit({
+            "type": "result",
+            "id": req_id,
+            "ok": True,
+            "ms": int((time.time() - began) * 1000),
+            "sampleRate": int(sr),
+            "durationSec": round(n / float(sr), 3),
+            "peaks": {"buckets": buckets, "frames": n, "min": low, "max": high},
+        })
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -712,6 +920,12 @@ def main() -> int:
             continue
         if op == "remix":
             remix(req)
+            continue
+        if op == "convertRange":
+            convert_range(req)
+            continue
+        if op == "peaks":
+            peaks(req)
             continue
         print("[rvc] 未知指令：%s" % op, file=sys.stderr)
     return 0

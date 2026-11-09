@@ -30,6 +30,19 @@ export interface SessionOutput {
   at: string;
 }
 
+/** 一次选段重跑或（P2 起）一个可重做的逻辑段落。 */
+export interface RefineSegment {
+  id: string;
+  /** 秒。 */
+  start: number;
+  end: number;
+  params: { pitch: number; indexRate: number; protect: number };
+  revision: number;
+  at: string;
+  /** P1 只写 `range`；P2 再扩成段落。 */
+  kind: 'range';
+}
+
 export interface RefineSession {
   version: number;
   id: string;
@@ -44,8 +57,8 @@ export interface RefineSession {
     channels: number;
     defaults: { pitch: number; indexRate: number; protect: number; chunk: boolean };
   };
-  /** P2 才用；P0 先留空数组，字段定好后面只加不改。 */
-  segments: unknown[];
+  /** 选区重跑记录；P2 起承载段落参数与静音状态。 */
+  segments: RefineSegment[];
   mix: SessionMix;
   outputs: SessionOutput[];
 }
