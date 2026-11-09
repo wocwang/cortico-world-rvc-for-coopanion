@@ -30,17 +30,54 @@ export interface SessionOutput {
   at: string;
 }
 
-/** 一次选段重跑或（P2 起）一个可重做的逻辑段落。 */
+export interface SegmentParams {
+  pitch: number;
+  indexRate: number;
+  protect: number;
+}
+
+/** 一次选段重跑（`range`）或一个可重做/静音/还原的逻辑段落（`segment`）。 */
 export interface RefineSegment {
   id: string;
   /** 秒。 */
   start: number;
   end: number;
-  params: { pitch: number; indexRate: number; protect: number };
+  params: SegmentParams;
   revision: number;
   at: string;
-  /** P1 只写 `range`；P2 再扩成段落。 */
-  kind: 'range';
+  kind: 'range' | 'segment';
+  /** 段落是否静音；只影响混音，不改 conv.wav。 */
+  muted?: boolean;
+  /** 段落首次重做前的原始音频（相对会话目录）；还原用。 */
+  backup?: string;
+}
+
+/** 默认段落粒度；与 worker 的 20 秒切片对齐，段落边界正好落在交叉淡化接缝上。 */
+export const SEGMENT_SECONDS = 20;
+
+/** 按 20 秒网格切出默认段落；尾巴不足 1 秒并进上一段，免得出现看不见的碎片。 */
+export function defaultSegments(
+  durationSec: number,
+  defaults: SegmentParams,
+  at = new Date().toISOString(),
+): RefineSegment[] {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) return [];
+  let count = Math.max(1, Math.ceil(durationSec / SEGMENT_SECONDS));
+  if (count > 1 && durationSec - (count - 1) * SEGMENT_SECONDS < 1) count -= 1;
+  const segments: RefineSegment[] = [];
+  for (let i = 0; i < count; i += 1) {
+    segments.push({
+      id: `s${i + 1}`,
+      start: i * SEGMENT_SECONDS,
+      end: i === count - 1 ? durationSec : (i + 1) * SEGMENT_SECONDS,
+      params: { ...defaults },
+      revision: 0,
+      at,
+      kind: 'segment',
+      muted: false,
+    });
+  }
+  return segments;
 }
 
 export interface RefineSession {

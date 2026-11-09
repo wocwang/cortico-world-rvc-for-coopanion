@@ -9,8 +9,17 @@
  * 纯计算（`rangeSamples` / `appendSegment`）与引擎解耦，方便单测。
  */
 import { join } from 'node:path';
-import type { ConvertDone, PeaksDone, RangeConvertRequest } from './engine.ts';
-import { readSession, sessionDir, writeSession, type RefineSegment, type RefineSession } from './session.ts';
+import { existsSync } from 'node:fs';
+import type { ConvertDone, PeaksDone, RangeConvertRequest, RestoreRangeRequest } from './engine.ts';
+import {
+  defaultSegments,
+  readSession,
+  sessionDir,
+  writeSession,
+  type RefineSegment,
+  type RefineSession,
+  type SegmentParams,
+} from './session.ts';
 
 /** 窗口上下文：选区前后各多读 0.5 秒给模型，只写回选区。 */
 export const RANGE_CONTEXT_SEC = 0.5;
@@ -25,6 +34,7 @@ export const MIN_RANGE_SEC = 0.05;
 export interface EngineAdapter {
   peaks(req: { path: string; buckets?: number }): Promise<PeaksDone>;
   convertRange(req: RangeConvertRequest): Promise<ConvertDone>;
+  restoreRange(req: RestoreRangeRequest): Promise<ConvertDone>;
 }
 
 export interface RangeSamples {
@@ -123,6 +133,49 @@ function numberOr(value: unknown, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function clampParams(
+  defaults: SegmentParams,
+  opts: { pitch?: number; indexRate?: number; protect?: number },
+): SegmentParams {
+  return {
+    pitch: Math.round(clamp(numberOr(opts.pitch, defaults.pitch), -24, 24)),
+    indexRate: clamp(numberOr(opts.indexRate, defaults.indexRate), 0, 1),
+    protect: clamp(numberOr(opts.protect, defaults.protect), 0, 0.5),
+  };
+}
+
+function mustRead(dataDir: string, id: string): { dir: string; session: RefineSession } {
+  const dir = sessionDir(dataDir, id);
+  const session = dir ? readSession(dataDir, id) : null;
+  if (!dir || !session) throw new Error(`找不到会话：${id || '(空)'}`);
+  return { dir, session };
+}
+
+/** 调引擎重跑一段：窗口、峰值补偿、交叉淡化都在 worker 里完成。 */
+function convertSpan(
+  engine: EngineAdapter,
+  dir: string,
+  session: RefineSession,
+  startSec: number,
+  endSec: number,
+  params: SegmentParams,
+  backupPath?: string,
+): Promise<ConvertDone> {
+  return engine.convertRange({
+    stem: join(dir, session.stems.vocals),
+    conv: join(dir, session.converted.path),
+    startSec,
+    endSec,
+    contextSec: RANGE_CONTEXT_SEC,
+    seamSec: RANGE_SEAM_SEC,
+    outSr: session.converted.sampleRate,
+    voice: session.engine.voice,
+    inputPeak: session.source.inputPeak,
+    backupPath,
+    ...params,
+  });
+}
+
 /** 校验会话与选区 → 调引擎重跑 → 记录 segments 并原子写回 session.json。 */
 export async function rerunRange(
   dataDir: string,
@@ -130,9 +183,7 @@ export async function rerunRange(
   id: string,
   opts: RangeOptions,
 ): Promise<RangeResult> {
-  const dir = sessionDir(dataDir, id);
-  const session = dir ? readSession(dataDir, id) : null;
-  if (!dir || !session) throw new Error(`找不到会话：${id || '(空)'}`);
+  const { dir, session } = mustRead(dataDir, id);
 
   const startSec = Number(opts.startSec);
   const endSec = Number(opts.endSec);
@@ -146,27 +197,221 @@ export async function rerunRange(
   }
   rangeSamples(clampedStart, clampedEnd, session.converted.sampleRate);
 
-  const defaults = session.converted.defaults;
-  const params = {
-    pitch: Math.round(clamp(numberOr(opts.pitch, defaults.pitch), -24, 24)),
-    indexRate: clamp(numberOr(opts.indexRate, defaults.indexRate), 0, 1),
-    protect: clamp(numberOr(opts.protect, defaults.protect), 0, 0.5),
-  };
-
-  const done = await engine.convertRange({
-    stem: join(dir, session.stems.vocals),
-    conv: join(dir, session.converted.path),
-    startSec: clampedStart,
-    endSec: clampedEnd,
-    contextSec: RANGE_CONTEXT_SEC,
-    seamSec: RANGE_SEAM_SEC,
-    outSr: session.converted.sampleRate,
-    voice: session.engine.voice,
-    inputPeak: session.source.inputPeak,
-    ...params,
-  });
+  const params = clampParams(session.converted.defaults, opts);
+  const done = await convertSpan(engine, dir, session, clampedStart, clampedEnd, params);
 
   const segment = appendSegment(session, clampedStart, clampedEnd, params);
   writeSession(dataDir, id, session);
   return { id, session, segment, done };
+}
+
+/**
+ * 老会话没有段落网格时补一份（P1 只存过 `range` 记录）。
+ * 返回是否改动；调用方据此决定要不要回写 session.json。
+ */
+export function ensureSegments(session: RefineSession, at = new Date().toISOString()): boolean {
+  if (session.segments.some((item) => item.kind === 'segment')) return false;
+  const grid = defaultSegments(session.source.durationSec, session.converted.defaults, at);
+  if (!grid.length) return false;
+  session.segments = [...session.segments, ...grid].sort((a, b) => a.start - b.start);
+  session.updatedAt = at;
+  return true;
+}
+
+/** 静音段落只影响混音：把区间收集出来交给 remix，不改 conv.wav。 */
+export function mutedRanges(segments: RefineSegment[]): Array<{ start: number; end: number }> {
+  return segments
+    .filter((item) => item.kind === 'segment' && item.muted)
+    .map((item) => ({ start: item.start, end: item.end }));
+}
+
+function segmentIndex(session: RefineSession, segmentId: string): number {
+  const index = session.segments.findIndex((item) => item.id === segmentId && item.kind === 'segment');
+  if (index < 0) throw new Error(`找不到段落：${segmentId || '(空)'}`);
+  return index;
+}
+
+function nextSegmentId(segments: RefineSegment[]): string {
+  let max = 0;
+  for (const item of segments) {
+    const match = /^s(\d+)$/.exec(item.id);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return `s${max + 1}`;
+}
+
+/** 在段落内部切一刀；两段都继承参数，备份作废（长度已经对不上）。 */
+export function splitSegmentIn(
+  session: RefineSession,
+  segmentId: string,
+  atSec: number,
+  at = new Date().toISOString(),
+): RefineSegment {
+  const index = segmentIndex(session, segmentId);
+  const segment = session.segments[index];
+  const cut = Number(atSec);
+  if (!Number.isFinite(cut) || cut - segment.start < MIN_RANGE_SEC || segment.end - cut < MIN_RANGE_SEC) {
+    throw new Error(`切割点要离段落两端至少 ${MIN_RANGE_SEC} 秒`);
+  }
+  const left: RefineSegment = { ...segment, end: cut, backup: undefined, at };
+  const right: RefineSegment = {
+    id: nextSegmentId(session.segments),
+    start: cut,
+    end: segment.end,
+    params: { ...segment.params },
+    revision: 0,
+    at,
+    kind: 'segment',
+    muted: false,
+  };
+  const rest = session.segments.slice();
+  rest.splice(index, 1, left, right);
+  session.segments = rest;
+  session.updatedAt = at;
+  return left;
+}
+
+/** 合并下一段（必须首尾相接）；合并后的备份作废。 */
+export function mergeSegmentWithNext(
+  session: RefineSession,
+  segmentId: string,
+  at = new Date().toISOString(),
+): RefineSegment {
+  const index = segmentIndex(session, segmentId);
+  const segment = session.segments[index];
+  const next = session.segments[index + 1];
+  if (!next || next.kind !== 'segment' || Math.abs(next.start - segment.end) > 1e-6) {
+    throw new Error('下一段不存在或与当前段不相接');
+  }
+  const merged: RefineSegment = { ...segment, end: next.end, backup: undefined, at };
+  const rest = session.segments.slice();
+  rest.splice(index, 2, merged);
+  session.segments = rest;
+  session.updatedAt = at;
+  return merged;
+}
+
+export interface SegmentOptions {
+  pitch?: number;
+  indexRate?: number;
+  protect?: number;
+}
+
+export interface SegmentActionResult {
+  session: RefineSession;
+  segment: RefineSegment;
+}
+
+/** 重做一段：首次重做前把原始音频写进 `segments/<id>.bak.wav`，还原用它。 */
+export async function redoSegment(
+  dataDir: string,
+  engine: EngineAdapter,
+  id: string,
+  segmentId: string,
+  opts: SegmentOptions = {},
+): Promise<SegmentActionResult & { done: ConvertDone }> {
+  const { dir, session } = mustRead(dataDir, id);
+  ensureSegments(session);
+  const index = segmentIndex(session, segmentId);
+  const segment = session.segments[index];
+  const params = clampParams(segment.params, opts);
+  const backupRel = `segments/${segment.id}.bak.wav`;
+  const done = await convertSpan(
+    engine, dir, session, segment.start, segment.end, params, join(dir, backupRel),
+  );
+  const at = new Date().toISOString();
+  const updated: RefineSegment = {
+    ...segment,
+    params,
+    revision: segment.revision + 1,
+    muted: false,
+    backup: segment.backup ?? backupRel,
+    at,
+  };
+  const rest = session.segments.slice();
+  rest[index] = updated;
+  session.segments = rest;
+  session.updatedAt = at;
+  writeSession(dataDir, id, session);
+  return { session, segment: updated, done };
+}
+
+/** 静音/取消静音：只改 session.json，不碰音频。 */
+export function muteSegment(
+  dataDir: string,
+  id: string,
+  segmentId: string,
+  muted: boolean,
+  at = new Date().toISOString(),
+): SegmentActionResult {
+  const { session } = mustRead(dataDir, id);
+  ensureSegments(session);
+  const index = segmentIndex(session, segmentId);
+  const updated: RefineSegment = { ...session.segments[index], muted: Boolean(muted), at };
+  const rest = session.segments.slice();
+  rest[index] = updated;
+  session.segments = rest;
+  session.updatedAt = at;
+  writeSession(dataDir, id, session);
+  return { session, segment: updated };
+}
+
+/**
+ * 还原一段：有备份就用备份逐样本写回；没有备份才按会话默认参数重跑。
+ * 还原后保留备份，重复还原是幂等的。
+ */
+export async function revertSegment(
+  dataDir: string,
+  engine: EngineAdapter,
+  id: string,
+  segmentId: string,
+): Promise<SegmentActionResult & { restored: boolean }> {
+  const { dir, session } = mustRead(dataDir, id);
+  ensureSegments(session);
+  const index = segmentIndex(session, segmentId);
+  const segment = session.segments[index];
+  const backupAbs = segment.backup ? join(dir, segment.backup) : '';
+  const restored = Boolean(backupAbs && existsSync(backupAbs));
+  if (restored) {
+    await engine.restoreRange({
+      conv: join(dir, session.converted.path),
+      backup: backupAbs,
+      start: Math.round(segment.start * session.converted.sampleRate),
+      end: Math.round(segment.end * session.converted.sampleRate),
+    });
+  } else {
+    await convertSpan(engine, dir, session, segment.start, segment.end, session.converted.defaults);
+  }
+  const at = new Date().toISOString();
+  const updated: RefineSegment = {
+    ...segment,
+    params: { ...session.converted.defaults },
+    muted: false,
+    revision: segment.revision + 1,
+    at,
+  };
+  const rest = session.segments.slice();
+  rest[index] = updated;
+  session.segments = rest;
+  session.updatedAt = at;
+  writeSession(dataDir, id, session);
+  return { session, segment: updated, restored };
+}
+
+/** 在段落内切一刀并回写。 */
+export function cutSegment(dataDir: string, id: string, segmentId: string, atSec: number): SegmentActionResult {
+  const { session } = mustRead(dataDir, id);
+  ensureSegments(session);
+  const segment = splitSegmentIn(session, segmentId, atSec);
+  writeSession(dataDir, id, session);
+  return { session, segment };
+}
+
+/** 合并下一段并回写。 */
+export function mergeSegments(dataDir: string, id: string, segmentId: string): SegmentActionResult {
+  const { session } = mustRead(dataDir, id);
+  ensureSegments(session);
+  const segment = mergeSegmentWithNext(session, segmentId);
+  writeSession(dataDir, id, session);
+  return { session, segment };
 }

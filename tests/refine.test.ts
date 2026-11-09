@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { MIN_RANGE_SEC, appendSegment, rangeSamples } from '../src/refine.ts';
+import {
+  MIN_RANGE_SEC, appendSegment, ensureSegments, mergeSegmentWithNext, mutedRanges, rangeSamples, splitSegmentIn,
+} from '../src/refine.ts';
+import { defaultSegments } from '../src/session.ts';
 import type { RefineSession, RefineSegment } from '../src/session.ts';
 
 function record(): RefineSession {
@@ -75,5 +78,103 @@ describe('appendSegment', () => {
 
   it('面板与编排共用同一个最短选区', () => {
     expect(MIN_RANGE_SEC).toBe(0.05);
+  });
+});
+
+describe('defaultSegments', () => {
+  const defaults = { pitch: 1, indexRate: 0.3, protect: 0.33 };
+
+  it('按 20 秒网格切分，最后一段到时长结尾', () => {
+    const at = '2026-11-10T02:00:00.000Z';
+    const grid = defaultSegments(45, defaults, at);
+    expect(grid.map((item) => [item.id, item.start, item.end])).toEqual([
+      ['s1', 0, 20],
+      ['s2', 20, 40],
+      ['s3', 40, 45],
+    ]);
+    expect(grid.every((item) => item.kind === 'segment' && item.muted === false && item.revision === 0)).toBe(true);
+    expect(grid[0].params).toEqual(defaults);
+    expect(grid[0].at).toBe(at);
+  });
+
+  it('尾巴不足 1 秒并入上一段', () => {
+    expect(defaultSegments(40.5, defaults).map((item) => item.end)).toEqual([20, 40.5]);
+  });
+
+  it('时长非法时返回空网格', () => {
+    expect(defaultSegments(0, defaults)).toEqual([]);
+    expect(defaultSegments(Number.NaN, defaults)).toEqual([]);
+  });
+});
+
+describe('ensureSegments', () => {
+  it('老会话补网格并返回改动标记，重复调用不再加', () => {
+    const session = record();
+    expect(ensureSegments(session)).toBe(true);
+    expect(session.segments).toHaveLength(1);
+    expect(session.segments[0]).toMatchObject({ id: 's1', start: 0, end: 12.5, kind: 'segment' });
+    expect(ensureSegments(session)).toBe(false);
+  });
+});
+
+describe('mutedRanges', () => {
+  it('只收静音的 segment，忽略选段重跑记录', () => {
+    const session = record();
+    session.segments = [
+      {
+        id: 'r1', start: 0, end: 1, revision: 1, at: '', kind: 'range',
+        params: { pitch: 0, indexRate: 0.3, protect: 0.33 },
+      },
+      {
+        id: 's1', start: 0, end: 20, revision: 0, at: '', kind: 'segment', muted: true,
+        params: { pitch: 0, indexRate: 0.3, protect: 0.33 },
+      },
+      {
+        id: 's2', start: 20, end: 40, revision: 0, at: '', kind: 'segment', muted: false,
+        params: { pitch: 0, indexRate: 0.3, protect: 0.33 },
+      },
+    ];
+    expect(mutedRanges(session.segments)).toEqual([{ start: 0, end: 20 }]);
+  });
+});
+
+describe('段落切分与合并', () => {
+  const at = '2026-11-10T03:00:00.000Z';
+
+  it('切开后两段首尾相接、继承参数、备份作废', () => {
+    const session = record();
+    ensureSegments(session, at);
+    session.segments[0].backup = 'segments/s1.bak.wav';
+    const left = splitSegmentIn(session, 's1', 6, at);
+    expect(session.segments.map((item) => [item.id, item.start, item.end])).toEqual([
+      ['s1', 0, 6],
+      ['s2', 6, 12.5],
+    ]);
+    expect(left.backup).toBeUndefined();
+    expect(session.segments[1].params).toEqual(left.params);
+    expect(session.segments[1].kind).toBe('segment');
+  });
+
+  it('合并下一段后恢复成一段，备份作废', () => {
+    const session = record();
+    ensureSegments(session, at);
+    splitSegmentIn(session, 's1', 6, at);
+    const merged = mergeSegmentWithNext(session, 's1', at);
+    expect(session.segments.map((item) => [item.id, item.start, item.end])).toEqual([['s1', 0, 12.5]]);
+    expect(merged.backup).toBeUndefined();
+  });
+
+  it('切割点太近、越界或没有下一段时报错', () => {
+    const session = record();
+    ensureSegments(session, at);
+    expect(() => splitSegmentIn(session, 's1', 0.01, at)).toThrow();
+    expect(() => splitSegmentIn(session, 's1', 13, at)).toThrow();
+    expect(() => mergeSegmentWithNext(session, 's1', at)).toThrow();
+  });
+
+  it('找不到段落时报错', () => {
+    const session = record();
+    ensureSegments(session, at);
+    expect(() => splitSegmentIn(session, 's9', 6, at)).toThrow(/找不到段落/);
   });
 });

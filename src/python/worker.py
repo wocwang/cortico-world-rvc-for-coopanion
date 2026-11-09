@@ -19,7 +19,10 @@ stdout 只放协议行（原 fd 被 dup 出来单独写，其余输出统统改�
    "format":"wav","vocalGain":0,"instGain":0,"fadeIn":0,"fadeOut":0,"rmsRatio":1.0}
   {"op":"convertRange","id":5,"stem":"stems/vocals.wav","conv":"vocals/conv.wav",
    "startSec":32.0,"endSec":41.0,"contextSec":0.5,"seamSec":0.3,"outSr":44100,
-   "voice":"daifeiyu","pitch":2,"indexRate":0.3,"protect":0.33,"inputPeak":0.91}
+   "voice":"daifeiyu","pitch":2,"indexRate":0.3,"protect":0.33,"inputPeak":0.91,
+   "backupPath":"segments/s2.bak.wav"}
+  {"op":"restoreRange","id":7,"conv":"vocals/conv.wav","backup":"segments/s2.bak.wav",
+   "start":1764000,"end":2205000}  # start/end 是整数样本
   {"op":"peaks","id":6,"path":"vocals/conv.wav","buckets":1200}
   {"op":"shutdown"}
 
@@ -625,6 +628,15 @@ def main() -> int:
             igain = 10 ** (float(req.get("instGain") or 0) / 20.0)
             fade_in = max(0.0, float(req.get("fadeIn") or 0))
             fade_out = max(0.0, float(req.get("fadeOut") or 0))
+            # 段落静音只作用于人声：区间内把 mono 乘 0，伴奏保持原样。
+            muted = []
+            for item in req.get("mutedRanges") or []:
+                if not isinstance(item, dict):
+                    continue
+                start = max(0.0, float(item.get("start") or 0))
+                end = float(item.get("end") or 0)
+                if end > start:
+                    muted.append((start, end))
             block = 1 << 20
 
             with sf.SoundFile(inst) as fi, sf.SoundFile(vocals) as fv:
@@ -645,7 +657,14 @@ def main() -> int:
                         b = fv.read(n, dtype="float32", always_2d=True)
                         if b.shape[0] < n:
                             b = np.pad(b, ((0, n - b.shape[0]), (0, 0)))
-                        yield pos, a.astype(np.float64), b.mean(axis=1).astype(np.float64)
+                        mono = b.mean(axis=1).astype(np.float64)
+                        if muted:
+                            t = (np.arange(pos, pos + n, dtype=np.float64) + 0.5) / 44100.0
+                            gate = np.ones(n, dtype=np.float64)
+                            for start, end in muted:
+                                gate[(t >= start) & (t < end)] = 0.0
+                            mono = mono * gate
+                        yield pos, a.astype(np.float64), mono
                         pos += n
 
                 def weights(pos: int, n: int):
@@ -760,6 +779,19 @@ def main() -> int:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "选段超出音频长度"})
             return
 
+        # 段落首次重做前留一份原始音频（只留第一次，后续重做不覆盖）。
+        backup_path = (req.get("backupPath") or "").strip()
+        backed_up = False
+        if backup_path:
+            try:
+                if not os.path.isfile(backup_path):
+                    os.makedirs(os.path.dirname(os.path.abspath(backup_path)), exist_ok=True)
+                    sf.write(backup_path, conv[a:b], out_sr, subtype="FLOAT")
+                    backed_up = True
+            except Exception:
+                emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "写段落备份失败：%s" % traceback.format_exc()[-800:]})
+                return
+
         try:
             stem_info = sf.info(stem)
             stem_sr = int(stem_info.samplerate) or out_sr
@@ -853,6 +885,7 @@ def main() -> int:
             "sampleRate": out_sr,
             "durationSec": round(total / float(out_sr), 3),
             "peakFactor": round(factor, 4),
+            "backedUp": backed_up,
             "spliced": {"start": a, "end": b, "expected": expected},
         })
 
@@ -897,6 +930,66 @@ def main() -> int:
             "peaks": {"buckets": buckets, "frames": n, "min": low, "max": high},
         })
 
+    def restore_range(req: dict) -> None:
+        """用段落备份逐样本还原 conv 的一段：不跑模型、不做淡化，样本级一致。"""
+        import shutil
+
+        import numpy as np
+        import soundfile as sf
+
+        req_id = req.get("id")
+        conv_path = req.get("conv") or ""
+        backup_path = req.get("backup") or ""
+        if not conv_path or not os.path.isfile(conv_path):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到变声结果：%s" % conv_path})
+            return
+        if not backup_path or not os.path.isfile(backup_path):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "找不到段落备份：%s" % backup_path})
+            return
+        try:
+            start = int(req.get("start"))
+            end = int(req.get("end"))
+        except (TypeError, ValueError):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "还原区间必须是整数样本"})
+            return
+        began = time.time()
+        try:
+            conv, sr = sf.read(conv_path, dtype="float32", always_2d=False)
+            if conv.ndim > 1:
+                conv = conv.mean(axis=1)
+            conv = np.asarray(conv, dtype=np.float32)
+            piece, _ = sf.read(backup_path, dtype="float32", always_2d=False)
+            if piece.ndim > 1:
+                piece = piece.mean(axis=1)
+            piece = np.asarray(piece, dtype=np.float32)
+            total = int(conv.shape[0])
+            start = max(0, min(start, total))
+            end = max(start, min(end, total))
+            if piece.shape[0] != end - start:
+                raise ValueError("备份长度与段落不一致（%d vs %d）" % (piece.shape[0], end - start))
+            conv[start:end] = piece
+            shutil.copyfile(conv_path, conv_path + ".bak")
+            tmp = conv_path + ".part.wav"
+            sf.write(tmp, conv, int(sr), subtype="FLOAT")
+            if int(sf.info(tmp).frames) != total:
+                raise ValueError("还原后的长度与原文件不一致")
+            os.replace(tmp, conv_path)
+        except ValueError as error:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": str(error)})
+            return
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "还原失败：%s" % traceback.format_exc()[-800:]})
+            return
+        emit({
+            "type": "result",
+            "id": req_id,
+            "ok": True,
+            "ms": int((time.time() - began) * 1000),
+            "sampleRate": int(sr),
+            "durationSec": round(total / float(sr), 3),
+            "restored": {"start": start, "end": end},
+        })
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -926,6 +1019,9 @@ def main() -> int:
             continue
         if op == "peaks":
             peaks(req)
+            continue
+        if op == "restoreRange":
+            restore_range(req)
             continue
         print("[rvc] 未知指令：%s" % op, file=sys.stderr)
     return 0

@@ -22,8 +22,11 @@ import { readConvertJob, startConvertServer, type ConvertDeps, type ConvertJob, 
 import { RvcVenv } from './venv.ts';
 import { RuntimeInstall, installedTiers } from './runtime.ts';
 import { importVoiceFile, listVoices } from './voices.ts';
-import { createSession, dirBytes, gcSessions, listSessions, readSession, removeSession, sessionDir, sessionsRoot, writeSession, type RefineSession } from './session.ts';
-import { readPeaks, rerunRange, type RangeOptions } from './refine.ts';
+import { createSession, defaultSegments, dirBytes, gcSessions, listSessions, readSession, removeSession, sessionDir, sessionsRoot, writeSession, type RefineSession } from './session.ts';
+import {
+  cutSegment, ensureSegments, mergeSegments, muteSegment, mutedRanges, readPeaks, redoSegment,
+  rerunRange, revertSegment, type RangeOptions,
+} from './refine.ts';
 import { panelText } from './webui/text.ts';
 
 const WORKER_SCRIPT = fileURLToPath(new URL('./python/worker.py', import.meta.url));
@@ -532,7 +535,10 @@ export class RvcWorld implements World {
             channels: 1,
             defaults: { pitch: job.pitch, indexRate: job.indexRate, protect: job.protect, chunk: job.chunk },
           },
-          segments: [],
+          // 默认 20 秒网格：与 worker 切片对齐，段落边界落在既有交叉淡化接缝上。
+          segments: defaultSegments(done.durationSec ?? 0, {
+            pitch: job.pitch, indexRate: job.indexRate, protect: job.protect,
+          }),
           mix: {
             vocalGainDb: vocalGain,
             instGainDb: 0,
@@ -636,6 +642,7 @@ export class RvcWorld implements World {
       vocalGain: opts.vocalGainDb, instGain: opts.instGainDb,
       fadeIn: opts.fadeInSec, fadeOut: opts.fadeOutSec,
       rmsRatio: session.mix.rmsRatio,
+      mutedRanges: mutedRanges(session.segments),
     });
     const audio = readFileSync(output);
     if (record && rel) {
@@ -735,6 +742,75 @@ export class RvcWorld implements World {
     }
   }
 
+  /** 面板「重做/还原段落」：都跑一次模型并混出新成品，只是音频来源不同。 */
+  private async segmentFromPanel(args: unknown[], mode: 'redo' | 'revert'): Promise<unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
+    const segmentId = typeof raw.segmentId === 'string' ? raw.segmentId : '';
+    const engine = this.engine;
+    if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
+    const format = raw.format === 'mp3' ? 'mp3' : 'wav';
+    let session: RefineSession;
+    let segment;
+    let modelMs = 0;
+    try {
+      if (mode === 'redo') {
+        const result = await redoSegment(this.opts.dataDir, engine, id, segmentId, {
+          pitch: raw.pitch === undefined ? undefined : Number(raw.pitch),
+          indexRate: raw.indexRate === undefined ? undefined : Number(raw.indexRate),
+          protect: raw.protect === undefined ? undefined : Number(raw.protect),
+        });
+        session = result.session;
+        segment = result.segment;
+        modelMs = result.done.ms;
+      } else {
+        const result = await revertSegment(this.opts.dataDir, engine, id, segmentId);
+        session = result.session;
+        segment = result.segment;
+      }
+    } catch (err) {
+      if (err instanceof RvcError) throw err;
+      throw new RvcError('param', err instanceof Error ? err.message : String(err));
+    }
+    this.activeSession = id;
+    const { audio, done, path } = await this.mixSession(id, session, {
+      format,
+      vocalGainDb: session.mix.vocalGainDb,
+      instGainDb: session.mix.instGainDb,
+      fadeInSec: session.mix.fadeInSec,
+      fadeOutSec: session.mix.fadeOutSec,
+    }, true);
+    this.lastRange = {
+      at: Date.now(), ms: modelMs + done.ms, bytes: audio.length, savedPath: path,
+      format, start: segment.start, end: segment.end, pitch: segment.params.pitch,
+    };
+    this.log?.info(mode === 'redo' ? 'RVC 段落重做完成' : 'RVC 段落还原完成', {
+      id, segment: segment.id, ms: modelMs,
+    });
+    return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+  }
+
+  /** 段落级元数据操作（静音/切分/合并）：只改 session.json，不碰音频。 */
+  private segmentEdit(method: string, args: unknown[]): Record<string, unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
+    const segmentId = typeof raw.segmentId === 'string' ? raw.segmentId : '';
+    try {
+      if (method === 'segmentMute') muteSegment(this.opts.dataDir, id, segmentId, Boolean(raw.muted));
+      else if (method === 'segmentCut') cutSegment(this.opts.dataDir, id, segmentId, Number(raw.atSec));
+      else mergeSegments(this.opts.dataDir, id, segmentId);
+    } catch (err) {
+      if (err instanceof RvcError) throw err;
+      throw new RvcError('param', err instanceof Error ? err.message : String(err));
+    }
+    this.activeSession = id || this.activeSession;
+    return this.refineState(id);
+  }
+
   /** 面板「结果编辑」：会话列表 + 当前会话的混音参数。 */
   private refineState(id = ''): Record<string, unknown> {
     const sessions = listSessions(this.opts.dataDir);
@@ -742,6 +818,11 @@ export class RvcWorld implements World {
     const wanted = id && has(id) ? id : this.activeSession && has(this.activeSession) ? this.activeSession : sessions[0]?.id ?? '';
     // 面板选中的会话就是「正在用的」：清理时跳过它，避免刚调好参数就被删。
     this.activeSession = wanted || null;
+    const session = wanted ? readSession(this.opts.dataDir, wanted) : null;
+    // 老会话（P1 只存过 range 记录）在这里补一次段落网格；写失败不影响展示。
+    if (session && ensureSegments(session)) {
+      try { writeSession(this.opts.dataDir, wanted, session); } catch { /* 只读展示 */ }
+    }
     return {
       root: sessionsRoot(this.opts.dataDir),
       keep: this.opts.cfg.keepStems !== false,
@@ -749,7 +830,7 @@ export class RvcWorld implements World {
       maxGb: this.opts.cfg.sessionMaxGb,
       active: this.activeSession,
       sessions,
-      session: wanted ? readSession(this.opts.dataDir, wanted) : null,
+      session,
     };
   }
 
@@ -803,6 +884,13 @@ export class RvcWorld implements World {
     if (method === 'rangeConvert') {
       this.beginJob('range', args);
       return this.status();
+    }
+    if (method === 'segmentRedo' || method === 'segmentRevert') {
+      this.beginJob('range', args, method);
+      return this.status();
+    }
+    if (method === 'segmentMute' || method === 'segmentCut' || method === 'segmentMerge') {
+      return this.segmentEdit(method, args);
     }
     if (method === 'refineState') return this.refineState(String(args[0] ?? ''));
     if (method === 'refinePeaks') return this.peaksFromPanel(String(args[0] ?? ''));
@@ -864,20 +952,32 @@ export class RvcWorld implements World {
     return { ...this.status(), storage: this.storage() };
   }
 
-  /** 把变声/翻唱/选段重跑放到后台跑：面板拿到的是即时状态，不用在页面上等。 */
-  private beginJob(kind: 'convert' | 'cover' | 'remix' | 'range', args: unknown[]): void {
+  /** 把变声/翻唱/选段重跑/段落重做放到后台跑：面板拿到的是即时状态，不用在页面上等。 */
+  private beginJob(
+    kind: 'convert' | 'cover' | 'remix' | 'range',
+    args: unknown[],
+    action: 'convert' | 'cover' | 'remix' | 'range' | 'segmentRedo' | 'segmentRevert' = kind,
+  ): void {
     if (this.job?.phase === 'working') throw new RvcError('param', '已有任务在跑，等它结束再试');
     const at = Date.now();
-    const detail = kind === 'cover' ? '分离人声' : kind === 'range' ? '重跑选段' : kind === 'remix' ? '重新混音' : '变声';
+    const detail = action === 'cover' ? '分离人声'
+      : action === 'range' ? '重跑选段'
+        : action === 'segmentRedo' ? '重做段落'
+          : action === 'segmentRevert' ? '还原段落'
+            : action === 'remix' ? '重新混音' : '变声';
     this.job = { kind, at, phase: 'working', detail };
     this.jobResult = null;
-    const task = kind === 'cover'
+    const task = action === 'cover'
       ? this.coverFromPanel(args)
-      : kind === 'range'
+      : action === 'range'
         ? this.rangeFromPanel(args)
-        : kind === 'remix'
-          ? this.remixFromPanel(args)
-          : this.convertFromPanel(args);
+        : action === 'segmentRedo'
+          ? this.segmentFromPanel(args, 'redo')
+          : action === 'segmentRevert'
+            ? this.segmentFromPanel(args, 'revert')
+            : action === 'remix'
+              ? this.remixFromPanel(args)
+              : this.convertFromPanel(args);
     task.then((res) => {
       const bin = (res as { $binary?: { mime: string; base64: string } }).$binary;
       const last = kind === 'cover' ? this.lastCover

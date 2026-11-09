@@ -116,6 +116,8 @@ export interface RemixRequest {
   fadeOut: number;
   /** 首次翻唱算出的 RMS 比例；冻结使用，避免局部重跑后整首电平跳变。 */
   rmsRatio: number;
+  /** 静音段落：区间内人声乘 0，伴奏不动。 */
+  mutedRanges?: Array<{ start: number; end: number }>;
 }
 
 export interface ConvertDone {
@@ -137,6 +139,10 @@ export interface ConvertDone {
   spliced?: { start: number; end: number; expected: number };
   /** 区间重跑：峰值补偿倍率（只衰减不放大）。 */
   peakFactor?: number;
+  /** 区间重跑：这次是否新建了段落备份。 */
+  backedUp?: boolean;
+  /** 段落还原：实际复写的样本区间。 */
+  restored?: { start: number; end: number };
   /** 波形包络：每个桶的 min/max 与总帧数。 */
   peaks?: { buckets: number; frames: number; min: number[]; max: number[] };
 }
@@ -160,6 +166,17 @@ export interface RangeConvertRequest {
   protect: number;
   /** 首次翻唱的整轨输入峰值；用于复现同样的音量。 */
   inputPeak: number;
+  /** 段落首次重做前写一份原始音频到这里；已存在则不覆盖。 */
+  backupPath?: string;
+}
+
+/** 用段落备份逐样本还原 conv 的一段（不做淡化、不跑模型）。 */
+export interface RestoreRangeRequest {
+  conv: string;
+  backup: string;
+  /** 整数样本。 */
+  start: number;
+  end: number;
 }
 
 export interface PeaksRequest {
@@ -191,6 +208,8 @@ const RANGE_BASE_TIMEOUT_MS = 120_000;
 const RANGE_PER_SECOND_MS = 4_000;
 /** 波形包络只读文件。 */
 const PEAKS_TIMEOUT_MS = 60_000;
+/** 段落还原只读备份、写回一段，不跑模型。 */
+const RESTORE_TIMEOUT_MS = 120_000;
 const TAIL_LINES = 40;
 
 interface Pending {
@@ -298,6 +317,7 @@ export class RvcEngine {
       vocals: req.vocals, inst: req.inst, output: req.output, format: req.format,
       vocalGain: req.vocalGain, instGain: req.instGain,
       fadeIn: req.fadeIn, fadeOut: req.fadeOut, rmsRatio: req.rmsRatio,
+      mutedRanges: req.mutedRanges ?? [],
     }, REMIX_TIMEOUT_MS);
   }
 
@@ -313,8 +333,15 @@ export class RvcEngine {
       contextSec: req.contextSec ?? 0.5, seamSec: req.seamSec ?? 0.3,
       outSr: req.outSr ?? 44100, voice: req.voice ?? '',
       pitch: req.pitch, indexRate: req.indexRate, protect: req.protect,
-      inputPeak: req.inputPeak,
+      inputPeak: req.inputPeak, backupPath: req.backupPath ?? '',
     }, timeout);
+  }
+
+  /** 用段落备份还原一段 conv（样本级一致，不跑模型）。 */
+  async restoreRange(req: RestoreRangeRequest): Promise<ConvertDone> {
+    return this.run('restoreRange', {
+      conv: req.conv, backup: req.backup, start: req.start, end: req.end,
+    }, RESTORE_TIMEOUT_MS);
   }
 
   /** 波形包络（min/max），面板拖选用。 */
@@ -332,7 +359,7 @@ export class RvcEngine {
     };
   }
 
-  private async run(op: 'convert' | 'separate' | 'cover' | 'remix' | 'convertRange' | 'peaks', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
+  private async run(op: 'convert' | 'separate' | 'cover' | 'remix' | 'convertRange' | 'restoreRange' | 'peaks', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
     if (!this.ready()) throw new RvcError('unavailable', this.st.detail ?? 'RVC 引擎未就绪');
     const id = ++this.seq;
     const run = () => new Promise<ConvertDone>((resolve, reject) => {
@@ -480,6 +507,8 @@ export class RvcEngine {
           durationSec: typeof msg.durationSec === 'number' ? msg.durationSec : undefined,
           spliced: msg.spliced && typeof msg.spliced === 'object' ? msg.spliced as ConvertDone['spliced'] : undefined,
           peakFactor: typeof msg.peakFactor === 'number' ? msg.peakFactor : undefined,
+          backedUp: msg.backedUp === true,
+          restored: msg.restored && typeof msg.restored === 'object' ? msg.restored as ConvertDone['restored'] : undefined,
           peaks: msg.peaks && typeof msg.peaks === 'object' ? msg.peaks as ConvertDone['peaks'] : undefined,
         });
       } else {

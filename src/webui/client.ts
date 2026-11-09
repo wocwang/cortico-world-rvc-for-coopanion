@@ -80,7 +80,16 @@ interface RefineSession {
     channels: number;
     defaults: { pitch: number; indexRate: number; protect: number; chunk: boolean };
   };
-  segments: Array<{ id: string; start: number; end: number; revision: number; kind: string }>;
+  segments: Array<{
+    id: string;
+    start: number;
+    end: number;
+    revision: number;
+    kind: string;
+    params: { pitch: number; indexRate: number; protect: number };
+    muted?: boolean;
+    backup?: string;
+  }>;
   mix: SessionMix;
   outputs: Array<{ format: string; path: string; at: string }>;
 }
@@ -640,6 +649,8 @@ const coverPanel: WebUiPanel = {
     let selEnd = 0;
     let rangeParamsKey = '';
     let previewTimer = 0;
+    /** 段落列表的渲染键：数据没变就不重建 DOM，避免轮询打断正在编辑的参数。 */
+    let segKey = '';
 
     const refineSheet = ui.section(t.refineTitle, t.refineHint);
     const sessionSelect = ui.select({
@@ -703,7 +714,13 @@ const coverPanel: WebUiPanel = {
     const mixLine = ui.h('div', 'rvc-detail');
     refineSheet.append(ui.field(t.session, sessionSelect), mixKnobs, refineActs, refineDisk, refineLine, mixLine);
 
-    ctx.root.append(sheet, audio, resultLine, dl, refineSheet, waveSheet, msg);
+    // 段落级参数：默认 20 秒网格，每段独立重做/静音/还原/切分/合并。
+    const segmentSheet = ui.section(t.segmentTitle, t.segmentHint);
+    const segmentList = ui.h('div', 'rvc-segments');
+    const segmentLine = ui.h('div', 'rvc-detail', t.segmentCutHint);
+    segmentSheet.append(segmentList, segmentLine);
+
+    ctx.root.append(sheet, audio, resultLine, dl, refineSheet, waveSheet, segmentSheet, msg);
     ctx.own(disposable(() => { stopPreviewTimer(); }));
 
     fileInput.addEventListener('change', () => {
@@ -799,9 +816,143 @@ const coverPanel: WebUiPanel = {
             session.engine.kind,
             session.engine.voice ? t.voiceLabel(session.engine.voice) : '',
             session.engine.modelSampleRate ? `${session.engine.modelSampleRate} Hz` : '',
-            t.rangeSegments(session.segments.length),
+            t.rangeSegments(session.segments.filter((item) => item.kind === 'range').length),
           ].filter(Boolean).join(' · ')
         : t.noSession;
+      renderSegments(session, busy);
+    }
+
+    /** 渲染 20 秒段落列表；每段带独立参数与重做/静音/还原/切分/合并。 */
+    function renderSegments(session: RefineSession | null, busy: boolean): void {
+      const segments = (session?.segments ?? []).filter((item) => item.kind === 'segment');
+      const key = session
+        ? `${session.id}:${JSON.stringify(segments.map((item) => [
+            item.id, item.start, item.end, item.revision, item.params, item.muted, item.backup,
+          ]))}`
+        : '';
+      if (key === segKey) {
+        // 数据没变，只同步禁用状态（引擎就绪、任务进行中会变）。
+        for (const el of Array.from(segmentList.querySelectorAll<HTMLButtonElement>('button[data-need-model]'))) {
+          el.disabled = busy || !state?.ready;
+        }
+        return;
+      }
+      segKey = key;
+      segmentList.textContent = '';
+      if (!segments.length) {
+        segmentLine.textContent = `${t.segmentCutHint} ${t.segmentEmpty}`;
+        return;
+      }
+      segmentLine.textContent = t.segmentCutHint;
+      for (const segment of segments) {
+        const head = ui.h('div', 'rvc-seg-head');
+        head.append(
+          ui.h('strong', '', segment.id),
+          ui.h('span', '', t.segmentLine(fmtSeconds(segment.start), fmtSeconds(segment.end))),
+        );
+
+        const rowPitch = ui.input({ value: String(segment.params.pitch) });
+        rowPitch.type = 'number';
+        rowPitch.min = '-24';
+        rowPitch.max = '24';
+        rowPitch.step = '1';
+        const rowIndex = ui.input({ value: String(segment.params.indexRate) });
+        rowIndex.type = 'number';
+        rowIndex.min = '0';
+        rowIndex.max = '1';
+        rowIndex.step = '0.05';
+        const rowProtect = ui.input({ value: String(segment.params.protect) });
+        rowProtect.type = 'number';
+        rowProtect.min = '0';
+        rowProtect.max = '0.5';
+        rowProtect.step = '0.01';
+        const rowKnobs = ui.h('div', 'rvc-grid');
+        rowKnobs.append(ui.field(t.pitch, rowPitch), ui.field(t.indexRate, rowIndex), ui.field(t.protect, rowProtect));
+
+        const redoBtn = ui.button(t.segmentRedo, {
+          variant: 'primary', size: 'sm',
+          onClick: () => void segmentAction('segmentRedo', segment, {
+            pitch: Number(rowPitch.value), indexRate: Number(rowIndex.value), protect: Number(rowProtect.value),
+          }),
+        });
+        redoBtn.dataset.needModel = '1';
+        const muteBtn = ui.button(segment.muted ? t.segmentUnmute : t.segmentMute, {
+          size: 'sm',
+          onClick: () => void segmentAction('segmentMute', segment, { muted: !segment.muted }),
+        });
+        const revertBtn = ui.button(t.segmentRevert, {
+          size: 'sm', onClick: () => void segmentAction('segmentRevert', segment),
+        });
+        revertBtn.dataset.needModel = '1';
+        const cutBtn = ui.button(t.segmentCut, {
+          size: 'sm', onClick: () => void segmentAction('segmentCut', segment),
+        });
+        const mergeBtn = ui.button(t.segmentMerge, {
+          size: 'sm', onClick: () => void segmentAction('segmentMerge', segment),
+        });
+        const rowActs = ui.actions();
+        rowActs.append(redoBtn, muteBtn, revertBtn, cutBtn, mergeBtn);
+
+        const status = ui.h('div', 'rvc-detail', t.segmentState(segment.revision, Boolean(segment.muted), Boolean(segment.backup)));
+        const row = ui.h('div', 'rvc-seg');
+        row.append(head, rowKnobs, rowActs, status);
+        segmentList.append(row);
+        redoBtn.disabled = busy || !state?.ready;
+        revertBtn.disabled = busy || !state?.ready;
+        muteBtn.disabled = busy;
+        cutBtn.disabled = busy;
+        mergeBtn.disabled = busy;
+      }
+    }
+
+    /** 段落动作：重做/还原走后台（会跑模型），静音/切分/合并只改 session.json。 */
+    async function segmentAction(
+      method: string,
+      segment: RefineSession['segments'][number],
+      extra: Record<string, unknown> = {},
+    ): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      if ((method === 'segmentRedo' || method === 'segmentRevert') && !state?.ready) {
+        msg.textContent = t.notReady;
+        msg.classList.add('bad');
+        return;
+      }
+      const payload: Record<string, unknown> = { segmentId: segment.id, format: mixFormat.value, ...extra };
+      if (method === 'segmentCut') {
+        // 选区中点落在段落内就切在那里，否则切段落中点。
+        const middle = (selStart + selEnd) / 2;
+        const inside = selEnd - selStart > 0.05 && middle > segment.start + 0.05 && middle < segment.end - 0.05;
+        payload.atSec = inside ? middle : (segment.start + segment.end) / 2;
+      }
+      if (method === 'segmentRedo' || method === 'segmentRevert') {
+        settledKey = '';
+        mixLine.textContent = '';
+        msg.textContent = method === 'segmentRedo' ? t.segmentRedo : t.segmentRevert;
+        try {
+          await ctx.invoke(method, [selectedId, payload]);
+        } catch (err) {
+          msg.textContent = errText(err);
+          msg.classList.add('bad');
+        }
+        return;
+      }
+      try {
+        const r = await ctx.invoke<RefineState>(method, [selectedId, payload]);
+        refineSeq += 1;
+        renderRefine(r);
+        if (method === 'segmentMute') {
+          msg.textContent = segment.muted ? t.segmentUnmuted(segment.id) : t.segmentMuted(segment.id);
+        } else if (method === 'segmentCut') {
+          msg.textContent = t.segmentCutDone(segment.id);
+        } else {
+          msg.textContent = t.segmentMerged(segment.id);
+        }
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      }
     }
 
     async function loadRefine(id = selectedId): Promise<void> {
@@ -1166,6 +1317,8 @@ const coverPanel: WebUiPanel = {
         // conv.wav 已经换过一段，波形要重新拉；选区保留，方便连续微调。
         peaksKey = '';
         void loadPeaks(selectedId);
+        // 段落参数/备份状态也变了，重读一次 session。
+        void loadRefine(selectedId);
         return;
       }
       if (job.kind === 'remix') {
