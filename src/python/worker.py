@@ -990,6 +990,56 @@ def main() -> int:
             "restored": {"start": start, "end": end},
         })
 
+    f0_cache = {"model": None}
+
+    def export_f0(req: dict) -> None:
+        """只读导出音高曲线：对分离人声跑一次 RMVPE，写 `time,f0` CSV（10 ms 一帧）。"""
+        import numpy as np
+
+        req_id = req.get("id")
+        source = req.get("input") or ""
+        output = req.get("output") or ""
+        if not source or not os.path.isfile(source):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到人声分轨：%s" % source})
+            return
+        if not output:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "没有指定 CSV 输出路径"})
+            return
+        began = time.time()
+        try:
+            from infer.audio import load_audio
+            from infer.rmvpe import RMVPE
+
+            if f0_cache["model"] is None:
+                f0_cache["model"] = RMVPE(os.path.join(assets, "rmvpe", "rmvpe.pt"), False)
+            threshold = float(req.get("threshold") or 0.03)
+            audio = load_audio(source, 16000)
+            f0 = np.asarray(f0_cache["model"].infer_from_audio(audio, thred=threshold), dtype=np.float64)
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+            tmp = output + ".tmp.csv"
+            with open(tmp, "w", encoding="utf-8", newline="") as sink:
+                sink.write("time,f0\n")
+                for index, value in enumerate(f0):
+                    sink.write("%.3f,%.3f\n" % (index / 100.0, float(value)))
+            os.replace(tmp, output)
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "写 CSV 失败：%s" % traceback.format_exc()[-800:]})
+            return
+        frames = int(f0.shape[0])
+        emit({
+            "type": "result",
+            "id": req_id,
+            "ok": True,
+            "ms": int((time.time() - began) * 1000),
+            "frames": frames,
+            "frameRate": 100,
+            "durationSec": round(frames / 100.0, 3),
+        })
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1022,6 +1072,9 @@ def main() -> int:
             continue
         if op == "restoreRange":
             restore_range(req)
+            continue
+        if op == "f0":
+            export_f0(req)
             continue
         print("[rvc] 未知指令：%s" % op, file=sys.stderr)
     return 0

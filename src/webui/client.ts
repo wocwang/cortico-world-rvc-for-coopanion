@@ -699,8 +699,9 @@ const coverPanel: WebUiPanel = {
     rangeKnobs.append(ui.field(t.pitch, rangePitch), ui.field(t.indexRate, rangeIndex), ui.field(t.protect, rangeProtect));
     const rerunRangeBtn = ui.button(t.rangeRerun, { variant: 'primary', size: 'sm', onClick: () => void runRange() });
     const auditionBtn = ui.button(t.rangeAudition, { size: 'sm', onClick: () => void auditionRange() });
+    const f0Btn = ui.button(t.exportF0, { size: 'sm', onClick: () => void exportF0() });
     const rangeActs = ui.actions();
-    rangeActs.append(rerunRangeBtn, auditionBtn);
+    rangeActs.append(rerunRangeBtn, auditionBtn, f0Btn);
     waveSheet.append(canvas, rangeLine, rangeKnobs, rangeActs);
 
     const remixBtn = ui.button(t.remix, { variant: 'primary', size: 'sm', onClick: () => void runRemix() });
@@ -808,6 +809,7 @@ const coverPanel: WebUiPanel = {
       remixBtn.disabled = busy || !session || !state?.ready;
       rerunRangeBtn.disabled = busy || !session || !state?.ready;
       auditionBtn.disabled = busy || !session || !state?.ready;
+      f0Btn.disabled = busy || !session || !state?.ready;
       deleteBtn.disabled = busy || !session;
       cleanupBtn.disabled = busy;
       refineDisk.textContent = t.refineDisk(r.days, r.maxGb);
@@ -1264,6 +1266,32 @@ const coverPanel: WebUiPanel = {
         msg.classList.add('bad');
       } finally {
         auditionBtn.disabled = !(state?.ready && selectedId);
+      }
+    }
+
+    /** 导出音高曲线：worker 只读分轨跑 RMVPE，CSV 直接给浏览器下载。 */
+    async function exportF0(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      msg.textContent = t.f0Running;
+      f0Btn.disabled = true;
+      try {
+        const r = await ctx.invoke<{
+          name: string; csv: string; frames: number; frameRate: number; durationSec: number; savedPath: string;
+        }>('exportF0', [selectedId]);
+        const blob = new Blob([r.csv], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        dl.href = url;
+        dl.download = r.name || 'f0.csv';
+        dl.hidden = false;
+        msg.textContent = t.f0Done(r.frames, r.frameRate, r.savedPath);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      } finally {
+        f0Btn.disabled = !(state?.ready && selectedId);
       }
     }
 

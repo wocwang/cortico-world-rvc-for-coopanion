@@ -145,6 +145,9 @@ export interface ConvertDone {
   restored?: { start: number; end: number };
   /** 波形包络：每个桶的 min/max 与总帧数。 */
   peaks?: { buckets: number; frames: number; min: number[]; max: number[] };
+  /** 音高导出：帧数、帧率与时长。 */
+  frames?: number;
+  frameRate?: number;
 }
 
 /** 只重跑一段时间：读会话人声分轨的窗口，换参数重渲后拼回 conv。 */
@@ -194,6 +197,21 @@ export interface PeaksDone {
   max: number[];
 }
 
+/** 只读导出音高：对分离人声跑一次 RMVPE，写 `time,f0` CSV。 */
+export interface F0Request {
+  input: string;
+  output: string;
+  /** 静音阈值（默认 0.03，与 run_vc 的 RMVPE 提取一致）。 */
+  threshold?: number;
+}
+
+export interface F0Done {
+  ms: number;
+  frames: number;
+  frameRate: number;
+  durationSec: number;
+}
+
 /** 长音频会切片（每 20 秒一片），5 分钟的音频在 CPU 上也可能几分钟，给足上限。 */
 const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_START_TIMEOUT_MS = 180_000;
@@ -210,6 +228,8 @@ const RANGE_PER_SECOND_MS = 4_000;
 const PEAKS_TIMEOUT_MS = 60_000;
 /** 段落还原只读备份、写回一段，不跑模型。 */
 const RESTORE_TIMEOUT_MS = 120_000;
+/** 音高导出要载入 RMVPE（首次约几秒）再跑一遍，给足余量。 */
+const F0_TIMEOUT_MS = 300_000;
 const TAIL_LINES = 40;
 
 interface Pending {
@@ -359,7 +379,20 @@ export class RvcEngine {
     };
   }
 
-  private async run(op: 'convert' | 'separate' | 'cover' | 'remix' | 'convertRange' | 'restoreRange' | 'peaks', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
+  /** 只读导出音高曲线（CSV），不碰 conv.wav。 */
+  async f0(req: F0Request): Promise<F0Done> {
+    const done = await this.run('f0', {
+      input: req.input, output: req.output, threshold: req.threshold ?? 0.03,
+    }, F0_TIMEOUT_MS);
+    return {
+      ms: done.ms,
+      frames: done.frames ?? 0,
+      frameRate: done.frameRate ?? 100,
+      durationSec: done.durationSec ?? 0,
+    };
+  }
+
+  private async run(op: 'convert' | 'separate' | 'cover' | 'remix' | 'convertRange' | 'restoreRange' | 'peaks' | 'f0', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
     if (!this.ready()) throw new RvcError('unavailable', this.st.detail ?? 'RVC 引擎未就绪');
     const id = ++this.seq;
     const run = () => new Promise<ConvertDone>((resolve, reject) => {
@@ -510,6 +543,8 @@ export class RvcEngine {
           backedUp: msg.backedUp === true,
           restored: msg.restored && typeof msg.restored === 'object' ? msg.restored as ConvertDone['restored'] : undefined,
           peaks: msg.peaks && typeof msg.peaks === 'object' ? msg.peaks as ConvertDone['peaks'] : undefined,
+          frames: typeof msg.frames === 'number' ? msg.frames : undefined,
+          frameRate: typeof msg.frameRate === 'number' ? msg.frameRate : undefined,
         });
       } else {
         const kind = msg.kind === 'decode' ? 'decode' : msg.kind === 'param' ? 'param' : 'infer';

@@ -726,7 +726,33 @@ export class RvcWorld implements World {
     return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
   }
 
-  /** 面板波形：读当前会话变声结果的 min/max 包络。 */
+  /** 面板「导出音高」：对分离人声提一次 RMVPE，写 out/f0.csv，内容直接交给面板下载。 */
+  private async f0FromPanel(id: string): Promise<Record<string, unknown>> {
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    const engine = this.engine;
+    if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
+    const target = join(dir, 'out', 'f0.csv');
+    let done: Awaited<ReturnType<RvcEngine['f0']>>;
+    try {
+      done = await engine.f0({ input: join(dir, session.stems.vocals), output: target });
+    } catch (err) {
+      if (err instanceof RvcError) throw err;
+      throw new RvcError('infer', err instanceof Error ? err.message : String(err));
+    }
+    const csv = readFileSync(target, 'utf8');
+    this.log?.info('RVC 音高曲线已导出', { id, frames: done.frames, ms: done.ms });
+    return {
+      name: 'f0.csv', csv, frames: done.frames, frameRate: done.frameRate,
+      durationSec: done.durationSec, savedPath: target,
+    };
+  }
+
   private async peaksFromPanel(id: string): Promise<unknown> {
     const engine = this.engine;
     if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
@@ -894,6 +920,7 @@ export class RvcWorld implements World {
     }
     if (method === 'refineState') return this.refineState(String(args[0] ?? ''));
     if (method === 'refinePeaks') return this.peaksFromPanel(String(args[0] ?? ''));
+    if (method === 'exportF0') return this.f0FromPanel(String(args[0] ?? ''));
     if (method === 'refinePreview') {
       const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
       return this.previewSession(String(args[0] ?? ''), raw);
