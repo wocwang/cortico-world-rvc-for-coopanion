@@ -11,6 +11,11 @@ export interface RvcConfigSection {
   enabled: boolean;
   /** 随 Coopanion 启动时自动拉起引擎；关掉就等面板点「启动引擎」。 */
   autoStart: boolean;
+  /**
+   * 闲置多少分钟后停掉引擎子进程、释放显存/内存；0 表示不停。
+   * 只回收引擎，9881 接口与面板保持不变；下一条请求会自动重新拉起。
+   */
+  idleMinutes: number;
   /** 推理档；改档后重建派生 venv 并重启引擎生效。 */
   tier: RvcTier;
   /**
@@ -58,6 +63,8 @@ export const DEFAULT_PORT = 9881;
 export const RVC_DEFAULTS: RvcConfigSection = {
   enabled: false,
   autoStart: true,
+  // 保持旧行为：升级后引擎照旧常驻，想要回收的用户自己开。
+  idleMinutes: 0,
   tier: 'auto',
   codeDir: '',
   assetsDir: '',
@@ -84,6 +91,7 @@ const TEXT = {
     groupConvert: { title: '变声参数', description: '推理档、默认音色与三个推理参数；面板上传时还可以逐次覆盖。' },
     groupService: { title: '运行与接口', description: '推理代码、派生 venv 与音色目录，以及给其他插件用的本机 HTTP 接口。' },
     autoStart: { title: '随软件自动启动', description: '开启后 Coopanion 启动时会自动拉起 RVC 引擎（约 0.7 GB 显存 / 2.5 GB 内存）；关闭后等你在「服务」页点「启动引擎」。手动点过「启动引擎」不受这个开关影响。' },
+    idleMinutes: { title: '闲置回收（分钟）', description: '多久没有变声/翻唱就停掉引擎子进程、释放显存与内存；0 表示不回收（默认，保持旧行为）。只回收引擎，9881 接口照常监听，下一条请求会自动重新拉起。手动点「停止引擎」后不会自动重启。' },
     tier: { title: '推理档', description: '自动：检测到 NVIDIA 显卡就用显卡档，否则 CPU 档。显卡档的派生 venv 基于 CUDA 运行时，变声快很多（约 0.6–0.8 GB 显存）；CPU 档约 1–2 GB 内存。改档后在面板点「重启引擎」生效，切档会自动重建 venv。' },
     tierAuto: '自动',
     tierCuda: '显卡（NVIDIA）',
@@ -106,6 +114,7 @@ const TEXT = {
     groupConvert: { title: 'Conversion', description: 'Inference tier, default voice and the three inference knobs; the panel can override them per upload.' },
     groupService: { title: 'Runtime and API', description: 'Inference code, derived venv, voices folder, and the loopback HTTP endpoint for other plugins.' },
     autoStart: { title: 'Start with Coopanion', description: 'When on, the RVC engine starts automatically when Coopanion launches (about 0.7 GB VRAM / 2.5 GB RAM). When off, wait for Start engine on the Service tab. A manual Start engine is not affected by this switch.' },
+    idleMinutes: { title: 'Idle shutdown (minutes)', description: 'Stop the engine process and free VRAM/RAM after this many idle minutes; 0 keeps it running (default, same as before). Only the engine is recycled — the 9881 API keeps listening and the next request starts it again. A manual Stop engine is never overridden.' },
     tier: { title: 'Inference tier', description: 'Auto uses the GPU tier when an NVIDIA GPU is detected, otherwise CPU. The GPU tier builds the derived venv on the CUDA runtime and is much faster (about 0.6–0.8 GB VRAM); the CPU tier uses about 1–2 GB RAM. After changing this, click Restart engine — switching tiers rebuilds the venv automatically.' },
     tierAuto: 'Auto',
     tierCuda: 'GPU (NVIDIA)',
@@ -154,6 +163,7 @@ export function configGroups(language: Language): ConfigGroup[] {
         description: t.groupService.description,
         properties: {
           [`${K}.autoStart`]: { type: 'boolean', title: t.autoStart.title, description: t.autoStart.description, 'x-hot': true },
+          [`${K}.idleMinutes`]: { type: 'number', title: t.idleMinutes.title, description: t.idleMinutes.description, minimum: 0, maximum: 1440, multipleOf: 1, 'x-hot': true },
           [`${K}.codeDir`]: { type: 'string', title: t.codeDir.title, description: t.codeDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.assetsDir`]: { type: 'string', title: t.assetsDir.title, description: t.assetsDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.pythonPath`]: { type: 'string', title: t.pythonPath.title, description: t.pythonPath.description, 'x-path': { kind: 'file', extensions: ['.exe'] }, 'x-hot': true },

@@ -112,6 +112,11 @@ export class RvcWorld implements World {
   private stopped = true;
   /** 用户在面板上手动停了引擎：自动重拉（装完依赖、切档后）都要让位给这个意图。 */
   private engineHeld = false;
+  /** 引擎是「闲置回收」停的（不是用户手动停）：下一条请求要能自动拉回来。 */
+  private idleStopped = false;
+  private idleTimer: NodeJS.Timeout | undefined;
+  /** 正在执行 stop() 的那一小段：请求要等它结束再决定是否拉回。 */
+  private idleSleep: Promise<void> | undefined;
   private launchDetail = '';
   private codeDir = '';
   private assetsDir = '';
@@ -215,6 +220,7 @@ export class RvcWorld implements World {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.cancelIdle();
     this.installer?.cancel();
     this.venv?.cancel();
     const server = this.server;
@@ -232,12 +238,77 @@ export class RvcWorld implements World {
     if (!engine) return;
     if (auto && this.engineHeld) return;
     this.starting = engine.start()
-      .then(() => { this.launchDetail = ''; })
+      .then(() => {
+        this.launchDetail = '';
+        this.idleStopped = false;
+        this.armIdle();
+      })
       .catch((err: unknown) => {
         this.launchDetail = err instanceof Error ? err.message : String(err);
         this.log?.warn('RVC 引擎启动失败', { err: this.launchDetail });
       });
     void this.starting;
+  }
+
+  /** 闲置回收：到点停掉引擎子进程。手动停过（`engineHeld`）或 World 已卸载时不排期。 */
+  private armIdle(): void {
+    this.cancelIdle();
+    const minutes = Math.max(0, Math.floor(Number(this.opts.cfg.idleMinutes) || 0));
+    if (!minutes || this.stopped || this.engineHeld) return;
+    const engine = this.engine;
+    if (!engine?.ready()) return;
+    if (this.job?.phase === 'working') return;
+    if (engine.queue() > 0) return;
+    this.idleTimer = setTimeout(() => { void this.sleepIdle(); }, minutes * 60_000);
+    this.idleTimer.unref?.();
+  }
+
+  private cancelIdle(): void {
+    if (!this.idleTimer) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = undefined;
+  }
+
+  /** 定时器到点：再确认一次没有活，才真正停引擎；停完不设 `engineHeld`，下一条请求可以自动拉回。 */
+  private async sleepIdle(): Promise<void> {
+    this.idleTimer = undefined;
+    if (this.stopped || this.engineHeld) return;
+    const engine = this.engine;
+    if (!engine?.ready() || engine.queue() > 0 || this.job?.phase === 'working') {
+      this.armIdle();
+      return;
+    }
+    const done = (async (): Promise<void> => {
+      await engine.stop();
+      this.idleStopped = true;
+      this.launchDetail = '引擎已闲置停止，下一条请求会自动启动';
+      this.log?.info('RVC 引擎闲置回收', { idleMinutes: this.opts.cfg.idleMinutes });
+    })();
+    this.idleSleep = done;
+    try {
+      await done;
+    } finally {
+      this.idleSleep = undefined;
+    }
+  }
+
+  /**
+   * 回收后自动拉回：只处理「闲置停」这一种停止。
+   * 手动停止、未装依赖、启动失败都保持原来的 409/未就绪语义，不在这里偷偷重试。
+   */
+  async ensureReady(): Promise<void> {
+    if (this.stopped || this.engineHeld) return;
+    const engine = this.engine;
+    if (!engine || engine.ready()) return;
+    // 正在执行闲置回收：等 stop() 结束（期间请求排队，不吃 409）。
+    if (this.idleSleep) await this.idleSleep.catch(() => undefined);
+    // 已经在启动中（自动启动或别的请求触发）：一起等，避免并发请求被 409 打回。
+    if (this.starting) await this.starting.catch(() => undefined);
+    if (engine.ready()) return;
+    if (!this.idleStopped || engine.state().phase !== 'stopped') return;
+    this.idleStopped = false;
+    this.bootEngine(false);
+    await this.starting?.catch(() => undefined);
   }
 
   /** 面板/接口共用：此刻引擎状态。 */
@@ -277,6 +348,7 @@ export class RvcWorld implements World {
   private async startHttp(): Promise<void> {
     const deps: ConvertDeps = {
       ready: () => !!this.engine?.ready(),
+      ensureReady: () => this.ensureReady(),
       stateText: () => this.engine?.state().detail ?? (this.launchDetail || 'RVC 引擎启动中'),
       health: () => this.health(),
       uvr5: () => hasUvr5(this.uvrDir),
@@ -303,6 +375,11 @@ export class RvcWorld implements World {
   private async convert(job: ConvertJob): Promise<{ audio: Buffer; savedPath?: string }> {
     const engine = this.engine;
     if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+    // 闲置回收进行中/已停：等回收结束再拉回来，别在 stop() 中间硬塞转换。
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
     if (job.separator === 'uvr5' && !hasUvr5(this.uvrDir)) {
       throw new RvcError('param', '人声分离模型未安装；请先在服务页点「一键安装」（约 64 MB）');
     }
@@ -314,6 +391,7 @@ export class RvcWorld implements World {
     const vocals = join(tmpDir, `${id}.vocals.wav`);
     const output = join(tmpDir, `${id}.${job.format}`);
     writeFileSync(input, job.file);
+    this.cancelIdle();
     const at = Date.now();
     try {
       let done;
@@ -358,6 +436,7 @@ export class RvcWorld implements World {
       rmSync(input, { force: true });
       rmSync(vocals, { force: true });
       rmSync(output, { force: true });
+      this.armIdle();
     }
   }
 
@@ -387,7 +466,10 @@ export class RvcWorld implements World {
     if (!Number.isFinite(vocalGain) || vocalGain < -12 || vocalGain > 12) {
       throw new RvcError('param', '人声增益必须在 -12..12 分贝');
     }
-    if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
 
     const tmpDir = join(this.opts.dataDir, 'tmp');
     mkdirSync(tmpDir, { recursive: true });
@@ -396,6 +478,7 @@ export class RvcWorld implements World {
     const input = join(tmpDir, `${id}${ext}`);
     const output = join(tmpDir, `${id}.${job.format}`);
     writeFileSync(input, job.file);
+    this.cancelIdle();
     const at = Date.now();
     try {
       const done = await engine.cover({
@@ -423,6 +506,7 @@ export class RvcWorld implements World {
     } finally {
       rmSync(input, { force: true });
       rmSync(output, { force: true });
+      this.armIdle();
     }
   }
 
@@ -515,6 +599,9 @@ export class RvcWorld implements World {
       }
     }).catch((err) => {
       this.job = { kind, at, phase: 'error', detail: '失败', error: err instanceof Error ? err.message : String(err) };
+    }).finally(() => {
+      // 任务结束后再排期：`armIdle()` 在 job 还是 working 时会直接返回。
+      this.armIdle();
     });
   }
 
@@ -599,6 +686,8 @@ export class RvcWorld implements World {
   private async restartEngine(): Promise<void> {
     // 「重启」是明确的启动意图：手动停过的印记在这里清掉。
     this.engineHeld = false;
+    this.idleStopped = false;
+    this.cancelIdle();
     await this.engine?.stop();
     if (this.stopped) return;
     // 可能改过推理档/运行时：按当前配置重建 venv 与引擎（venv 的 base 变了会自动重建）。
@@ -620,6 +709,7 @@ export class RvcWorld implements World {
   /** 面板「启动引擎」：清掉手动停止的印记，按当前配置重拉。 */
   private startEngine(): void {
     this.engineHeld = false;
+    this.idleStopped = false;
     this.launchDetail = '';
     if (!this.engine) this.setup();
     this.bootEngine(false);
@@ -628,6 +718,8 @@ export class RvcWorld implements World {
   /** 面板「停止引擎」：立刻释放显存/内存；之后装依赖、切档都不会再把引擎拉起来，直到用户再点启动。 */
   private async stopEngine(): Promise<void> {
     this.engineHeld = true;
+    this.idleStopped = false;
+    this.cancelIdle();
     this.launchDetail = '';
     await this.engine?.stop();
   }
@@ -652,7 +744,10 @@ export class RvcWorld implements World {
     } catch (err) {
       throw new RvcError('param', err instanceof Error ? err.message : String(err));
     }
-    if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
     const out = await this.convert(job);
     return { $binary: { mime: job.format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: out.audio.toString('base64') } };
   }

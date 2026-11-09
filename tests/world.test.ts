@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Logger, WorldHost } from 'cortico/core/types.ts';
-import { RVC_DEFAULTS } from '../src/config.ts';
+import { RVC_DEFAULTS, configGroups } from '../src/config.ts';
 import { RvcWorld } from '../src/world.ts';
 
 const roots: string[] = [];
@@ -205,5 +205,18 @@ describe('World 面板数据面', () => {
     // 再点停止：回到 stopped，且之后自动重拉不会把它顶回去（这里只看状态回落）。
     const again = (await invoke('stop')) as State;
     expect(again.phase).toBe('stopped');
+  });
+});
+
+describe('闲置回收配置', () => {
+  it('默认 0 分钟：升级后引擎照旧常驻', () => {
+    expect(RVC_DEFAULTS.idleMinutes).toBe(0);
+  });
+
+  it('服务分组里能改，最小 0（0 表示不回收）', () => {
+    const group = configGroups('zh').find((g) => g.id.endsWith(':service'));
+    const prop = group?.schema.properties?.['worlds.rvc.idleMinutes'] as { type?: string; minimum?: number } | undefined;
+    expect(prop?.type).toBe('number');
+    expect(prop?.minimum).toBe(0);
   });
 });

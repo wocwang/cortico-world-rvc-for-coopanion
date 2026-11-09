@@ -43,6 +43,11 @@ export interface ConvertOutcome {
 export interface ConvertDeps {
   /** 引擎此刻能不能接活。 */
   ready(): boolean;
+  /**
+   * 引擎只是「闲置回收」停掉时，把它拉回来并等启动结束。
+   * 手动停止、依赖没装、启动失败都直接返回，让 `ready()` 继续回 409。
+   */
+  ensureReady?(): Promise<void>;
   /** 不能接活时的说明，用作 409 文案。 */
   stateText(): string;
   /** 引擎状态：设备、当前音色。 */
@@ -222,6 +227,8 @@ export function startConvertServer(opts: {
   };
 
   const convert = async (res: ServerResponse, req: IncomingMessage): Promise<void> => {
+    // 闲置回收后第一次请求：先把它拉起来（和请求体上传并行），别让调用方吃 409。
+    if (!deps.ready()) await deps.ensureReady?.();
     const raw = await readBody(req, MAX_BODY_BYTES);
     const job = readConvertJob(parseMultipart(raw, req.headers['content-type'] ?? ''), { uvr5: deps.uvr5() });
     if (!deps.ready()) throw new RvcHttpError(409, `模型未就绪：${deps.stateText()}`);

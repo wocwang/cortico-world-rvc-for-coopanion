@@ -35,6 +35,8 @@ interface Harness {
   jobs: ConvertJob[];
   deps: ConvertDeps;
   overlap: boolean[];
+  /** `ensureReady()` 被调用的次数。 */
+  wakes: () => number;
 }
 
 async function boot(opts: {
@@ -45,15 +47,25 @@ async function boot(opts: {
   fail?: RvcError;
   saved?: string;
   uvr5?: boolean;
+  /** 模拟「闲置回收后自动拉起」：初始未就绪，第一次请求时被 ensureReady 拉回。 */
+  idleWake?: boolean;
 } = {}): Promise<Harness> {
   const jobs: ConvertJob[] = [];
   const overlap: boolean[] = [];
   let busy = false;
+  let ready = opts.ready !== false;
+  let wakes = 0;
   const deps: ConvertDeps = {
     log,
-    ready: () => opts.ready !== false,
-    stateText: () => 'starting',
-    health: () => ({ ready: opts.ready !== false, device: 'cuda:0', model: 'daifeiyu' }),
+    ready: () => ready,
+    ensureReady: async () => {
+      if (!opts.idleWake) return;
+      wakes += 1;
+      await new Promise((r) => setTimeout(r, 20));
+      ready = true;
+    },
+    stateText: () => (ready ? '' : '引擎已闲置停止'),
+    health: () => ({ ready, device: 'cuda:0', model: 'daifeiyu' }),
     uvr5: () => opts.uvr5 === true,
     convert: async (job) => {
       overlap.push(busy);
@@ -69,7 +81,7 @@ async function boot(opts: {
     },
   };
   handle = await startConvertServer({ port: 0, token: opts.token, deps, queueLimit: opts.queueLimit });
-  return { base: `http://127.0.0.1:${handle.port}`, jobs, deps, overlap };
+  return { base: `http://127.0.0.1:${handle.port}`, jobs, deps, overlap, wakes: () => wakes };
 }
 
 const post = (base: string, body: FormData, headers: Record<string, string> = {}): Promise<Response> =>
@@ -172,6 +184,19 @@ describe('RVC 本机接口', () => {
     const res = await post(infer.base, form());
     expect(res.status).toBe(502);
     expect((await res.json()) as { error: string }).toEqual({ error: '推理炸了' });
+  });
+
+  it('闲置回收后第一次 POST /convert 自动拉起，不返回 409', async () => {
+    const h = await boot({ ready: false, idleWake: true });
+    const health = await fetch(`${h.base}/health`);
+    expect(health.status).toBe(200);
+    expect(((await health.json()) as { ready: boolean }).ready).toBe(false);
+
+    expect((await post(h.base, form())).status).toBe(200);
+    expect(h.wakes()).toBe(1);
+    // 已经热了，第二次不该再调 ensureReady。
+    expect((await post(h.base, form())).status).toBe(200);
+    expect(h.wakes()).toBe(1);
   });
 
   it('未知路由 404', async () => {
