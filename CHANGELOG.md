@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.10 — 2026-11-10
+
+- 新增「结果编辑」：翻唱后把分轨留在 `<dataDir>/sessions/<id>/`（`stems/vocals.wav`、`stems/inst.wav`、
+  `vocals/conv.wav`、`out/mix-n.wav`、`session.json`）；面板改人声/伴奏增益、淡入淡出只重做混音，
+  不再重新分离与变声。默认保留 7 天 / 8 GB，可单独删除或一键清理。
+- 长音频分片改用绝对时间轴 + 0.3 秒互补权重 + 逐片峰值补偿，拼接处不再爆音或音量跳变。
+  真实 30 秒素材实测：input/inst/vocals/conv/mix 全部 1,323,000 帧（差 0 ms），峰值 0.900，
+  相邻采样最大跳变 0.381，人声与成品互相关滞后 0 ms。
+- 修复 mp3 输出：LAME 不支持 RVC v2 的 40 kHz，先在归一化后重采样到 44.1 kHz 再编码。
+  实测 9.98 s 与 wav 完全一致，波形相关 0.97、峰值 0.90，可正常播放。
+- 修复整段/短音频模式 `run_vc` 返回元组错位（此前直接报「写出失败」）。
+- 修复「重新混音」分块游标不前进导致的广播错误。
+- 预热音频改写到每 worker 独立的临时目录，并发启动不再报 `LibsndfileError: System error`。
+- 修复 numba 缓存探测在受保护目录（共享运行时 site-packages）反复重试导致启动卡死数分钟。
+- 真实 HTTP 验证：本机接口 401/404/400 与 200（`x-rvc-ms`、`x-rvc-saved`、`audio/wav`、`audio/mpeg`）全部通过。
+
 ## 0.4.9 — 2026-11-09
 
 - 服务页新增「闲置回收（分钟）」`worlds.rvc.idleMinutes`（默认 0，升级后仍常驻）：超过设定时间没有变声/翻唱

@@ -16,6 +16,12 @@ export interface RvcConfigSection {
    * 只回收引擎，9881 接口与面板保持不变；下一条请求会自动重新拉起。
    */
   idleMinutes: number;
+  /** 翻唱后保留人声/伴奏/变声结果，供面板重新混音；默认开。 */
+  keepStems: boolean;
+  /** 翻唱会话保留天数；0 表示不按时间清理。 */
+  sessionDays: number;
+  /** 翻唱会话总容量上限（GB）；0 表示不按容量清理。 */
+  sessionMaxGb: number;
   /** 推理档；改档后重建派生 venv 并重启引擎生效。 */
   tier: RvcTier;
   /**
@@ -65,6 +71,10 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   autoStart: true,
   // 保持旧行为：升级后引擎照旧常驻，想要回收的用户自己开。
   idleMinutes: 0,
+  // 默认开：不留分轨就没有可精修的素材；用 7 天 / 8 GB 兜住磁盘。
+  keepStems: true,
+  sessionDays: 7,
+  sessionMaxGb: 8,
   tier: 'auto',
   codeDir: '',
   assetsDir: '',
@@ -92,6 +102,9 @@ const TEXT = {
     groupService: { title: '运行与接口', description: '推理代码、派生 venv 与音色目录，以及给其他插件用的本机 HTTP 接口。' },
     autoStart: { title: '随软件自动启动', description: '开启后 Coopanion 启动时会自动拉起 RVC 引擎（约 0.7 GB 显存 / 2.5 GB 内存）；关闭后等你在「服务」页点「启动引擎」。手动点过「启动引擎」不受这个开关影响。' },
     idleMinutes: { title: '闲置回收（分钟）', description: '多久没有变声/翻唱就停掉引擎子进程、释放显存与内存；0 表示不回收（默认，保持旧行为）。只回收引擎，9881 接口照常监听，下一条请求会自动重新拉起。手动点「停止引擎」后不会自动重启。' },
+    keepStems: { title: '保留分轨（可精修）', description: '翻唱后把人声、伴奏和变声结果留在插件数据目录的 sessions 下，面板可以只重做混音，不用重新分离和变声。每首 4 分钟的歌约占 250 MB；默认 7 天 / 8 GB 自动清理，只清 sessions，不动 out。关闭后与旧版一样不落盘。' },
+    sessionDays: { title: '会话保留天数', description: '超过这么多天的翻唱会话会被清理；0 表示不按时间清理（仍受容量上限约束）。' },
+    sessionMaxGb: { title: '会话容量上限（GB）', description: 'sessions 总占用超过这个值时，从最久未用的会话开始删；0 表示不限。只影响 sessions，不动 out。' },
     tier: { title: '推理档', description: '自动：检测到 NVIDIA 显卡就用显卡档，否则 CPU 档。显卡档的派生 venv 基于 CUDA 运行时，变声快很多（约 0.6–0.8 GB 显存）；CPU 档约 1–2 GB 内存。改档后在面板点「重启引擎」生效，切档会自动重建 venv。' },
     tierAuto: '自动',
     tierCuda: '显卡（NVIDIA）',
@@ -115,6 +128,9 @@ const TEXT = {
     groupService: { title: 'Runtime and API', description: 'Inference code, derived venv, voices folder, and the loopback HTTP endpoint for other plugins.' },
     autoStart: { title: 'Start with Coopanion', description: 'When on, the RVC engine starts automatically when Coopanion launches (about 0.7 GB VRAM / 2.5 GB RAM). When off, wait for Start engine on the Service tab. A manual Start engine is not affected by this switch.' },
     idleMinutes: { title: 'Idle shutdown (minutes)', description: 'Stop the engine process and free VRAM/RAM after this many idle minutes; 0 keeps it running (default, same as before). Only the engine is recycled — the 9881 API keeps listening and the next request starts it again. A manual Stop engine is never overridden.' },
+    keepStems: { title: 'Keep stems for refinement', description: 'After a cover, keep the separated vocals, instrumental and converted vocal under sessions in the plugin data folder, so the panel can remix without separating or converting again. About 250 MB per 4-minute song; 7 days / 8 GB auto-cleanup by default, and only sessions is touched. Off restores the old behavior (nothing kept).' },
+    sessionDays: { title: 'Session retention (days)', description: 'Cover sessions older than this are cleaned up; 0 disables the age rule (the size cap still applies).' },
+    sessionMaxGb: { title: 'Session size cap (GB)', description: 'When sessions exceed this size, the least recently used ones are removed first; 0 means no cap. Only sessions is touched, never out.' },
     tier: { title: 'Inference tier', description: 'Auto uses the GPU tier when an NVIDIA GPU is detected, otherwise CPU. The GPU tier builds the derived venv on the CUDA runtime and is much faster (about 0.6–0.8 GB VRAM); the CPU tier uses about 1–2 GB RAM. After changing this, click Restart engine — switching tiers rebuilds the venv automatically.' },
     tierAuto: 'Auto',
     tierCuda: 'GPU (NVIDIA)',
@@ -164,6 +180,9 @@ export function configGroups(language: Language): ConfigGroup[] {
         properties: {
           [`${K}.autoStart`]: { type: 'boolean', title: t.autoStart.title, description: t.autoStart.description, 'x-hot': true },
           [`${K}.idleMinutes`]: { type: 'number', title: t.idleMinutes.title, description: t.idleMinutes.description, minimum: 0, maximum: 1440, multipleOf: 1, 'x-hot': true },
+          [`${K}.keepStems`]: { type: 'boolean', title: t.keepStems.title, description: t.keepStems.description, 'x-hot': true },
+          [`${K}.sessionDays`]: { type: 'number', title: t.sessionDays.title, description: t.sessionDays.description, minimum: 0, maximum: 365, multipleOf: 1, 'x-hot': true },
+          [`${K}.sessionMaxGb`]: { type: 'number', title: t.sessionMaxGb.title, description: t.sessionMaxGb.description, minimum: 0, maximum: 1000, multipleOf: 1, 'x-hot': true },
           [`${K}.codeDir`]: { type: 'string', title: t.codeDir.title, description: t.codeDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.assetsDir`]: { type: 'string', title: t.assetsDir.title, description: t.assetsDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.pythonPath`]: { type: 'string', title: t.pythonPath.title, description: t.pythonPath.description, 'x-path': { kind: 'file', extensions: ['.exe'] }, 'x-hot': true },

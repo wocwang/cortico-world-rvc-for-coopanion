@@ -22,6 +22,7 @@ import { readConvertJob, startConvertServer, type ConvertDeps, type ConvertJob, 
 import { RvcVenv } from './venv.ts';
 import { RuntimeInstall, installedTiers } from './runtime.ts';
 import { importVoiceFile, listVoices } from './voices.ts';
+import { createSession, dirBytes, gcSessions, listSessions, readSession, removeSession, sessionDir, sessionsRoot, writeSession, type RefineSession } from './session.ts';
 import { panelText } from './webui/text.ts';
 
 const WORKER_SCRIPT = fileURLToPath(new URL('./python/worker.py', import.meta.url));
@@ -135,7 +136,13 @@ export class RvcWorld implements World {
   private lastCover: {
     at: number; ms: number; bytes: number; savedPath: string | null; voice: string; format: string;
     stages?: { separate?: number; convert?: number; mix?: number }; peakScale?: number;
+    /** 这次翻唱留下的会话 id；没留分轨时为空。 */
+    sessionId?: string;
   } | null = null;
+  /** 最近一次「重新混音」的结果，面板渲染用。 */
+  private lastMix: { at: number; ms: number; bytes: number; savedPath: string | null; format: string; peakScale?: number } | null = null;
+  /** 当前打开/最近创建的分轨会话；清理与删除时据此保护。 */
+  private activeSession: string | null = null;
 
   constructor(opts: RvcWorldOptions) {
     this.opts = opts;
@@ -179,6 +186,8 @@ export class RvcWorld implements World {
     this.engineHeld = this.opts.cfg.autoStart === false;
     this.launchDetail = '';
     this.setup();
+    // 启动时顺手清一次旧会话：只动 sessions，失败不影响启动。
+    try { this.gcSessions(); } catch { /* 清理失败留到下次 */ }
     // 就绪可能要十几秒；先让 World 挂上，接口立刻能答 `ready=false`。
     this.bootEngine();
     // 已有的派生 venv 不必等用户点安装：后台探一次，面板直接显示就绪。
@@ -480,6 +489,10 @@ export class RvcWorld implements World {
     writeFileSync(input, job.file);
     this.cancelIdle();
     const at = Date.now();
+    const keepStems = this.opts.cfg.keepStems !== false;
+    const session = keepStems ? createSession(this.opts.dataDir) : null;
+    if (session) this.activeSession = session.id;
+    let sessionWritten = false;
     try {
       const done = await engine.cover({
         input,
@@ -491,27 +504,170 @@ export class RvcWorld implements World {
         format: job.format,
         vocalGain,
         chunk: job.chunk,
+        sessionDir: session?.dir,
       });
       const audio = readFileSync(output);
       const outDir = join(this.opts.dataDir, 'out');
       mkdirSync(outDir, { recursive: true });
       const savedPath = join(outDir, `cover-${stamp()}.${job.format}`);
       writeFileSync(savedPath, audio);
+      if (session) {
+        const now = new Date().toISOString();
+        const rel = `out/mix-1.${job.format}`;
+        writeFileSync(join(session.dir, rel), audio);
+        const record: RefineSession = {
+          version: 1,
+          id: session.id,
+          createdAt: now,
+          updatedAt: now,
+          engine: { kind: 'rvc', voice: job.voice || engine.state().model || '', modelSampleRate: done.modelSampleRate ?? done.sampleRate ?? 0 },
+          source: { durationSec: done.durationSec ?? 0, inputPeak: done.inputPeak ?? 0, format: job.format },
+          stems: { vocals: 'stems/vocals.wav', inst: 'stems/inst.wav' },
+          converted: {
+            path: 'vocals/conv.wav',
+            sampleRate: 44100,
+            channels: 1,
+            defaults: { pitch: job.pitch, indexRate: job.indexRate, protect: job.protect, chunk: job.chunk },
+          },
+          segments: [],
+          mix: {
+            vocalGainDb: vocalGain,
+            instGainDb: 0,
+            rmsRatio: done.rmsRatio ?? 1,
+            rmsFrozen: true,
+            fadeInSec: 0,
+            fadeOutSec: 0,
+            peakScale: done.peakScale ?? 1,
+          },
+          outputs: [{ format: job.format, path: rel, at: now }],
+        };
+        writeSession(this.opts.dataDir, session.id, record);
+        sessionWritten = true;
+        this.gcSessions();
+      }
       this.lastCover = {
         at, ms: done.ms, bytes: audio.length, savedPath,
         voice: job.voice || engine.state().model || '', format: job.format,
         stages: done.stages, peakScale: done.peakScale,
+        sessionId: session?.id,
       };
       return { $binary: { mime: job.format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
     } finally {
+      // 没写成功就清掉空会话，别在 sessions 里留垃圾。
+      if (session && !sessionWritten) {
+        rmSync(session.dir, { recursive: true, force: true });
+        if (this.activeSession === session.id) this.activeSession = null;
+      }
       rmSync(input, { force: true });
       rmSync(output, { force: true });
       this.armIdle();
     }
   }
 
+  /** 面板「重新混音」：只读会话里的分轨与变声结果，重做混音后落盘，不跑模型。 */
+  private async remixFromPanel(args: unknown[]): Promise<unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    const engine = this.engine;
+    if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+
+    const vocals = join(dir, session.converted.path);
+    const inst = join(dir, session.stems.inst);
+    if (!existsSync(vocals) || !existsSync(inst)) {
+      throw new RvcError('param', '会话缺少分轨文件，请重新翻唱一次');
+    }
+    const format = raw.format === 'mp3' ? 'mp3' : 'wav';
+    const vocalGainDb = clampNumber(raw.vocalGainDb, -24, 24, 0);
+    const instGainDb = clampNumber(raw.instGainDb, -24, 24, 0);
+    const fadeInSec = clampNumber(raw.fadeInSec, 0, 30, 0);
+    const fadeOutSec = clampNumber(raw.fadeOutSec, 0, 30, 0);
+
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
+
+    // 编号取已有最大值 +1：成品数量被裁到 3 个后，仍不会覆盖同名文件。
+    const next = session.outputs.reduce((max, item) => {
+      const match = /^out\/mix-(\d+)\./.exec(item.path);
+      return match ? Math.max(max, Number(match[1])) : max;
+    }, 0) + 1;
+    const rel = `out/mix-${next}.${format}`;
+    const output = join(dir, rel);
+    this.cancelIdle();
+    const done = await engine.remix({
+      vocals, inst, output, format,
+      vocalGain: vocalGainDb, instGain: instGainDb,
+      fadeIn: fadeInSec, fadeOut: fadeOutSec,
+      rmsRatio: session.mix.rmsRatio,
+    });
+    const audio = readFileSync(output);
+    session.mix = { ...session.mix, vocalGainDb, instGainDb, fadeInSec, fadeOutSec, peakScale: done.peakScale ?? 1 };
+    session.updatedAt = new Date().toISOString();
+    session.outputs.push({ format, path: rel, at: session.updatedAt });
+    // 只留最近 3 个成品，避免反复试听把磁盘撑大。
+    while (session.outputs.length > 3) {
+      const old = session.outputs.shift();
+      if (old) rmSync(join(dir, old.path), { force: true });
+    }
+    writeSession(this.opts.dataDir, id, session);
+    this.activeSession = id;
+    this.lastMix = {
+      at: Date.now(), ms: done.ms, bytes: audio.length, savedPath: output,
+      format, peakScale: done.peakScale,
+    };
+    this.log?.info('RVC 重新混音完成', { id, format, ms: done.ms });
+    return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+  }
+
+  /** 面板「结果编辑」：会话列表 + 当前会话的混音参数。 */
+  private refineState(id = ''): Record<string, unknown> {
+    const sessions = listSessions(this.opts.dataDir);
+    const has = (value: string): boolean => sessions.some((s) => s.id === value);
+    const wanted = id && has(id) ? id : this.activeSession && has(this.activeSession) ? this.activeSession : sessions[0]?.id ?? '';
+    // 面板选中的会话就是「正在用的」：清理时跳过它，避免刚调好参数就被删。
+    this.activeSession = wanted || null;
+    return {
+      root: sessionsRoot(this.opts.dataDir),
+      keep: this.opts.cfg.keepStems !== false,
+      days: this.opts.cfg.sessionDays,
+      maxGb: this.opts.cfg.sessionMaxGb,
+      active: this.activeSession,
+      sessions,
+      session: wanted ? readSession(this.opts.dataDir, wanted) : null,
+    };
+  }
+
+  private deleteSession(id: string): Record<string, unknown> {
+    if (this.job?.phase === 'working') throw new RvcError('param', '有任务在跑，等它结束再删会话');
+    if (!removeSession(this.opts.dataDir, id)) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    if (this.activeSession === id) this.activeSession = null;
+    this.log?.info('删除 RVC 翻唱会话', { id });
+    return this.refineState();
+  }
+
+  private cleanupSessions(): Record<string, unknown> {
+    if (this.job?.phase === 'working') throw new RvcError('param', '有任务在跑，等它结束再清理');
+    const result = this.gcSessions();
+    return { ...this.refineState(), cleaned: result.removed.length, freed: result.freed };
+  }
+
+  /** 双阈值清理：只动 `sessions/`，正在用的会话永远跳过。 */
+  private gcSessions(): { removed: string[]; freed: number } {
+    const result = gcSessions(this.opts.dataDir, {
+      days: Math.max(0, Math.floor(Number(this.opts.cfg.sessionDays) || 0)),
+      maxGb: Math.max(0, Number(this.opts.cfg.sessionMaxGb) || 0),
+      keep: this.activeSession ? [this.activeSession] : [],
+    });
+    if (result.removed.length) this.log?.info('清理 RVC 翻唱会话', result);
+    return result;
+  }
+
   /** 面板发起的变声/翻唱：后台跑，面板立刻返回，用户可以切到别的页；结果用 `takeResult` 取。 */
-  private job: { kind: 'convert' | 'cover'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null = null;
+  private job: { kind: 'convert' | 'cover' | 'remix'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null = null;
   private jobResult: { mime: string; base64: string; savedPath: string | null; ms: number } | null = null;
 
   private async invoke(panel: string, method: string, args: unknown[] = []): Promise<unknown> {
@@ -528,10 +684,13 @@ export class RvcWorld implements World {
       }
       return this.status();
     }
-    if (method === 'convert' || method === 'cover') {
+    if (method === 'convert' || method === 'cover' || method === 'remix') {
       this.beginJob(method, args);
       return this.status();
     }
+    if (method === 'refineState') return this.refineState(String(args[0] ?? ''));
+    if (method === 'sessionDelete') return this.deleteSession(String(args[0] ?? ''));
+    if (method === 'cleanupSessions') return this.cleanupSessions();
     if (method === 'storage') return { items: this.storage() };
     if (method === 'uninstall') return this.uninstall(String(args[0] ?? ''));
     if (method === 'voices') return { voices: listVoices(this.voicesDir) };
@@ -558,6 +717,7 @@ export class RvcWorld implements World {
       { id: 'assets', bytes: dirBytes(this.assetsDir), shared: false },
       { id: 'voices', bytes: dirBytes(this.voicesDir), shared: false },
       { id: 'uvr5', bytes: dirBytes(this.uvrDir), shared: false },
+      { id: 'sessions', bytes: dirBytes(sessionsRoot(this.opts.dataDir)), shared: false },
     ];
   }
 
@@ -570,27 +730,34 @@ export class RvcWorld implements World {
       assets: this.assetsDir,
       voices: this.voicesDir,
       uvr5: this.uvrDir,
+      sessions: sessionsRoot(this.opts.dataDir),
     };
     const target = targets[id];
     if (!target) throw new RvcError('param', `未知的模型：${id}`);
     await this.engine?.stop();
     rmSync(target, { recursive: true, force: true });
     if (id === 'venv') this.venv?.reset();
+    if (id === 'sessions') this.activeSession = null;
     this.launchDetail = '已卸载，点「一键安装」可重新装回';
     this.log?.info('卸载 RVC 数据', { id, path: target });
     return { ...this.status(), storage: this.storage() };
   }
 
   /** 把变声/翻唱放到后台跑：面板拿到的是即时状态，不用在页面上等。 */
-  private beginJob(kind: 'convert' | 'cover', args: unknown[]): void {
+  private beginJob(kind: 'convert' | 'cover' | 'remix', args: unknown[]): void {
     if (this.job?.phase === 'working') throw new RvcError('param', '已有任务在跑，等它结束再试');
     const at = Date.now();
-    this.job = { kind, at, phase: 'working', detail: kind === 'cover' ? '分离人声' : '变声' };
+    const detail = kind === 'cover' ? '分离人声' : kind === 'remix' ? '重新混音' : '变声';
+    this.job = { kind, at, phase: 'working', detail };
     this.jobResult = null;
-    const task = kind === 'cover' ? this.coverFromPanel(args) : this.convertFromPanel(args);
+    const task = kind === 'cover'
+      ? this.coverFromPanel(args)
+      : kind === 'remix'
+        ? this.remixFromPanel(args)
+        : this.convertFromPanel(args);
     task.then((res) => {
       const bin = (res as { $binary?: { mime: string; base64: string } }).$binary;
-      const last = kind === 'cover' ? this.lastCover : this.lastConvert;
+      const last = kind === 'cover' ? this.lastCover : kind === 'remix' ? this.lastMix : this.lastConvert;
       if (bin) {
         this.jobResult = { mime: bin.mime, base64: bin.base64, savedPath: last?.savedPath ?? null, ms: last?.ms ?? 0 };
         this.job = { kind, at, phase: 'done', detail: '完成', ms: last?.ms ?? 0 };
@@ -637,6 +804,7 @@ export class RvcWorld implements World {
       defaultVoice: this.defaultVoice(voices),
       lastConvert: this.lastConvert,
       lastCover: this.lastCover,
+      lastMix: this.lastMix,
       job: this.job,
       resultReady: this.jobResult !== null,
     };
@@ -760,38 +928,11 @@ function stamp(): string {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-/** 递归统计目录字节数；读不到的文件跳过，不抛。 */
-function dirBytes(path: string): number {
-  try {
-    const st = statSync(path);
-    if (!st.isDirectory()) return st.size;
-  } catch {
-    return 0;
-  }
-  let total = 0;
-  const stack = [path];
-  while (stack.length) {
-    const dir = stack.pop() as string;
-    let entries;
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-      } else if (entry.isFile()) {
-        try {
-          total += statSync(full).size;
-        } catch {
-          // 读不到（正在写/已删）就不计入
-        }
-      }
-    }
-  }
-  return total;
+/** 面板传进来的数字：非有限值回落到默认值，再夹到区间内。 */
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
 }
 
 const silentLogger: Logger = {

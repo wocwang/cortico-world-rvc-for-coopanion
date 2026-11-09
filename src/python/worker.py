@@ -13,14 +13,18 @@ stdout 只放协议行（原 fd 被 dup 出来单独写，其余输出统统改�
    "pitch":0,"indexRate":0.3,"protect":0.33,"format":"wav"}
   {"op":"separate","id":2,"input":"song.wav","output":"vocals.wav"}
   {"op":"cover","id":3,"input":"song.mp3","output":"cover.wav","voice":"daifeiyu",
-   "pitch":0,"indexRate":0.3,"protect":0.33,"format":"wav","vocalGain":0}
+   "pitch":0,"indexRate":0.3,"protect":0.33,"format":"wav","vocalGain":0,
+   "sessionDir":"<dataDir>/sessions/20261109-221501-a1b2"}
+  {"op":"remix","id":4,"vocals":"conv.wav","inst":"inst.wav","output":"mix.wav",
+   "format":"wav","vocalGain":0,"instGain":0,"fadeIn":0,"fadeOut":0,"rmsRatio":1.0}
   {"op":"shutdown"}
 
 回复：
   {"type":"ready","device":"cuda:0","model":"daifeiyu","warn":null}
   {"type":"result","id":1,"ok":true,"ms":123,"sampleRate":40000}
   {"type":"result","id":3,"ok":true,"ms":12345,"sampleRate":44100,
-   "stages":{"separate":6800,"convert":7200,"mix":40},"peakScale":0.87}
+   "stages":{"separate":6800,"convert":7200,"mix":40},"peakScale":0.87,
+   "inputPeak":0.91,"rmsRatio":1.23,"durationSec":213.4}
   {"type":"result","id":1,"ok":false,"kind":"decode|infer|param","error":"..."}
   {"type":"fatal","error":"..."}
 """
@@ -89,6 +93,18 @@ def main() -> int:
     os.environ["rmvpe_root"] = os.path.join(assets, "rmvpe")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    # numba 把编译缓存放在源码旁的 __pycache__，启动时用 tempfile 探测目录可写性。
+    # Windows 上这个探测在受保护目录（共享运行时的 site-packages）里会按 TMP_MAX 次反复重试，
+    # 实测把启动卡死数分钟。目录本身可写，跳过探测，直接建目录。
+    try:
+        import numba.core.caching as _numba_caching
+
+        def _ensure_cache_path(self) -> None:
+            os.makedirs(self.get_cache_path(), exist_ok=True)
+
+        _numba_caching._CacheLocator.ensure_cache_path = _ensure_cache_path
+    except Exception:
+        pass
 
     started = time.time()
     from configs.config import Config  # noqa: E402  (先修好 sys.path 再 import)
@@ -152,17 +168,18 @@ def main() -> int:
 
             sr = 16000
             t = np.arange(sr * 2, dtype=np.float32) / sr
-            warm = os.path.join(voices, ".warmup.wav")
+            # 每个 worker 用独立临时目录：两个 worker 同时启动时不要抢同一个预热文件。
+            import shutil
+            import tempfile
+
+            warm_dir = tempfile.mkdtemp(prefix="rvc-warmup-")
+            warm = os.path.join(warm_dir, "warmup.wav")
             sf.write(warm, (0.1 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32), sr)
             status, result = vc.vc_single(0, warm, 0, "rmvpe", current["index"], 0.3, 0, 1.0, 0.33)
             if not result or result[1] is None:
                 warn = "预热失败（仍按就绪处理）：%s" % str(status).splitlines()[-1][:200]
                 print("[rvc] %s" % warn, file=sys.stderr)
-            for path in (warm,):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            shutil.rmtree(warm_dir, ignore_errors=True)
         except Exception as error:
             warn = "预热异常（仍按就绪处理）：%s" % error
             print("[rvc] %s\n%s" % (warn, traceback.format_exc()), file=sys.stderr)
@@ -175,13 +192,29 @@ def main() -> int:
         "loadMs": int((time.time() - started) * 1000),
     })
 
+    # LAME 只认这几档采样率；RVC v2 出的是 40 kHz，直接编码会在 avcodec_open2 报 EINVAL。
+    MP3_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
+
     def write_audio(path: str, audio, sample_rate: int, output_format: str) -> None:
+        import numpy as np
         import soundfile as sf
 
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         if output_format in ("wav", "flac"):
             sf.write(path, audio, sample_rate)
             return
+        if output_format == "mp3" and sample_rate not in MP3_RATES:
+            from math import gcd
+
+            from scipy.signal import resample_poly
+
+            # run_vc 给的是 int16 波形，重采样前先归一化；否则 sf.write 会把 ±3 万的值削成全幅方波。
+            data = np.asarray(audio)
+            data = data.astype(np.float32) / 32768.0 if np.issubdtype(data.dtype, np.integer) else data.astype(np.float32)
+            target = min(MP3_RATES, key=lambda rate: abs(rate - sample_rate))
+            step = gcd(target, sample_rate)
+            audio = resample_poly(data, target // step, sample_rate // step, axis=0)
+            sample_rate = target
         with BytesIO() as wav_file:
             sf.write(wav_file, audio, sample_rate, format="wav")
             wav_file.seek(0)
@@ -207,7 +240,10 @@ def main() -> int:
         audio = load_audio(path, 16000)
         chunk = int(CHUNK_SECONDS * 16000)
         if not chunked or len(audio) <= chunk:
-            return vc.vc_single(0, path, pitch, "rmvpe", current["index"], index_rate, 0, 1.0, protect)
+            status, result = vc.vc_single(0, path, pitch, "rmvpe", current["index"], index_rate, 0, 1.0, protect)
+            if not result or result[0] is None or result[1] is None:
+                return status, None
+            return result
 
         overlap = int(OVERLAP_SECONDS * 16000)
         global_peak = float(np.abs(audio).max()) or 1.0
@@ -457,11 +493,22 @@ def main() -> int:
             return
         separate_ms = int((time.time() - began) * 1000)
 
-        vocal_path = source + ".vocals.wav"
+        stem_dir = (req.get("sessionDir") or "").strip()
+        if stem_dir:
+            # 会话模式：分轨落在 session 里，任务结束也不删。
+            vocal_path = os.path.join(stem_dir, "stems", "vocals.wav")
+            inst_path = os.path.join(stem_dir, "stems", "inst.wav")
+        else:
+            vocal_path = source + ".vocals.wav"
+            inst_path = ""
         try:
             import soundfile as sf
 
+            os.makedirs(os.path.dirname(os.path.abspath(vocal_path)), exist_ok=True)
             sf.write(vocal_path, vocals.T, 44100, subtype="FLOAT")
+            if inst_path:
+                os.makedirs(os.path.dirname(os.path.abspath(inst_path)), exist_ok=True)
+                sf.write(inst_path, instrumental.T, 44100, subtype="FLOAT")
         except Exception:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "写出人声失败：%s" % traceback.format_exc()[-800:]})
             return
@@ -479,14 +526,23 @@ def main() -> int:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
             return
         finally:
-            try:
-                os.remove(vocal_path)
-            except OSError:
-                pass
+            if not stem_dir:
+                try:
+                    os.remove(vocal_path)
+                except OSError:
+                    pass
         if not result or result[0] is None or result[1] is None:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": str(result[0] if result else "没有可转换的音频")[-1500:]})
             return
         convert_ms = int((time.time() - convert_began) * 1000)
+
+        # 会话模式额外记两个数：后续区间重跑复现音量、重混沿用同一电平比例。
+        input_peak = 0.0
+        if stem_dir:
+            try:
+                input_peak = float(np.abs(load_audio(vocal_path, 16000)).max())
+            except Exception:
+                input_peak = float(np.abs(vocals).max())
 
         try:
             conv_sr, conv = int(result[0]), np.asarray(result[1])
@@ -497,6 +553,10 @@ def main() -> int:
             conv = resample_to_44100(conv, conv_sr)
             n = instrumental.shape[1]
             conv = conv[:n] if conv.size >= n else np.pad(conv, (0, n - conv.size))
+            if stem_dir:
+                conv_path = os.path.join(stem_dir, "vocals", "conv.wav")
+                os.makedirs(os.path.dirname(os.path.abspath(conv_path)), exist_ok=True)
+                sf.write(conv_path, conv, 44100, subtype="FLOAT")
             # 电平对齐：RVC 输出被峰值归一化过，直接叠会盖过伴奏；按原人声的 RMS 比例把音量拉回来。
             rms_vocal = float(np.sqrt(np.mean(vocals ** 2)))
             rms_conv = float(np.sqrt(np.mean(conv ** 2)))
@@ -521,6 +581,112 @@ def main() -> int:
             "stages": {"separate": separate_ms, "convert": convert_ms,
                        "mix": int((time.time() - began) * 1000) - separate_ms - convert_ms},
             "peakScale": round(scale, 3),
+            "inputPeak": round(input_peak, 4),
+            "modelSampleRate": int(conv_sr),
+            "rmsRatio": round(ratio, 4),
+            "durationSec": round(n / 44100.0, 3),
+        })
+
+    def remix(req: dict) -> None:
+        """只重做混音：读已分离的伴奏与变声后人声，按增益/淡入淡出混成一条。
+
+        不重新分离、不变声；分块流式读写，长音频也不会整首进内存。
+        电平比例（rmsRatio）由首次翻唱算好后冻结传入，避免局部重跑后整首忽大忽小。
+        """
+        import numpy as np
+        import soundfile as sf
+
+        req_id = req.get("id")
+        fmt = (req.get("format") or "wav").lower()
+        if fmt not in ("wav", "mp3"):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "未知的输出格式：%s" % fmt})
+            return
+        vocals = req.get("vocals") or ""
+        inst = req.get("inst") or ""
+        output = req.get("output") or ""
+        if not output:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "缺少输出路径"})
+            return
+        for path in (vocals, inst):
+            if not path or not os.path.isfile(path):
+                emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到音频：%s" % path})
+                return
+
+        began = time.time()
+        try:
+            ratio = float(req.get("rmsRatio") or 1.0)
+            if not np.isfinite(ratio) or ratio <= 0:
+                ratio = 1.0
+            vgain = ratio * (10 ** (float(req.get("vocalGain") or 0) / 20.0))
+            igain = 10 ** (float(req.get("instGain") or 0) / 20.0)
+            fade_in = max(0.0, float(req.get("fadeIn") or 0))
+            fade_out = max(0.0, float(req.get("fadeOut") or 0))
+            block = 1 << 20
+
+            with sf.SoundFile(inst) as fi, sf.SoundFile(vocals) as fv:
+                if int(fi.samplerate) != 44100 or int(fv.samplerate) != 44100:
+                    raise ValueError("混音只支持 44.1 kHz 的会话文件")
+                total = int(fi.frames)
+                if total <= 0:
+                    raise ValueError("伴奏是空文件")
+                duration = total / 44100.0
+
+                def blocks():
+                    fi.seek(0)
+                    fv.seek(0)
+                    pos = 0
+                    while pos < total:
+                        n = min(block, total - pos)
+                        a = fi.read(n, dtype="float32", always_2d=True)
+                        b = fv.read(n, dtype="float32", always_2d=True)
+                        if b.shape[0] < n:
+                            b = np.pad(b, ((0, n - b.shape[0]), (0, 0)))
+                        yield pos, a.astype(np.float64), b.mean(axis=1).astype(np.float64)
+                        pos += n
+
+                def weights(pos: int, n: int):
+                    t = (np.arange(pos, pos + n, dtype=np.float64) + 0.5) / 44100.0
+                    w = np.ones(n, dtype=np.float64)
+                    if fade_in > 0:
+                        w = np.minimum(w, np.clip(t / fade_in, 0.0, 1.0))
+                    if fade_out > 0:
+                        w = np.minimum(w, np.clip((duration - t) / fade_out, 0.0, 1.0))
+                    return w
+
+                def mixed(pos: int, a, mono):
+                    return (a * igain + np.tile(mono[:, None], (1, 2)) * vgain) * weights(pos, a.shape[0])[:, None]
+
+                # 第一遍只找峰值：先限幅再写，避免整首削波。
+                peak = 0.0
+                for pos, a, mono in blocks():
+                    peak = max(peak, float(np.abs(mixed(pos, a, mono)).max()))
+                scale = 0.99 / peak if peak > 0.99 else 1.0
+
+                os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+                tmp = output + ".tmp.wav"
+                with sf.SoundFile(tmp, "w", samplerate=44100, channels=2, subtype="PCM_16") as sink:
+                    for pos, a, mono in blocks():
+                        sink.write((np.clip(mixed(pos, a, mono), -1.0, 1.0) * scale).astype(np.float32))
+                if fmt == "wav":
+                    os.replace(tmp, output)
+                else:
+                    with open(tmp, "rb") as src, open(output, "wb") as dst:
+                        wav2(src, dst, fmt)
+                    os.remove(tmp)
+        except ValueError as error:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": str(error)})
+            return
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "重混失败：%s" % traceback.format_exc()[-1200:]})
+            return
+        emit({
+            "type": "result",
+            "id": req_id,
+            "ok": True,
+            "ms": int((time.time() - began) * 1000),
+            "sampleRate": 44100,
+            "peakScale": round(scale, 3),
+            "durationSec": round(duration, 3),
         })
 
     for line in sys.stdin:
@@ -543,6 +709,9 @@ def main() -> int:
             continue
         if op == "cover":
             cover(req)
+            continue
+        if op == "remix":
+            remix(req)
             continue
         print("[rvc] 未知指令：%s" % op, file=sys.stderr)
     return 0

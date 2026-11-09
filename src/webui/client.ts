@@ -32,6 +32,51 @@ interface ConvertDone {
 interface CoverDone extends ConvertDone {
   stages?: { separate?: number; convert?: number; mix?: number };
   peakScale?: number;
+  sessionId?: string;
+}
+interface MixDone {
+  at: number;
+  ms: number;
+  bytes: number;
+  savedPath: string | null;
+  format: string;
+  peakScale?: number;
+}
+interface SessionSummary {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  bytes: number;
+  durationSec: number;
+  voice: string;
+  outputs: number;
+}
+interface SessionMix {
+  vocalGainDb: number;
+  instGainDb: number;
+  rmsRatio: number;
+  rmsFrozen: boolean;
+  fadeInSec: number;
+  fadeOutSec: number;
+  peakScale: number;
+}
+interface RefineSession {
+  id: string;
+  engine: { kind: string; voice: string; modelSampleRate: number };
+  source: { durationSec: number; inputPeak: number; format: string };
+  mix: SessionMix;
+  outputs: Array<{ format: string; path: string; at: string }>;
+}
+interface RefineState {
+  root: string;
+  keep: boolean;
+  days: number;
+  maxGb: number;
+  active: string | null;
+  sessions: SessionSummary[];
+  session: RefineSession | null;
+  cleaned?: number;
+  freed?: number;
 }
 interface PanelState {
   phase: 'stopped' | 'starting' | 'ready' | 'error';
@@ -51,7 +96,8 @@ interface PanelState {
   defaultVoice: string;
   lastConvert: ConvertDone | null;
   lastCover: CoverDone | null;
-  job: { kind: 'convert' | 'cover'; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null;
+  lastMix: MixDone | null;
+  job: { kind: 'convert' | 'cover' | 'remix'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null;
   resultReady: boolean;
 }
 interface JobResult {
@@ -206,6 +252,7 @@ const servicePanel: WebUiPanel = {
       assets: t.storeAssets,
       voices: t.storeVoices,
       uvr5: t.storeUvr,
+      sessions: t.storeSessions,
     };
 
     function renderStorage(items: StorageItem[]): void {
@@ -433,7 +480,7 @@ const convertPanel: WebUiPanel = {
     /** 轮询状态时把后台任务收尾：出错显示原因，完成就把音频取回来。 */
     async function settle(s: PanelState): Promise<void> {
       const job = s.job;
-      if (!job) return;
+      if (!job || job.kind !== 'convert') return;
       if (job.phase === 'working') {
         msg.textContent = job.detail || t.converting;
         msg.classList.remove('bad');
@@ -552,7 +599,42 @@ const coverPanel: WebUiPanel = {
     const dl = ui.h('a', 'btn sm', t.download);
     dl.hidden = true;
 
-    ctx.root.append(sheet, audio, resultLine, dl, msg);
+    // 结果编辑：只列会话元数据，不读音频；选中的会话决定「重新混音」的素材。
+    let selectedId = '';
+    let mixKey = '';
+    let settledKey = '';
+    /** 只让最后一次 refineState 请求落地，避免切会话时被慢响应弹回去。 */
+    let refineSeq = 0;
+
+    const refineSheet = ui.section(t.refineTitle, t.refineHint);
+    const sessionSelect = ui.select({
+      options: [],
+      onChange: (value) => {
+        selectedId = value;
+        mixKey = '';
+        void loadRefine(value);
+      },
+    });
+    const vocalGainDb = slider(t.vocalGain, -12, 12, 1);
+    const instGainDb = slider(t.instGain, -12, 12, 1);
+    const fadeIn = slider(t.fadeIn, 0, 10, 0.5);
+    const fadeOut = slider(t.fadeOut, 0, 10, 0.5);
+    const mixFormat = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
+    const mixKnobs = ui.h('div', 'rvc-grid');
+    mixKnobs.append(vocalGainDb.field, instGainDb.field, fadeIn.field, fadeOut.field, ui.field(t.format, mixFormat));
+
+    const remixBtn = ui.button(t.remix, { variant: 'primary', size: 'sm', onClick: () => void runRemix() });
+    const deleteBtn = ui.button(t.sessionDelete, { size: 'sm', onClick: () => void deleteCurrent() });
+    const cleanupBtn = ui.button(t.sessionCleanup, { size: 'sm', onClick: () => void cleanup() });
+    const refineActs = ui.actions();
+    refineActs.append(remixBtn, deleteBtn, cleanupBtn);
+
+    const refineDisk = ui.h('div', 'rvc-detail');
+    const refineLine = ui.h('div', 'rvc-detail');
+    const mixLine = ui.h('div', 'rvc-detail');
+    refineSheet.append(ui.field(t.session, sessionSelect), mixKnobs, refineActs, refineDisk, refineLine, mixLine);
+
+    ctx.root.append(sheet, audio, resultLine, dl, refineSheet, msg);
 
     fileInput.addEventListener('change', () => {
       file = fileInput.files?.[0] ?? null;
@@ -560,6 +642,82 @@ const coverPanel: WebUiPanel = {
       msg.classList.remove('bad');
       if (file) resultLine.textContent = `${file.name} · ${ui.fmt.bytes(file.size)}`;
     });
+
+    /** 一条 0..N 的滑杆，右侧显示当前值。 */
+    function slider(label: string, min: number, max: number, step: number): {
+      input: HTMLInputElement;
+      field: HTMLLabelElement;
+      update: () => void;
+    } {
+      const input = ui.input({ value: '0' });
+      input.type = 'range';
+      input.min = String(min);
+      input.max = String(max);
+      input.step = String(step);
+      const readout = ui.h('span', 'rvc-slider-value');
+      const wrap = ui.h('div', 'rvc-slider');
+      wrap.append(input, readout);
+      const update = (): void => { readout.textContent = String(Number(input.value)); };
+      input.addEventListener('input', update);
+      update();
+      return { input, field: ui.field(label, wrap), update };
+    }
+
+    function setSlider(s: { input: HTMLInputElement; update: () => void }, value: number): void {
+      s.input.value = String(value);
+      s.update();
+    }
+
+    function renderRefine(r: RefineState): void {
+      fillSelect(ui, sessionSelect, r.sessions.map((s) => ({
+        value: s.id,
+        label: [s.id, s.voice ? t.voiceLabel(s.voice) : '', t.sessionLine(ui.fmt.duration(s.durationSec * 1000), ui.fmt.bytes(s.bytes), s.outputs)]
+          .filter(Boolean)
+          .join(' · '),
+      })));
+      const session = r.session;
+      selectedId = session?.id ?? '';
+      sessionSelect.value = selectedId;
+      if (session) {
+        // 只在会话或混音参数真的变了时才回填滑杆，避免轮询把用户正在拖的值弹回去。
+        const key = `${session.id}:${JSON.stringify(session.mix)}`;
+        if (key !== mixKey) {
+          mixKey = key;
+          setSlider(vocalGainDb, session.mix.vocalGainDb);
+          setSlider(instGainDb, session.mix.instGainDb);
+          setSlider(fadeIn, session.mix.fadeInSec);
+          setSlider(fadeOut, session.mix.fadeOutSec);
+        }
+      }
+      const busy = state?.job?.phase === 'working';
+      sessionSelect.disabled = busy || !r.sessions.length;
+      vocalGainDb.input.disabled = busy || !session;
+      instGainDb.input.disabled = busy || !session;
+      fadeIn.input.disabled = busy || !session;
+      fadeOut.input.disabled = busy || !session;
+      mixFormat.disabled = busy || !session;
+      remixBtn.disabled = busy || !session || !state?.ready;
+      deleteBtn.disabled = busy || !session;
+      cleanupBtn.disabled = busy;
+      refineDisk.textContent = t.refineDisk(r.days, r.maxGb);
+      refineLine.textContent = session
+        ? [
+            session.engine.kind,
+            session.engine.voice ? t.voiceLabel(session.engine.voice) : '',
+            session.engine.modelSampleRate ? `${session.engine.modelSampleRate} Hz` : '',
+          ].filter(Boolean).join(' · ')
+        : t.noSession;
+    }
+
+    async function loadRefine(id = selectedId): Promise<void> {
+      const seq = ++refineSeq;
+      try {
+        const r = await ctx.invoke<RefineState>('refineState', id ? [id] : []);
+        if (seq === refineSeq) renderRefine(r);
+      } catch (err) {
+        if (seq === refineSeq) refineLine.textContent = errText(err);
+      }
+    }
 
     function render(s: PanelState, voices: VoiceRow[]): void {
       state = s;
@@ -570,15 +728,13 @@ const coverPanel: WebUiPanel = {
       else if (!s.uvr5) msg.textContent = t.coverNeedsUvr;
     }
 
-    let tookResult = false;
-
     async function run(): Promise<void> {
       msg.textContent = '';
       msg.classList.remove('bad');
       if (!file) { msg.textContent = t.pickFileFirst; msg.classList.add('bad'); return; }
       if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
       if (!state?.uvr5) { msg.textContent = t.coverNeedsUvr; msg.classList.add('bad'); return; }
-      tookResult = false;
+      settledKey = '';
       msg.textContent = t.covering;
       coverBtn.disabled = true;
       try {
@@ -600,22 +756,81 @@ const coverPanel: WebUiPanel = {
       }
     }
 
+    async function runRemix(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      settledKey = '';
+      mixLine.textContent = '';
+      msg.textContent = t.remixing;
+      remixBtn.disabled = true;
+      try {
+        await ctx.invoke('remix', [selectedId, {
+          vocalGainDb: Number(vocalGainDb.input.value),
+          instGainDb: Number(instGainDb.input.value),
+          fadeInSec: Number(fadeIn.input.value),
+          fadeOutSec: Number(fadeOut.input.value),
+          format: mixFormat.value,
+        }]);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+        remixBtn.disabled = !state?.ready;
+      }
+    }
+
+    async function deleteCurrent(): Promise<void> {
+      if (!selectedId) return;
+      const ok = await ui.confirm({ title: t.sessionDelete, body: t.sessionDeleteConfirm, danger: true });
+      if (!ok) return;
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      try {
+        const r = await ctx.invoke<RefineState>('sessionDelete', [selectedId]);
+        refineSeq += 1;
+        mixKey = '';
+        renderRefine(r);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      }
+    }
+
+    async function cleanup(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      try {
+        const r = await ctx.invoke<RefineState>('cleanupSessions');
+        refineSeq += 1;
+        mixKey = '';
+        renderRefine(r);
+        msg.textContent = t.sessionCleaned(r.cleaned ?? 0);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      }
+    }
+
     async function settle(s: PanelState): Promise<void> {
       const job = s.job;
-      if (!job) return;
+      if (!job || (job.kind !== 'cover' && job.kind !== 'remix')) return;
       if (job.phase === 'working') {
-        msg.textContent = job.detail || t.covering;
+        msg.textContent = job.detail || (job.kind === 'remix' ? t.remixing : t.covering);
         msg.classList.remove('bad');
         return;
       }
-      if (tookResult) return;
-      tookResult = true;
+      const key = `${job.kind}:${job.phase}:${job.at}`;
       if (job.phase === 'error') {
-        msg.textContent = job.error || '翻唱失败';
-        msg.classList.add('bad');
+        if (settledKey !== key) {
+          settledKey = key;
+          msg.textContent = job.error || (job.kind === 'remix' ? '重新混音失败' : '翻唱失败');
+          msg.classList.add('bad');
+        }
         return;
       }
-      if (!s.resultReady) return;
+      if (!s.resultReady || settledKey === key) return;
+      settledKey = key;
       const r = await ctx.invoke<JobResult>('takeResult');
       if (r.error || !r.base64) {
         msg.textContent = r.error ?? '没有拿到音频';
@@ -628,6 +843,16 @@ const coverPanel: WebUiPanel = {
       url = URL.createObjectURL(blob);
       audio.src = url;
       audio.hidden = false;
+      if (job.kind === 'remix') {
+        const done = s.lastMix;
+        dl.href = url;
+        dl.download = `remix.${done?.format ?? mixFormat.value}`;
+        dl.hidden = false;
+        mixLine.textContent = done
+          ? t.remixDone(ui.fmt.duration(done.ms), ui.fmt.bytes(done.bytes), done.savedPath ?? r.savedPath ?? '')
+          : '';
+        return;
+      }
       dl.href = url;
       dl.download = `cover.${format.value}`;
       dl.hidden = false;
@@ -645,6 +870,7 @@ const coverPanel: WebUiPanel = {
           done.peakScale !== undefined && done.peakScale < 1 ? t.peakScaled : '',
           done.savedPath ? t.saved(done.savedPath) : '',
         ].filter(Boolean).join(' · ');
+        if (done.sessionId) selectedId = done.sessionId;
       }
     }
 
@@ -653,6 +879,7 @@ const coverPanel: WebUiPanel = {
         const [s, v] = await Promise.all([ctx.invoke<PanelState>('state'), ctx.invoke<VoicesResp>('voices')]);
         render(s, v.voices ?? []);
         await settle(s);
+        await loadRefine(selectedId);
       } catch (err) { if (!state) msg.textContent = errText(err); }
     };
     void refresh();

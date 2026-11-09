@@ -11,6 +11,7 @@
  * - engine → worker：`{"op":"convert","id":1,"input":"...","output":"...","voice":"...","pitch":0,...}`
  * - engine → worker：`{"op":"separate","id":2,"input":"...","output":"..."}`
  * - engine → worker：`{"op":"cover","id":3,"input":"...","output":"...","voice":"...","vocalGain":0,...}`
+ * - engine → worker：`{"op":"remix","id":4,"vocals":"...","inst":"...","output":"..."}`
  * - engine → worker：`{"op":"shutdown"}`
  * worker 的日志一律走 stderr，stdout 只放协议行。
  */
@@ -87,6 +88,8 @@ export interface CoverRequest {
   vocalGain?: number;
   /** 长音频是否切片（默认切）。 */
   chunk?: boolean;
+  /** 翻唱会话目录；给了就把分轨与变声结果留在里面，不给则沿用旧行为（不落盘）。 */
+  sessionDir?: string;
 }
 
 export interface SeparateRequest {
@@ -97,6 +100,24 @@ export interface SeparateRequest {
   instrumental?: string;
 }
 
+/** 只做文件级混音：读已分离好的伴奏与变声后人声，按增益/淡入淡出混成一条。 */
+export interface RemixRequest {
+  /** 变声后人声（44.1 kHz mono）。 */
+  vocals: string;
+  /** 伴奏（44.1 kHz stereo）。 */
+  inst: string;
+  output: string;
+  format: 'wav' | 'mp3';
+  /** 人声增益，分贝。 */
+  vocalGain: number;
+  /** 伴奏增益，分贝。 */
+  instGain: number;
+  fadeIn: number;
+  fadeOut: number;
+  /** 首次翻唱算出的 RMS 比例；冻结使用，避免局部重跑后整首电平跳变。 */
+  rmsRatio: number;
+}
+
 export interface ConvertDone {
   ms: number;
   sampleRate: number;
@@ -104,6 +125,14 @@ export interface ConvertDone {
   stages?: { separate?: number; convert?: number; mix?: number };
   /** 混音时为了不削波整体缩小的倍率（1 表示没缩）。 */
   peakScale?: number;
+  /** 翻唱：分离人声的 16 kHz 峰值，后续区间重跑复现音量用。 */
+  inputPeak?: number;
+  /** 翻唱：RVC 模型原始输出的采样率（重采样到 44.1 kHz 之前）。 */
+  modelSampleRate?: number;
+  /** 翻唱：人声与变声结果的 RMS 比例，混音与重混都用它。 */
+  rmsRatio?: number;
+  /** 翻唱/重混：成品时长（秒）。 */
+  durationSec?: number;
 }
 
 /** 长音频会切片（每 20 秒一片），5 分钟的音频在 CPU 上也可能几分钟，给足上限。 */
@@ -113,6 +142,8 @@ const DEFAULT_START_TIMEOUT_MS = 180_000;
 const SEPARATE_TIMEOUT_MS = 900_000;
 /** 分离 + 变声 + 混音：一首 4 分钟的歌约 5 分钟，给足余量。 */
 const COVER_TIMEOUT_MS = 1_800_000;
+/** 重混只读文件、不跑模型；长音频也在秒级到分钟级。 */
+const REMIX_TIMEOUT_MS = 300_000;
 const TAIL_LINES = 40;
 
 interface Pending {
@@ -210,10 +241,20 @@ export class RvcEngine {
       input: req.input, output: req.output, voice: req.voice ?? '',
       pitch: req.pitch, indexRate: req.indexRate, protect: req.protect,
       format: req.format, vocalGain: req.vocalGain ?? 0, chunk: req.chunk === false ? 0 : 1,
+      sessionDir: req.sessionDir ?? '',
     }, COVER_TIMEOUT_MS);
   }
 
-  private async run(op: 'convert' | 'separate' | 'cover', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
+  /** 只重做混音：不重新分离、不变声。 */
+  async remix(req: RemixRequest): Promise<ConvertDone> {
+    return this.run('remix', {
+      vocals: req.vocals, inst: req.inst, output: req.output, format: req.format,
+      vocalGain: req.vocalGain, instGain: req.instGain,
+      fadeIn: req.fadeIn, fadeOut: req.fadeOut, rmsRatio: req.rmsRatio,
+    }, REMIX_TIMEOUT_MS);
+  }
+
+  private async run(op: 'convert' | 'separate' | 'cover' | 'remix', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
     if (!this.ready()) throw new RvcError('unavailable', this.st.detail ?? 'RVC 引擎未就绪');
     const id = ++this.seq;
     const run = () => new Promise<ConvertDone>((resolve, reject) => {
@@ -355,6 +396,10 @@ export class RvcEngine {
           sampleRate: typeof msg.sampleRate === 'number' ? msg.sampleRate : 0,
           stages: msg.stages && typeof msg.stages === 'object' ? msg.stages as ConvertDone['stages'] : undefined,
           peakScale: typeof msg.peakScale === 'number' ? msg.peakScale : undefined,
+          inputPeak: typeof msg.inputPeak === 'number' ? msg.inputPeak : undefined,
+          modelSampleRate: typeof msg.modelSampleRate === 'number' ? msg.modelSampleRate : undefined,
+          rmsRatio: typeof msg.rmsRatio === 'number' ? msg.rmsRatio : undefined,
+          durationSec: typeof msg.durationSec === 'number' ? msg.durationSec : undefined,
         });
       } else {
         const kind = msg.kind === 'decode' ? 'decode' : msg.kind === 'param' ? 'param' : 'infer';
