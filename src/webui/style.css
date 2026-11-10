@@ -23,3 +23,7 @@
 .rvc-seg-head { display: flex; gap: .6em; align-items: baseline; font-size: .9em; }
 .rvc-seg-head strong { font-variant-numeric: tabular-nums; }
 .rvc-seg-head span { opacity: .7; font-variant-numeric: tabular-nums; }
+.rvc-pitch-regions { display: flex; flex-direction: column; gap: .35em; margin: .3em 0 .6em; }
+.rvc-pitch-row { display: flex; align-items: center; justify-content: space-between; gap: .6em; font-size: .85em; font-variant-numeric: tabular-nums; }
+.rvc-pitch-row span { opacity: .8; }
+.rvc-pitch-row button { flex: none; }

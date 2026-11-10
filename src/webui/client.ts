@@ -7,6 +7,8 @@
  */
 import type { WebUiClientBundle, WebUiPanel, WebUiPanelContext, WebUi, Disposable } from 'cortico/web/shared/client-panel.ts';
 import { panelText } from './text.ts';
+import { abRange, abWrap, carryPosition } from './ab.ts';
+import type { PitchAnalysis } from '../pitch.ts';
 import './style.css';
 
 /** 本地版本的 `toDisposable`：浏览器 bundle 只允许 import type 框架，运行时要自带。 */
@@ -52,6 +54,16 @@ interface RangeDone {
   end: number;
   pitch: number;
 }
+interface MasterDone extends MixDone {
+  targetLufs: number;
+  ceilingDb: number;
+  inputLufs: number;
+  inputTruePeakDb: number;
+  outputLufs: number;
+  outputTruePeakDb: number;
+  gainDb: number;
+  limitedDb: number;
+}
 interface SessionSummary {
   id: string;
   createdAt: string;
@@ -92,6 +104,10 @@ interface RefineSession {
   }>;
   mix: SessionMix;
   outputs: Array<{ format: string; path: string; at: string }>;
+  masters?: Array<{
+    format: string; path: string; at: string; targetLufs: number;
+    inputLufs: number; inputTruePeakDb: number; outputLufs: number; outputTruePeakDb: number;
+  }>;
 }
 interface PeaksResp {
   id?: string;
@@ -133,7 +149,8 @@ interface PanelState {
   lastCover: CoverDone | null;
   lastMix: MixDone | null;
   lastRange: RangeDone | null;
-  job: { kind: 'convert' | 'cover' | 'remix' | 'range'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null;
+  lastMaster: MasterDone | null;
+  job: { kind: 'convert' | 'cover' | 'remix' | 'range' | 'master'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null;
   resultReady: boolean;
 }
 interface JobResult {
@@ -651,6 +668,21 @@ const coverPanel: WebUiPanel = {
     let previewTimer = 0;
     /** 段落列表的渲染键：数据没变就不重建 DOM，避免轮询打断正在编辑的参数。 */
     let segKey = '';
+    /** 音高体检数据（源人声不变，按会话缓存）与请求序号。 */
+    let pitchData: PitchAnalysis | null = null;
+    let pitchKey = '';
+    let pitchSeq = 0;
+    /** A/B：当前音轨、正在载入的成品对、两个 object URL 与循环计时器。 */
+    let abActive: 'A' | 'B' = 'A';
+    let abKey = '';
+    let abToken = 0;
+    let abTimer = 0;
+    let abUrlA: string | null = null;
+    let abUrlB: string | null = null;
+    let abLoaded = false;
+    let abLabelA = '';
+    let abLabelB = '';
+    let abOutputs: RefineSession['outputs'] = [];
 
     const refineSheet = ui.section(t.refineTitle, t.refineHint);
     const sessionSelect = ui.select({
@@ -663,6 +695,13 @@ const coverPanel: WebUiPanel = {
         peaksKey = '';
         selStart = 0;
         selEnd = 0;
+        pitchData = null;
+        pitchKey = '';
+        pitchList.textContent = '';
+        pitchLine.textContent = t.pitchHint;
+        abKey = '';
+        abLoaded = false;
+        stopAB();
         updateRangeLine();
         drawWave();
         void loadRefine(value);
@@ -702,7 +741,27 @@ const coverPanel: WebUiPanel = {
     const f0Btn = ui.button(t.exportF0, { size: 'sm', onClick: () => void exportF0() });
     const rangeActs = ui.actions();
     rangeActs.append(rerunRangeBtn, auditionBtn, f0Btn);
-    waveSheet.append(canvas, rangeLine, rangeKnobs, rangeActs);
+    // 音高体检：曲线与热力条画在同一个波形画布上，下面只列跑调区间。
+    const pitchLine = ui.h('div', 'rvc-detail', t.pitchHint);
+    const pitchList = ui.h('div', 'rvc-pitch-regions');
+    waveSheet.append(canvas, rangeLine, pitchLine, pitchList, rangeKnobs, rangeActs);
+
+    // 一键母带：另存，不覆盖最近一次混音。
+    const masterSheet = ui.section(t.masterTitle, t.masterHint);
+    const masterPreset = ui.select({
+      value: '-14',
+      options: [
+        { value: '-14', label: '-14 LUFS' },
+        { value: '-16', label: '-16 LUFS' },
+        { value: '-23', label: '-23 LUFS' },
+      ],
+    });
+    const masterFormat = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
+    const masterBtn = ui.button(t.master, { variant: 'primary', size: 'sm', onClick: () => void runMaster() });
+    const masterActs = ui.actions();
+    masterActs.append(masterBtn);
+    const masterLine = ui.h('div', 'rvc-detail');
+    masterSheet.append(ui.field(t.masterPreset, masterPreset), ui.field(t.format, masterFormat), masterActs, masterLine);
 
     const remixBtn = ui.button(t.remix, { variant: 'primary', size: 'sm', onClick: () => void runRemix() });
     const deleteBtn = ui.button(t.sessionDelete, { size: 'sm', onClick: () => void deleteCurrent() });
@@ -721,8 +780,28 @@ const coverPanel: WebUiPanel = {
     const segmentLine = ui.h('div', 'rvc-detail', t.segmentCutHint);
     segmentSheet.append(segmentList, segmentLine);
 
-    ctx.root.append(sheet, audio, resultLine, dl, refineSheet, waveSheet, segmentSheet, msg);
-    ctx.own(disposable(() => { stopPreviewTimer(); }));
+    // A/B 试听：两个隐藏 audio，各自持有一条成品；切换只搬 currentTime。
+    const abSheet = ui.section(t.abTitle, t.abHint);
+    const abLine = ui.h('div', 'rvc-detail', t.abNeedTwo);
+    const abABtn = ui.button('A', { size: 'sm', onClick: () => void abPlay('A') });
+    const abBBtn = ui.button('B', { variant: 'primary', size: 'sm', onClick: () => void abPlay('B') });
+    const abSwitchBtn = ui.button(t.abSwitch, { size: 'sm', onClick: () => void abPlay(abActive === 'A' ? 'B' : 'A') });
+    const abStopBtn = ui.button(t.abStop, { size: 'sm', onClick: () => stopAB() });
+    const abActs = ui.actions();
+    abActs.append(abABtn, abBBtn, abSwitchBtn, abStopBtn);
+    const abAudioA = document.createElement('audio');
+    const abAudioB = document.createElement('audio');
+    abAudioA.hidden = true;
+    abAudioB.hidden = true;
+    abSheet.append(abActs, abLine);
+
+    ctx.root.append(sheet, audio, resultLine, dl, refineSheet, waveSheet, masterSheet, segmentSheet, abSheet, abAudioA, abAudioB, msg);
+    ctx.own(disposable(() => {
+      stopPreviewTimer();
+      stopAB();
+      if (abUrlA) URL.revokeObjectURL(abUrlA);
+      if (abUrlB) URL.revokeObjectURL(abUrlB);
+    }));
 
     fileInput.addEventListener('change', () => {
       file = fileInput.files?.[0] ?? null;
@@ -788,6 +867,16 @@ const coverPanel: WebUiPanel = {
         }
       }
       if (selectedId && peaksKey !== selectedId) void loadPeaks(selectedId);
+      if (selectedId && pitchKey !== selectedId) {
+        // 换会话先清掉上一个会话的曲线与母带读数，别让旧数据叠在新波形上。
+        pitchData = null;
+        pitchKey = '';
+        pitchLine.textContent = state?.ready ? t.pitchLoading : t.pitchNeedsReady;
+        pitchList.textContent = '';
+        masterLine.textContent = '';
+        drawWave();
+        if (state?.ready) void loadPitch(selectedId);
+      }
       if (!selectedId) {
         peaks = null;
         peaksKey = '';
@@ -810,8 +899,21 @@ const coverPanel: WebUiPanel = {
       rerunRangeBtn.disabled = busy || !session || !state?.ready;
       auditionBtn.disabled = busy || !session || !state?.ready;
       f0Btn.disabled = busy || !session || !state?.ready;
+      masterPreset.disabled = busy || !session;
+      masterFormat.disabled = busy || !session;
+      masterBtn.disabled = busy || !session || !state?.ready || !session.outputs.length;
       deleteBtn.disabled = busy || !session;
       cleanupBtn.disabled = busy;
+      if (!selectedId) {
+        pitchData = null;
+        pitchKey = '';
+        pitchLine.textContent = t.pitchHint;
+        pitchList.textContent = '';
+        masterLine.textContent = '';
+      } else if (!state?.ready && !pitchData) {
+        pitchLine.textContent = t.pitchNeedsReady;
+      }
+      renderAB(session, busy);
       refineDisk.textContent = t.refineDisk(r.days, r.maxGb);
       refineLine.textContent = session
         ? [
@@ -905,6 +1007,226 @@ const coverPanel: WebUiPanel = {
         cutBtn.disabled = busy;
         mergeBtn.disabled = busy;
       }
+    }
+
+    /** 音高体检：首次要跑 RMVPE（几秒）；源人声不变，按会话缓存，不随重做失效。 */
+    async function loadPitch(id: string): Promise<void> {
+      const seq = ++pitchSeq;
+      pitchLine.textContent = t.pitchLoading;
+      pitchList.textContent = '';
+      try {
+        const r = await ctx.invoke<PitchAnalysis>('refinePitch', [id]);
+        if (seq !== pitchSeq) return;
+        pitchData = r;
+        pitchKey = id;
+        if (r.voicedRatio <= 0) pitchLine.textContent = t.pitchNoVoice;
+        else {
+          pitchLine.textContent = [
+            t.pitchSummary(Math.round(r.inTuneRatio * 100), r.regionCount),
+            t.pitchMeta(r.tuningOffsetCents, r.thresholds.cents, Math.round((r.thresholds.minRegionFrames / r.frameRate) * 1000)),
+          ].join(' · ');
+        }
+        renderPitchRegions();
+        drawWave();
+      } catch (err) {
+        if (seq !== pitchSeq) return;
+        pitchData = null;
+        // 记住失败的会话，别让 3 秒轮询反复打同一个错误。
+        pitchKey = id;
+        pitchLine.textContent = t.pitchFailed(errText(err));
+        pitchList.textContent = '';
+        drawWave();
+      }
+    }
+
+    function renderPitchRegions(): void {
+      pitchList.textContent = '';
+      if (!pitchData || !pitchData.regions.length) {
+        if (pitchData) pitchList.append(ui.h('div', 'rvc-detail', t.pitchEmpty));
+        return;
+      }
+      pitchList.append(ui.h('div', 'rvc-detail', t.pitchRegions));
+      for (const region of pitchData.regions.slice(0, 20)) {
+        const row = ui.h('div', 'rvc-pitch-row');
+        row.append(
+          ui.h('span', '', t.pitchRegion(fmtSeconds(region.start), fmtSeconds(region.end), region.meanCents.toFixed(0))),
+          ui.button(t.pitchSelect, { size: 'sm', onClick: () => selectRegion(region) }),
+        );
+        pitchList.append(row);
+      }
+      if (pitchData.regionCount > 20) {
+        pitchList.append(ui.h('div', 'rvc-detail', t.pitchMore(pitchData.regionCount - 20)));
+      }
+    }
+
+    /** 点跑调区间 → 选中并滚回「重跑这一段」，参数留给用户自己改。 */
+    function selectRegion(region: PitchAnalysis['regions'][number]): void {
+      if (!peaks) return;
+      selStart = Math.max(0, Math.min(peaks.durationSec, region.start));
+      selEnd = Math.max(selStart, Math.min(peaks.durationSec, region.end + 0.05));
+      updateRangeLine();
+      drawWave();
+      msg.textContent = t.pitchJump;
+      waveSheet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    // ---- A/B 试听 ----------------------------------------------------------
+    function abEl(which: 'A' | 'B'): HTMLAudioElement {
+      return which === 'A' ? abAudioA : abAudioB;
+    }
+
+    function abCurrent(): HTMLAudioElement {
+      return abEl(abActive);
+    }
+
+    function abDuration(): number {
+      const a = Number.isFinite(abAudioA.duration) && abAudioA.duration > 0 ? abAudioA.duration : 0;
+      const b = Number.isFinite(abAudioB.duration) && abAudioB.duration > 0 ? abAudioB.duration : 0;
+      if (a && b) return Math.min(a, b);
+      return a || b || 0;
+    }
+
+    function abLoopRange(): { start: number; end: number } {
+      return abRange(selStart, selEnd, abDuration() || peaks?.durationSec || 0);
+    }
+
+    function updateABLine(): void {
+      if (!abLoaded) return;
+      const range = abLoopRange();
+      abLine.textContent = [
+        t.abLoaded(abLabelA, abLabelB),
+        t.abRange(fmtSeconds(range.start), fmtSeconds(range.end)),
+        t.abPosition(abActive, fmtSeconds(abCurrent().currentTime)),
+      ].join(' · ');
+    }
+
+    function stopABTimer(): void {
+      if (abTimer) {
+        cancelAnimationFrame(abTimer);
+        abTimer = 0;
+      }
+    }
+
+    function startABTimer(): void {
+      stopABTimer();
+      const tick = (): void => {
+        const el = abCurrent();
+        if (el.paused) {
+          abTimer = 0;
+          updateABLine();
+          return;
+        }
+        const range = abLoopRange();
+        if (range.end > range.start) el.currentTime = abWrap(el.currentTime, range.start, range.end);
+        updateABLine();
+        abTimer = requestAnimationFrame(tick);
+      };
+      abTimer = requestAnimationFrame(tick);
+    }
+
+    function stopAB(): void {
+      stopABTimer();
+      abAudioA.pause();
+      abAudioB.pause();
+      updateABLine();
+    }
+
+    /** 切到 A 或 B：先搬 currentTime，再决定是否继续播。 */
+    async function abPlay(which: 'A' | 'B'): Promise<void> {
+      if (!abLoaded) return;
+      const from = abCurrent();
+      const to = abEl(which);
+      const playing = !from.paused;
+      const range = abLoopRange();
+      if (which !== abActive) {
+        carryPosition(from, to, abDuration());
+        from.pause();
+        abActive = which;
+      }
+      if (!playing && (to.currentTime < range.start || to.currentTime >= range.end)) {
+        to.currentTime = range.start;
+      }
+      await to.play().catch(() => undefined);
+      startABTimer();
+      updateABLine();
+    }
+
+    function waitMeta(el: HTMLAudioElement): Promise<void> {
+      if (el.readyState >= 1) return Promise.resolve();
+      return new Promise((resolve) => {
+        el.addEventListener('loadedmetadata', () => resolve(), { once: true });
+        el.addEventListener('error', () => resolve(), { once: true });
+      });
+    }
+
+    function clockOf(at: string | undefined): string {
+      if (!at) return '';
+      const date = new Date(at);
+      return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString();
+    }
+
+    /** 载入最近两条成品，保留当前播放位置；切会话/新成品时自动重载。 */
+    async function loadAB(aIndex: number, bIndex: number): Promise<void> {
+      if (!selectedId) return;
+      const token = ++abToken;
+      abLoaded = false;
+      abLine.textContent = t.abLoading;
+      try {
+        const [blobA, blobB] = await Promise.all([
+          ctx.invokeBinary('refineAudio', [selectedId, aIndex]),
+          ctx.invokeBinary('refineAudio', [selectedId, bIndex]),
+        ]);
+        if (token !== abToken) return;
+        const wasPlaying = !abCurrent().paused;
+        const position = abCurrent().currentTime;
+        if (abUrlA) URL.revokeObjectURL(abUrlA);
+        if (abUrlB) URL.revokeObjectURL(abUrlB);
+        abUrlA = URL.createObjectURL(blobA);
+        abUrlB = URL.createObjectURL(blobB);
+        abAudioA.src = abUrlA;
+        abAudioB.src = abUrlB;
+        await Promise.all([waitMeta(abAudioA), waitMeta(abAudioB)]);
+        if (token !== abToken) return;
+        const duration = abDuration();
+        const at = Number.isFinite(position) && position > 0 && position < duration ? position : 0;
+        abAudioA.currentTime = at;
+        abAudioB.currentTime = at;
+        abLabelA = clockOf(abOutputs[aIndex]?.at);
+        abLabelB = clockOf(abOutputs[bIndex]?.at);
+        abABtn.textContent = t.abA(abLabelA ? ` · ${abLabelA}` : '');
+        abBBtn.textContent = t.abB(abLabelB ? ` · ${abLabelB}` : '');
+        abLoaded = true;
+        if (wasPlaying) void abCurrent().play().catch(() => undefined);
+        updateABLine();
+        if (wasPlaying) startABTimer();
+      } catch (err) {
+        if (token !== abToken) return;
+        abLoaded = false;
+        abLine.textContent = `${t.abFailed}：${errText(err)}`;
+      }
+    }
+
+    function renderAB(session: RefineSession | null, busy: boolean): void {
+      abOutputs = session?.outputs ?? [];
+      const pair = abOutputs.slice(-2);
+      const key = session ? `${session.id}:${pair.map((item) => item.path).join('|')}` : '';
+      if (key !== abKey) {
+        abKey = key;
+        if (!session || pair.length < 2) {
+          abLoaded = false;
+          stopAB();
+          abAudioA.removeAttribute('src');
+          abAudioB.removeAttribute('src');
+          abLine.textContent = t.abNeedTwo;
+        } else {
+          void loadAB(abOutputs.length - 2, abOutputs.length - 1);
+        }
+      }
+      const ready = abLoaded && !busy;
+      abABtn.disabled = !ready;
+      abBBtn.disabled = !ready;
+      abSwitchBtn.disabled = !ready;
+      abStopBtn.disabled = !ready;
     }
 
     /** 段落动作：重做/还原走后台（会跑模型），静音/切分/合并只改 session.json。 */
@@ -1099,6 +1421,7 @@ const coverPanel: WebUiPanel = {
         const bottom = mid - low * mid * 0.92;
         paint.fillRect(i * bar, top, Math.max(1, bar * 0.9), Math.max(1, bottom - top));
       }
+      drawPitch(paint, width, height, peaks.durationSec);
       if (peaks.durationSec > 0 && selEnd - selStart > 0.001) {
         const x1 = (selStart / peaks.durationSec) * width;
         const x2 = (selEnd / peaks.durationSec) * width;
@@ -1107,6 +1430,60 @@ const coverPanel: WebUiPanel = {
         paint.strokeStyle = 'rgba(255,196,84,.9)';
         paint.strokeRect(x1 + 0.5, 0.5, Math.max(1, x2 - x1 - 1), height - 1);
       }
+    }
+
+    /**
+     * 在波形上叠音高曲线（对数频率轴 70–1200 Hz）和底部偏差热力条。
+     * 热力条颜色：|偏差| <15 绿、15–35 黄、≥35 红；跑调区间再盖一层红框。
+     */
+    function drawPitch(paint: CanvasRenderingContext2D, width: number, height: number, duration: number): void {
+      if (!pitchData || !duration || !pitchData.curve.times.length) return;
+      const { times, f0, cents } = pitchData.curve;
+      const count = times.length;
+      const bucket = width / count;
+      const stripTop = height * 0.86;
+      const stripHeight = Math.max(2, height * 0.11);
+      for (let i = 0; i < count; i += 1) {
+        const value = cents[i];
+        if (value === null) continue;
+        const abs = Math.abs(value);
+        paint.fillStyle = abs < 15 ? 'rgba(94,214,139,.55)' : abs < pitchData.thresholds.cents ? 'rgba(255,196,84,.6)' : 'rgba(255,96,96,.72)';
+        paint.fillRect(times[i] / duration * width, stripTop, Math.max(1, bucket), stripHeight);
+      }
+
+      const lo = Math.log2(70);
+      const hi = Math.log2(1200);
+      const yOf = (hz: number): number => {
+        const v = Math.log2(Math.max(70, Math.min(1200, hz)));
+        return (1 - (v - lo) / (hi - lo)) * (stripTop - 8) + 4;
+      };
+      paint.strokeStyle = 'rgba(126,231,255,.9)';
+      paint.lineWidth = Math.max(1, window.devicePixelRatio || 1);
+      paint.beginPath();
+      let pen = false;
+      for (let i = 0; i < count; i += 1) {
+        if (!(f0[i] > 0)) {
+          pen = false;
+          continue;
+        }
+        const x = times[i] / duration * width;
+        const y = yOf(f0[i]);
+        if (pen) paint.lineTo(x, y);
+        else paint.moveTo(x, y);
+        pen = true;
+      }
+      paint.stroke();
+
+      for (const region of pitchData.regions) {
+        const x1 = Math.max(0, Math.min(width, region.start / duration * width));
+        const x2 = Math.max(0, Math.min(width, region.end / duration * width));
+        if (x2 - x1 < 0.5) continue;
+        paint.fillStyle = 'rgba(255,96,96,.13)';
+        paint.fillRect(x1, 0, x2 - x1, height);
+        paint.fillStyle = 'rgba(255,96,96,.95)';
+        paint.fillRect(x1, 0, Math.max(1, x2 - x1), Math.max(2, height * 0.03));
+      }
+      paint.lineWidth = 1;
     }
 
     function updateRangeLine(): void {
@@ -1295,11 +1672,34 @@ const coverPanel: WebUiPanel = {
       }
     }
 
+    /** 一键母带：源永远是最新成品，结果另存；处理完由 settle 接音频。 */
+    async function runMaster(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      settledKey = '';
+      masterLine.textContent = '';
+      msg.textContent = t.mastering;
+      masterBtn.disabled = true;
+      try {
+        await ctx.invoke('master', [selectedId, {
+          targetLufs: Number(masterPreset.value),
+          format: masterFormat.value,
+        }]);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      } finally {
+        masterBtn.disabled = !(state?.ready && selectedId);
+      }
+    }
+
     async function settle(s: PanelState): Promise<void> {
       const job = s.job;
-      if (!job || (job.kind !== 'cover' && job.kind !== 'remix' && job.kind !== 'range')) return;
+      if (!job || (job.kind !== 'cover' && job.kind !== 'remix' && job.kind !== 'range' && job.kind !== 'master')) return;
       if (job.phase === 'working') {
-        msg.textContent = job.detail || (job.kind === 'range' ? t.rangeRunning : job.kind === 'remix' ? t.remixing : t.covering);
+        msg.textContent = job.detail || (job.kind === 'range' ? t.rangeRunning : job.kind === 'remix' ? t.remixing : job.kind === 'master' ? t.mastering : t.covering);
         msg.classList.remove('bad');
         return;
       }
@@ -1307,7 +1707,7 @@ const coverPanel: WebUiPanel = {
       if (job.phase === 'error') {
         if (settledKey !== key) {
           settledKey = key;
-          msg.textContent = job.error || (job.kind === 'range' ? '选段重跑失败' : job.kind === 'remix' ? '重新混音失败' : '翻唱失败');
+          msg.textContent = job.error || (job.kind === 'range' ? '选段重跑失败' : job.kind === 'remix' ? '重新混音失败' : job.kind === 'master' ? t.masterFailed : '翻唱失败');
           msg.classList.add('bad');
         }
         return;
@@ -1357,6 +1757,23 @@ const coverPanel: WebUiPanel = {
         mixLine.textContent = done
           ? t.remixDone(ui.fmt.duration(done.ms), ui.fmt.bytes(done.bytes), done.savedPath ?? r.savedPath ?? '')
           : '';
+        return;
+      }
+      if (job.kind === 'master') {
+        const done = s.lastMaster;
+        dl.href = url;
+        dl.download = `master-${done?.targetLufs ?? masterPreset.value}.${done?.format ?? masterFormat.value}`;
+        dl.hidden = false;
+        masterLine.textContent = done
+          ? `${t.masterDone(
+              done.inputLufs.toFixed(1),
+              done.outputLufs.toFixed(1),
+              done.outputTruePeakDb.toFixed(2),
+              done.savedPath ?? '',
+            )} · ${t.masterLimit(done.gainDb.toFixed(1), done.limitedDb.toFixed(1))}`
+          : '';
+        // 母带记到 session.masters，重读一次把历史补齐。
+        void loadRefine(selectedId);
         return;
       }
       dl.href = url;

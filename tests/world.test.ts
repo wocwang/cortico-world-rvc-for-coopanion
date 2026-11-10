@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Logger, WorldHost } from 'cortico/core/types.ts';
 import { RVC_DEFAULTS, configGroups } from '../src/config.ts';
+import { createSession, readSession, writeSession, type RefineSession } from '../src/session.ts';
 import { RvcWorld } from '../src/world.ts';
 
 const roots: string[] = [];
@@ -205,6 +206,85 @@ describe('World 面板数据面', () => {
     // 再点停止：回到 stopped，且之后自动重拉不会把它顶回去（这里只看状态回落）。
     const again = (await invoke('stop')) as State;
     expect(again.phase).toBe('stopped');
+  });
+});
+
+/** 造一个会话：默认是 P1 时代的老清单（没有 masters 字段），可按需登记成品与分轨。 */
+function seedSession(
+  dataDir: string,
+  opts: { outputs?: string[]; stems?: boolean } = {},
+): { id: string; dir: string } {
+  const { id, dir } = createSession(dataDir);
+  const at = new Date().toISOString();
+  const rec: RefineSession = {
+    version: 1,
+    id,
+    createdAt: at,
+    updatedAt: at,
+    engine: { kind: 'rvc', voice: 'daifeiyu', modelSampleRate: 40000 },
+    source: { durationSec: 12.5, inputPeak: 0.8, format: 'wav' },
+    stems: { vocals: 'stems/vocals.wav', inst: 'stems/inst.wav' },
+    converted: {
+      path: 'vocals/conv.wav',
+      sampleRate: 44100,
+      channels: 1,
+      defaults: { pitch: 0, indexRate: 0.3, protect: 0.33, chunk: true },
+    },
+    segments: [],
+    mix: { vocalGainDb: 0, instGainDb: 0, rmsRatio: 1, rmsFrozen: true, fadeInSec: 0, fadeOutSec: 0, peakScale: 1 },
+    outputs: (opts.outputs ?? []).map((path) => ({
+      format: path.endsWith('.mp3') ? 'mp3' as const : 'wav' as const,
+      path,
+      at,
+    })),
+  };
+  writeSession(dataDir, id, rec);
+  if (opts.stems) writeFileSync(join(dir, 'stems', 'vocals.wav'), Buffer.alloc(1024));
+  for (const path of opts.outputs ?? []) writeFileSync(join(dir, path), Buffer.alloc(2048, 0x33));
+  return { id, dir };
+}
+
+describe('母带 / 音高 / A/B 的数据面', () => {
+  it('母带只认三档预设，必须有已登记且还在的成品', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const empty = seedSession(dataDir);
+    expect(await jobError(invoke, 'master', [empty.id, { targetLufs: -12 }])).toContain('母带只支持 -14 / -16 / -23 LUFS 三档');
+    expect(await jobError(invoke, 'master', [empty.id, { targetLufs: -14 }])).toContain('这个会话还没有成品');
+
+    const missing = seedSession(dataDir, { outputs: ['out/mix-1.wav'] });
+    const rec = readSession(dataDir, missing.id)!;
+    rec.outputs[0]!.path = 'out/gone.wav';
+    writeSession(dataDir, missing.id, rec);
+    expect(await jobError(invoke, 'master', [missing.id, { targetLufs: -16 }])).toContain('最近一次成品文件不在了');
+    expect(await jobError(invoke, 'master', ['', { targetLufs: -14 }])).toContain('找不到会话');
+  });
+
+  it('A/B 只取会话里登记的成品，返回 $file 而不是塞 base64', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const { id } = seedSession(dataDir, { outputs: ['out/mix-1.wav', 'out/mix-2.mp3'] });
+    const first = (await invoke('refineAudio', [id, 0])) as { $file?: { mime: string; bytes: number; sha256: string } };
+    expect(first.$file?.mime).toBe('audio/wav');
+    expect(first.$file?.bytes).toBe(2048);
+    expect(first.$file?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    const second = (await invoke('refineAudio', [id, 1])) as { $file?: { mime: string } };
+    expect(second.$file?.mime).toBe('audio/mpeg');
+    await expect(invoke('refineAudio', [id, 2])).rejects.toThrow('成品序号无效');
+    await expect(invoke('refineAudio', [id, -1])).rejects.toThrow('成品序号无效');
+    await expect(invoke('refineAudio', ['nope', 0])).rejects.toThrow('找不到会话');
+  });
+
+  it('音高体检缺人声分轨时报错；没有 masters 的老会话照常打开', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const old = seedSession(dataDir);
+    await expect(invoke('refinePitch', [old.id])).rejects.toThrow('缺少人声分轨');
+    await expect(invoke('refinePitch', [''])).rejects.toThrow('找不到会话');
+
+    const state = (await invoke('refineState', [old.id])) as { session: RefineSession | null };
+    expect(state.session?.id).toBe(old.id);
+    expect(state.session?.masters).toBeUndefined();
+    // 打开时补出 20 秒段落网格，但不会凭空写 masters。
+    expect(state.session?.segments.length).toBe(1);
+    expect(readSession(dataDir, old.id)?.masters).toBeUndefined();
   });
 });
 

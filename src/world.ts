@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wri
 import { execFileSync } from 'node:child_process';
 import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
 import type { Logger, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { configGroups, DEFAULT_PORT, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
@@ -23,6 +23,7 @@ import { RvcVenv } from './venv.ts';
 import { RuntimeInstall, installedTiers } from './runtime.ts';
 import { importVoiceFile, listVoices } from './voices.ts';
 import { createSession, defaultSegments, dirBytes, gcSessions, listSessions, readSession, removeSession, sessionDir, sessionsRoot, writeSession, type RefineSession } from './session.ts';
+import { analyzePitch, parseF0Csv } from './pitch.ts';
 import {
   cutSegment, ensureSegments, mergeSegments, muteSegment, mutedRanges, readPeaks, redoSegment,
   rerunRange, revertSegment, type RangeOptions,
@@ -147,6 +148,13 @@ export class RvcWorld implements World {
   private lastMix: { at: number; ms: number; bytes: number; savedPath: string | null; format: string; peakScale?: number } | null = null;
   /** 最近一次「重跑选段」的结果，面板渲染用。 */
   private lastRange: { at: number; ms: number; bytes: number; savedPath: string | null; format: string; start: number; end: number; pitch: number } | null = null;
+  /** 最近一次「母带」的结果，面板渲染用。 */
+  private lastMaster: {
+    at: number; ms: number; bytes: number; savedPath: string | null; format: string;
+    targetLufs: number; ceilingDb: number;
+    inputLufs: number; inputTruePeakDb: number; outputLufs: number; outputTruePeakDb: number;
+    gainDb: number; limitedDb: number;
+  } | null = null;
   /** 当前打开/最近创建的分轨会话；清理与删除时据此保护。 */
   private activeSession: string | null = null;
 
@@ -753,6 +761,129 @@ export class RvcWorld implements World {
     };
   }
 
+  /**
+   * 面板「一键母带」：以最近一条成品为源，按 -14 / -16 / -23 LUFS 另存一条。
+   * 不覆盖任何已有文件；`session.masters` 只追加，最多留 3 条。
+   */
+  private async masterFromPanel(args: unknown[]): Promise<unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    const engine = this.engine;
+    if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+    const targetLufs = Number(raw.targetLufs);
+    if (![-14, -16, -23].includes(targetLufs)) {
+      throw new RvcError('param', '母带只支持 -14 / -16 / -23 LUFS 三档');
+    }
+    const format = raw.format === 'mp3' ? 'mp3' : 'wav';
+    const source = session.outputs[session.outputs.length - 1];
+    if (!source) throw new RvcError('param', '这个会话还没有成品，先混一次再母带');
+    const input = join(dir, source.path);
+    if (!existsSync(input)) throw new RvcError('param', '最近一次成品文件不在了，请重新混音');
+
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
+
+    // 编号取已有最大值 +1：母带记录裁到 3 条后，也不会覆盖同名文件。
+    const next = (session.masters ?? []).reduce((max, item) => {
+      const match = /^out\/master-(\d+)\./.exec(item.path);
+      return match ? Math.max(max, Number(match[1])) : max;
+    }, 0) + 1;
+    const rel = `out/master-${next}.${format}`;
+    const output = join(dir, rel);
+    this.cancelIdle();
+    let done;
+    try {
+      done = await engine.master({ input, output, format, targetLufs, ceilingDb: -1 });
+    } catch (err) {
+      if (err instanceof RvcError) throw err;
+      throw new RvcError('infer', err instanceof Error ? err.message : String(err));
+    }
+    const audio = readFileSync(output);
+    const now = new Date().toISOString();
+    session.masters = [...(session.masters ?? []), { format, path: rel, at: now, ...done.loudness }];
+    while (session.masters.length > 3) {
+      const old = session.masters.shift();
+      if (old) rmSync(join(dir, old.path), { force: true });
+    }
+    session.updatedAt = now;
+    writeSession(this.opts.dataDir, id, session);
+    this.activeSession = id;
+    this.lastMaster = {
+      at: Date.now(), ms: done.ms, bytes: audio.length, savedPath: output, format,
+      ...done.loudness,
+    };
+    this.log?.info('RVC 母带完成', { id, targetLufs, outputLufs: done.loudness.outputLufs, ms: done.ms });
+    return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+  }
+
+  /**
+   * 面板「音高体检」：复用 `out/f0.csv`（没有或比分轨旧才重跑 RMVPE），
+   * 返回叠加曲线与跑调区间。只读，不改 conv、不改 f0。
+   */
+  private async pitchFromPanel(id: string): Promise<Record<string, unknown>> {
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    const stem = join(dir, session.stems.vocals);
+    if (!existsSync(stem)) throw new RvcError('param', '会话缺少人声分轨，请重新翻唱一次');
+    const csv = join(dir, 'out', 'f0.csv');
+    let cached = false;
+    try {
+      cached = existsSync(csv) && statSync(csv).mtimeMs >= statSync(stem).mtimeMs;
+    } catch {
+      cached = false;
+    }
+    if (!cached) {
+      const engine = this.engine;
+      if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+      if (!engine.ready()) {
+        await this.ensureReady();
+        if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+      }
+      try {
+        await engine.f0({ input: stem, output: csv });
+      } catch (err) {
+        if (err instanceof RvcError) throw err;
+        throw new RvcError('infer', err instanceof Error ? err.message : String(err));
+      }
+    }
+    const analysis = analyzePitch(parseF0Csv(readFileSync(csv, 'utf8')), 100);
+    this.log?.info('RVC 音高体检完成', {
+      id, frames: analysis.frames, cached, regions: analysis.regionCount, inTune: analysis.inTuneRatio,
+    });
+    return { ...analysis, cached, savedPath: csv };
+  }
+
+  /**
+   * 面板 A/B：按 `session.outputs` 下标把成品文件交给浏览器（`$file` 由宿主校验并流式返回，
+   * 不在 JSON 里塞 base64）。只允许读本会话已登记的成品。
+   */
+  private audioFromPanel(args: unknown[]): Record<string, unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const index = Number(args[1]);
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    const output = Number.isInteger(index) ? session.outputs[index] : undefined;
+    if (!output) throw new RvcError('param', `成品序号无效：${String(args[1] ?? '')}`);
+    const full = join(dir, output.path);
+    if (!existsSync(full)) throw new RvcError('param', '成品文件不存在，可能已被清理');
+    const data = readFileSync(full);
+    return {
+      $file: {
+        mime: output.format === 'mp3' ? 'audio/mpeg' : 'audio/wav',
+        path: full,
+        bytes: data.length,
+        sha256: createHash('sha256').update(data).digest('hex'),
+      },
+    };
+  }
+
   private async peaksFromPanel(id: string): Promise<unknown> {
     const engine = this.engine;
     if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
@@ -886,7 +1017,7 @@ export class RvcWorld implements World {
   }
 
   /** 面板发起的变声/翻唱：后台跑，面板立刻返回，用户可以切到别的页；结果用 `takeResult` 取。 */
-  private job: { kind: 'convert' | 'cover' | 'remix' | 'range'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null = null;
+  private job: { kind: 'convert' | 'cover' | 'remix' | 'range' | 'master'; at: number; phase: 'working' | 'done' | 'error'; detail: string; error?: string; ms?: number } | null = null;
   private jobResult: { mime: string; base64: string; savedPath: string | null; ms: number } | null = null;
 
   private async invoke(panel: string, method: string, args: unknown[] = []): Promise<unknown> {
@@ -903,7 +1034,7 @@ export class RvcWorld implements World {
       }
       return this.status();
     }
-    if (method === 'convert' || method === 'cover' || method === 'remix') {
+    if (method === 'convert' || method === 'cover' || method === 'remix' || method === 'master') {
       this.beginJob(method, args);
       return this.status();
     }
@@ -921,6 +1052,8 @@ export class RvcWorld implements World {
     if (method === 'refineState') return this.refineState(String(args[0] ?? ''));
     if (method === 'refinePeaks') return this.peaksFromPanel(String(args[0] ?? ''));
     if (method === 'exportF0') return this.f0FromPanel(String(args[0] ?? ''));
+    if (method === 'refinePitch') return this.pitchFromPanel(String(args[0] ?? ''));
+    if (method === 'refineAudio') return this.audioFromPanel(args);
     if (method === 'refinePreview') {
       const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
       return this.previewSession(String(args[0] ?? ''), raw);
@@ -981,9 +1114,9 @@ export class RvcWorld implements World {
 
   /** 把变声/翻唱/选段重跑/段落重做放到后台跑：面板拿到的是即时状态，不用在页面上等。 */
   private beginJob(
-    kind: 'convert' | 'cover' | 'remix' | 'range',
+    kind: 'convert' | 'cover' | 'remix' | 'range' | 'master',
     args: unknown[],
-    action: 'convert' | 'cover' | 'remix' | 'range' | 'segmentRedo' | 'segmentRevert' = kind,
+    action: 'convert' | 'cover' | 'remix' | 'range' | 'master' | 'segmentRedo' | 'segmentRevert' = kind,
   ): void {
     if (this.job?.phase === 'working') throw new RvcError('param', '已有任务在跑，等它结束再试');
     const at = Date.now();
@@ -991,7 +1124,8 @@ export class RvcWorld implements World {
       : action === 'range' ? '重跑选段'
         : action === 'segmentRedo' ? '重做段落'
           : action === 'segmentRevert' ? '还原段落'
-            : action === 'remix' ? '重新混音' : '变声';
+            : action === 'remix' ? '重新混音'
+              : action === 'master' ? '母带处理' : '变声';
     this.job = { kind, at, phase: 'working', detail };
     this.jobResult = null;
     const task = action === 'cover'
@@ -1004,13 +1138,16 @@ export class RvcWorld implements World {
             ? this.segmentFromPanel(args, 'revert')
             : action === 'remix'
               ? this.remixFromPanel(args)
-              : this.convertFromPanel(args);
+              : action === 'master'
+                ? this.masterFromPanel(args)
+                : this.convertFromPanel(args);
     task.then((res) => {
       const bin = (res as { $binary?: { mime: string; base64: string } }).$binary;
       const last = kind === 'cover' ? this.lastCover
         : kind === 'range' ? this.lastRange
           : kind === 'remix' ? this.lastMix
-            : this.lastConvert;
+            : kind === 'master' ? this.lastMaster
+              : this.lastConvert;
       if (bin) {
         this.jobResult = { mime: bin.mime, base64: bin.base64, savedPath: last?.savedPath ?? null, ms: last?.ms ?? 0 };
         this.job = { kind, at, phase: 'done', detail: '完成', ms: last?.ms ?? 0 };
@@ -1059,6 +1196,7 @@ export class RvcWorld implements World {
       lastCover: this.lastCover,
       lastMix: this.lastMix,
       lastRange: this.lastRange,
+      lastMaster: this.lastMaster,
       job: this.job,
       resultReady: this.jobResult !== null,
     };
