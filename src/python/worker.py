@@ -24,6 +24,8 @@ stdout 只放协议行（原 fd 被 dup 出来单独写，其余输出统统改�
   {"op":"restoreRange","id":7,"conv":"vocals/conv.wav","backup":"segments/s2.bak.wav",
    "start":1764000,"end":2205000}  # start/end 是整数样本
   {"op":"peaks","id":6,"path":"vocals/conv.wav","buckets":1200}
+  {"op":"master","id":8,"input":"out/mix-1.wav","output":"out/master-1.wav",
+   "format":"wav","targetLufs":-14,"ceilingDb":-1}
   {"op":"shutdown"}
 
 回复：
@@ -52,6 +54,192 @@ def _is_foreign_tools(path: str, root: str) -> bool:
         return os.path.isdir(os.path.join(path, "tools")) and os.path.abspath(path) != root
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# 母带：ITU-R BS.1770-4 / EBU R128 响度 + 4 倍过采样真峰值 + 只削峰限幅
+#
+# 全部用运行时已有的 numpy / scipy，不引入新依赖。K 加权系数按 libebur128 的
+# 公式从采样率推导（不写死 48 kHz 的那组），44.1 / 48 kHz 都适用。
+# ---------------------------------------------------------------------------
+
+LOUDNESS_PRESETS = (-14.0, -16.0, -23.0)
+
+
+def _k_weighting(audio, sample_rate):
+    """两级 K 加权（高架 + 38 Hz 高通），返回同形状 float64。"""
+    import math
+
+    import numpy as np
+    from scipy.signal import lfilter
+
+    # 第一级：高架（BS.1770 表格参数，按采样率重算双线性变换系数）
+    f0 = 1681.974450955533
+    gain_db = 3.999843853973347
+    q = 0.7071752369554196
+    k = math.tan(math.pi * f0 / sample_rate)
+    vh = 10.0 ** (gain_db / 20.0)
+    vb = vh ** 0.4996667741545416
+    a0 = 1.0 + k / q + k * k
+    b1 = np.array([(vh + vb * k / q + k * k) / a0, 2.0 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0])
+    a1 = np.array([1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0])
+
+    # 第二级：高通
+    f0 = 38.13547087602444
+    q = 0.5003270373238773
+    k = math.tan(math.pi * f0 / sample_rate)
+    a0 = 1.0 + k / q + k * k
+    b2 = np.array([1.0, -2.0, 1.0])
+    a2 = np.array([1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0])
+
+    data = np.asarray(audio, dtype=np.float64)
+    return lfilter(b2, a2, lfilter(b1, a1, data, axis=-1), axis=-1)
+
+
+def _integrated_lufs(audio, sample_rate):
+    """门限积分响度（LUFS）：400 ms 块、100 ms 步进、-70 LUFS 绝对门 + 相对 -10 LU 门。"""
+    import numpy as np
+
+    y = _k_weighting(audio, sample_rate)
+    if y.ndim == 1:
+        y = y.reshape(1, -1)
+    blocks = max(1, int(round(0.4 * sample_rate)))
+    hop = max(1, int(round(0.1 * sample_rate)))
+    frames = int(y.shape[1])
+    if frames <= 0:
+        return float("-inf")
+    if frames < blocks:
+        power = np.mean(y * y, axis=1)
+        total = float(power.sum())
+        return -0.691 + 10.0 * np.log10(max(total, 1e-20))
+
+    # 累加平方和，一次算出所有块，避免逐块切片。
+    squares = np.cumsum(y * y, axis=1)
+    squares = np.concatenate([np.zeros((y.shape[0], 1)), squares], axis=1)
+    starts = np.arange(0, frames - blocks + 1, hop)
+    means = (squares[:, starts + blocks] - squares[:, starts]) / blocks
+    power = means.sum(axis=0)
+    loudness = -0.691 + 10.0 * np.log10(np.maximum(power, 1e-20))
+
+    absolute = loudness > -70.0
+    if not absolute.any():
+        return float("-inf")
+    ungated = -0.691 + 10.0 * np.log10(max(float(power[absolute].mean()), 1e-20))
+    relative = absolute & (loudness > ungated - 10.0)
+    if not relative.any():
+        relative = absolute
+    return -0.691 + 10.0 * np.log10(max(float(power[relative].mean()), 1e-20))
+
+
+def _true_peak_db(audio, sample_rate):
+    """真峰值：每声道 4 倍过采样后再取绝对值峰值（dBTP）。
+
+    直接拿原始采样点峰值当 true peak 会低估 0.3–1 dB，这里按 BS.1770 的建议
+    先做 4 倍多相重采样，再取峰值。
+    """
+    import numpy as np
+    from scipy.signal import resample_poly
+
+    data = np.asarray(audio, dtype=np.float32)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    peak = 0.0
+    for channel in data:
+        upsampled = resample_poly(channel, 4, 1)
+        peak = max(peak, float(np.max(np.abs(upsampled))))
+    return 20.0 * np.log10(max(peak, 1e-12))
+
+
+def _peak_envelope(audio, sample_rate):
+    """把 4 倍过采样峰值折回每个基础采样点，供限幅器使用。"""
+    import numpy as np
+    from scipy.signal import resample_poly
+
+    data = np.asarray(audio, dtype=np.float32)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    frames = int(data.shape[1])
+    envelope = np.zeros(frames, dtype=np.float32)
+    for channel in data:
+        upsampled = np.abs(resample_poly(channel, 4, 1)).astype(np.float32)
+        usable = (upsampled.size // 4) * 4
+        folded = upsampled[:usable].reshape(-1, 4).max(axis=1)
+        if folded.size < frames:
+            folded = np.pad(folded, (0, frames - folded.size), mode="edge")
+        envelope = np.maximum(envelope, folded[:frames])
+    return envelope
+
+
+def _limit_true_peak(audio, sample_rate, ceiling_db):
+    """只压超过 ceiling 的峰：前视 3 ms + 汉宁平滑，返回 (处理后的音频, 最大衰减 dB)。"""
+    import numpy as np
+    from scipy.ndimage import minimum_filter1d
+
+    data = np.asarray(audio, dtype=np.float32)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    ceiling = 10.0 ** (ceiling_db / 20.0)
+    envelope = _peak_envelope(data, sample_rate)
+    gain = np.minimum(1.0, ceiling / np.maximum(envelope, 1e-9)).astype(np.float32)
+    if float(gain.min()) >= 0.999999:
+        return data, 0.0
+
+    # 前视：让增益在峰值到达之前就降下来，避免削掉波头。
+    lookahead = max(1, int(round(0.003 * sample_rate)))
+    window = 2 * lookahead + 1
+    # 对称滑窗最小值：提前与拖后各 3 ms，听感上比瞬时限幅干净。
+    ahead = minimum_filter1d(gain, size=window, mode="nearest")
+    smooth = np.hanning(window + 2)[1:-1].astype(np.float32)
+    smooth /= smooth.sum()
+    smooth_gain = np.convolve(ahead, smooth, mode="same").astype(np.float32)
+    gain = np.minimum(np.clip(smooth_gain, 0.0, 1.0), 1.0)
+
+    out = (data * gain[None, :]).astype(np.float32)
+    # 平滑后再测一次；仍有残余过峰就整体收一点点（通常 < 0.1 dB）。
+    peak = _true_peak_db(out, sample_rate)
+    if peak > ceiling_db:
+        out *= 10.0 ** ((ceiling_db - peak) / 20.0)
+    return out, float(-20.0 * np.log10(max(float(gain.min()), 1e-9)))
+
+
+def master_audio(audio, sample_rate, target_lufs, ceiling_db=-1.0):
+    """把音频做响度归一化并限幅；返回 (处理后音频, 各项实测值)。"""
+    import numpy as np
+
+    data = np.asarray(audio, dtype=np.float32)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    input_lufs = _integrated_lufs(data, sample_rate)
+    input_peak = _true_peak_db(data, sample_rate)
+    if not np.isfinite(input_lufs):
+        raise ValueError("音频是静音或太轻，量不到响度")
+
+    gain_db = float(target_lufs) - input_lufs
+    out = (data * (10.0 ** (gain_db / 20.0))).astype(np.float32)
+    limited_db = 0.0
+    # 限幅会把响度拉下来一点；最多回头补 3 次增益，再补就只是在压峰。
+    for _ in range(4):
+        out, current = _limit_true_peak(out, sample_rate, ceiling_db)
+        limited_db = max(limited_db, current)
+        measured = _integrated_lufs(out, sample_rate)
+        delta = float(target_lufs) - measured
+        if abs(delta) <= 0.1:
+            break
+        out = (out * (10.0 ** (delta / 20.0))).astype(np.float32)
+    out, current = _limit_true_peak(out, sample_rate, ceiling_db)
+    limited_db = max(limited_db, current)
+    output_lufs = _integrated_lufs(out, sample_rate)
+    output_peak = _true_peak_db(out, sample_rate)
+    return out, {
+        "targetLufs": round(float(target_lufs), 2),
+        "ceilingDb": round(float(ceiling_db), 2),
+        "inputLufs": round(float(input_lufs), 2),
+        "inputTruePeakDb": round(float(input_peak), 2),
+        "outputLufs": round(float(output_lufs), 2),
+        "outputTruePeakDb": round(float(output_peak), 2),
+        "gainDb": round(float(gain_db), 2),
+        "limitedDb": round(float(limited_db), 2),
+    }
 
 
 def main() -> int:
@@ -1040,6 +1228,59 @@ def main() -> int:
             "durationSec": round(frames / 100.0, 3),
         })
 
+    def master(req: dict) -> None:
+        """母带：按 EBU R128 目标响度整体增益，再只对超过真峰值上限的峰做限幅。
+
+        输出另存，不碰原混音。响度与真峰值都在处理前后实测并回报。
+        """
+        req_id = req.get("id")
+        source = req.get("input") or ""
+        output = req.get("output") or ""
+        fmt = (req.get("format") or "wav").lower()
+        if fmt not in ("wav", "mp3"):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "未知的输出格式：%s" % fmt})
+            return
+        if not source or not os.path.isfile(source):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到混音：%s" % source})
+            return
+        if not output:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "缺少输出路径"})
+            return
+        try:
+            target = float(req.get("targetLufs", -14.0))
+            ceiling = float(req.get("ceilingDb", -1.0))
+        except (TypeError, ValueError):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "响度参数不是数字"})
+            return
+        if target not in LOUDNESS_PRESETS:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param",
+                  "error": "只支持 -14 / -16 / -23 LUFS 三档"})
+            return
+        if not -6.0 <= ceiling <= 0.0:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "真峰值上限应在 -6 到 0 dB 之间"})
+            return
+
+        began = time.time()
+        try:
+            audio = load_song(source)
+            processed, stats = master_audio(audio, 44100, target, ceiling)
+            os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+            tmp = output + ".tmp.wav"
+            write_audio(tmp, processed.T, 44100, fmt)
+            os.replace(tmp, output)
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "母带处理失败：%s" % traceback.format_exc()[-1200:]})
+            return
+        emit({
+            "type": "result",
+            "id": req_id,
+            "ok": True,
+            "ms": int((time.time() - began) * 1000),
+            "sampleRate": 44100,
+            "durationSec": round(audio.shape[1] / 44100.0, 3),
+            "loudness": stats,
+        })
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1075,6 +1316,9 @@ def main() -> int:
             continue
         if op == "f0":
             export_f0(req)
+            continue
+        if op == "master":
+            master(req)
             continue
         print("[rvc] 未知指令：%s" % op, file=sys.stderr)
     return 0

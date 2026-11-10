@@ -30,6 +30,21 @@ export interface SessionOutput {
   at: string;
 }
 
+/** 一次母带导出：只追加，绝不覆盖上一版混音。 */
+export interface SessionMaster {
+  format: 'wav' | 'mp3';
+  path: string;
+  at: string;
+  targetLufs: number;
+  ceilingDb: number;
+  inputLufs: number;
+  inputTruePeakDb: number;
+  outputLufs: number;
+  outputTruePeakDb: number;
+  gainDb: number;
+  limitedDb: number;
+}
+
 export interface SegmentParams {
   pitch: number;
   indexRate: number;
@@ -98,6 +113,8 @@ export interface RefineSession {
   segments: RefineSegment[];
   mix: SessionMix;
   outputs: SessionOutput[];
+  /** 母带导出历史；旧会话没有这个字段，读取时按空数组处理。 */
+  masters?: SessionMaster[];
 }
 
 export interface SessionSummary {
