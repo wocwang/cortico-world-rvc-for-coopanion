@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -301,43 +301,38 @@ describe('母带 / 音高 / A/B 的数据面', () => {
 });
 
 describe('另存会话文件', () => {
-  it('把成品或原声复制到用户选的目录，文件名会清掉非法字符', async () => {
+  it('把成品或原声读成 base64 交给浏览器保存', async () => {
     const { invoke, dataDir } = await makeWorld();
     const { id, dir } = seedSession(dataDir, { outputs: ['out/mix-1.wav'] });
     const rec = readSession(dataDir, id)!;
     rec.source = { ...rec.source, file: 'source.mp3', bytes: 4096 };
     writeSession(dataDir, id, rec);
     writeFileSync(join(dir, 'source.mp3'), Buffer.alloc(4096, 0x44));
-    const target = mkdtempSync(join(tmpdir(), 'rvc-export-'));
-    roots.push(target);
 
-    const out = (await invoke('sessionExport', [id, {
-      dir: target, name: 'cover/歌\\曲:*', which: 'output',
-    }])) as { path: string; name: string; bytes: number };
-    expect(out.name).toBe('cover 歌 曲.wav');
+    const out = (await invoke('sessionFile', [id, 'output'])) as {
+      name: string; ext: string; bytes: number; mime: string; base64: string;
+    };
+    expect(out.name).toBe(`cover-${id}.wav`);
+    expect(out.ext).toBe('.wav');
     expect(out.bytes).toBe(2048);
-    expect(readFileSync(out.path).length).toBe(2048);
+    expect(out.mime).toBe('audio/wav');
+    expect(Buffer.from(out.base64, 'base64').length).toBe(2048);
 
-    const src = (await invoke('sessionExport', [id, {
-      dir: target, name: 'cover-song.wav', which: 'source',
-    }])) as { name: string; bytes: number };
-    expect(src.name).toBe('cover-song.mp3');
+    const src = (await invoke('sessionFile', [id, 'source'])) as {
+      name: string; ext: string; bytes: number; mime: string;
+    };
+    expect(src.ext).toBe('.mp3');
+    expect(src.mime).toBe('audio/mpeg');
     expect(src.bytes).toBe(4096);
   });
 
-  it('目录不存在、没有原声、没有成品都明确报错', async () => {
+  it('没有原声、没有成品、会话不存在都明确报错', async () => {
     const { invoke, dataDir } = await makeWorld();
-    const target = mkdtempSync(join(tmpdir(), 'rvc-export-'));
-    roots.push(target);
     const full = seedSession(dataDir, { outputs: ['out/mix-1.wav'] });
-    await expect(invoke('sessionExport', [full.id, { dir: join(dataDir, 'nope') }]))
-      .rejects.toThrow('保存目录不存在');
-    await expect(invoke('sessionExport', [full.id, { dir: target, which: 'source' }]))
-      .rejects.toThrow('没有原声副本');
+    await expect(invoke('sessionFile', [full.id, 'source'])).rejects.toThrow('没有原声副本');
     const empty = seedSession(dataDir);
-    await expect(invoke('sessionExport', [empty.id, { dir: target }]))
-      .rejects.toThrow('还没有成品');
-    await expect(invoke('sessionExport', ['nope', { dir: target }])).rejects.toThrow('找不到会话');
+    await expect(invoke('sessionFile', [empty.id, 'output'])).rejects.toThrow('还没有成品');
+    await expect(invoke('sessionFile', ['nope', 'output'])).rejects.toThrow('找不到会话');
   });
 });
 

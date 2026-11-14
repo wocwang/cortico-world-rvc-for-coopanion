@@ -92,16 +92,14 @@ export function hasUvr5(uvrDir: string): boolean {
   }
 }
 
-/** 另存文件名：去掉路径分隔符、Windows 保留字符与控制符；空名字回退到 `fallback`。 */
-export function exportName(input: string, fallback: string): string {
-  const cleaned = input
-    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .replace(/^[.\s]+|[.\s]+$/g, '')
-    .slice(0, 80)
-    .trim();
-  return cleaned || fallback;
-}
+/** 另存时交给浏览器的 MIME：按扩展名映射，未知按二进制。 */
+const AUDIO_MIME: Record<string, string> = {
+  '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg',
+  '.flac': 'audio/flac',
+  '.ogg': 'audio/ogg',
+  '.m4a': 'audio/mp4',
+};
 
 /**
  * 有没有 NVIDIA 显卡：`auto` 档要先知道装哪一档共享运行时（显卡档 4 GB，CPU 档 1 GB）。
@@ -540,15 +538,17 @@ export class RvcWorld implements World {
         const now = new Date().toISOString();
         const rel = `out/mix-1.${job.format}`;
         writeFileSync(join(session.dir, rel), audio);
-        // 原声副本：之后「重新翻唱」直接用它，不必再让用户选文件；
+        // 原声副本：勾了「保存原声副本」才复制；之后「重新翻唱」直接用它，不必再让用户选文件。
         // 写不进去不影响这次翻唱，只是菜单里会显示「原声未保存」。
         let sourceFile = '';
-        try {
-          sourceFile = `source${/^\.[a-z0-9]{1,5}$/.test(ext) ? ext : '.bin'}`;
-          writeFileSync(join(session.dir, sourceFile), job.file);
-        } catch {
-          sourceFile = '';
-          this.log?.warn('写原声副本失败，本次会话不保存原声', { id: session.id });
+        if (raw.keepSource !== false) {
+          try {
+            sourceFile = `source${/^\.[a-z0-9]{1,5}$/.test(ext) ? ext : '.bin'}`;
+            writeFileSync(join(session.dir, sourceFile), job.file);
+          } catch {
+            sourceFile = '';
+            this.log?.warn('写原声副本失败，本次会话不保存原声', { id: session.id });
+          }
         }
         const record: RefineSession = {
           version: 1,
@@ -1088,35 +1088,27 @@ export class RvcWorld implements World {
     return { ...this.refineState(), cleaned: result.removed.length, freed: result.freed };
   }
 
-  /** 面板「另存」：宿主只有打开型选择器，所以按用户选的目录 + 名字复制一份，不动会话本身。 */
-  private exportSession(args: unknown[]): Record<string, unknown> {
+  /** 面板「另存」：把成品或原声读成 base64 交给浏览器保存（原生保存框或下载），不经过 PowerShell。 */
+  private sessionFile(args: unknown[]): Record<string, unknown> {
     const id = typeof args[0] === 'string' ? args[0] : '';
-    const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
+    const which = args[1] === 'source' ? 'source' : 'output';
     const dir = sessionDir(this.opts.dataDir, id);
     const session = dir ? readSession(this.opts.dataDir, id) : null;
     if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
-    const targetDir = typeof raw.dir === 'string' ? raw.dir.trim() : '';
-    if (!targetDir || !existsSync(targetDir) || !statSync(targetDir).isDirectory()) {
-      throw new RvcError('param', '保存目录不存在，重新选一个目录');
-    }
-    const which = raw.which === 'source' ? 'source' : 'output';
     const last = session.outputs[session.outputs.length - 1];
     const rel = which === 'source' ? session.source.file : last?.path;
     if (!rel) throw new RvcError('param', which === 'source' ? '这个会话没有原声副本' : '这个会话还没有成品');
     const source = join(dir, rel);
     if (!existsSync(source)) throw new RvcError('param', `文件不在了：${rel}`);
     const ext = extname(rel).toLowerCase() || '.wav';
-    const name = exportName(typeof raw.name === 'string' ? raw.name : '', `cover-${id}`)
-      .replace(/\.(wav|mp3|flac|ogg|m4a)$/i, '');
-    const target = join(targetDir, `${name}${ext}`);
-    try {
-      writeFileSync(target, readFileSync(source));
-    } catch (err) {
-      throw new RvcError('param', `写不进去：${err instanceof Error ? err.message : String(err)}`);
-    }
-    const bytes = statSync(target).size;
-    this.log?.info('另存 RVC 翻唱文件', { id, which, target });
-    return { path: target, name: `${name}${ext}`, bytes };
+    const bytes = readFileSync(source);
+    return {
+      name: `cover-${id}${ext}`,
+      ext,
+      bytes: bytes.length,
+      mime: AUDIO_MIME[ext] ?? 'application/octet-stream',
+      base64: bytes.toString('base64'),
+    };
   }
 
   /** 双阈值清理：只动 `sessions/`，正在用的会话永远跳过。 */
@@ -1177,7 +1169,7 @@ export class RvcWorld implements World {
       return this.previewSession(String(args[0] ?? ''), raw);
     }
     if (method === 'sessionDelete') return this.deleteSession(String(args[0] ?? ''));
-    if (method === 'sessionExport') return this.exportSession(args);
+    if (method === 'sessionFile') return this.sessionFile(args);
     if (method === 'cleanupSessions') return this.cleanupSessions();
     if (method === 'storage') return { items: this.storage() };
     if (method === 'uninstall') return this.uninstall(String(args[0] ?? ''));

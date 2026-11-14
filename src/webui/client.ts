@@ -602,6 +602,10 @@ const coverPanel: WebUiPanel = {
     const fileInput = ui.input({});
     fileInput.type = 'file';
     fileInput.accept = 'audio/*,.wav,.flac,.mp3,.ogg,.m4a';
+    const keepSource = ui.h('input') as HTMLInputElement;
+    keepSource.type = 'checkbox';
+    keepSource.checked = true;
+    const sourceLine = ui.h('div', 'rvc-detail');
     const voiceSelect = ui.select({ options: [] });
 
     // 第一组：会重跑变声的参数。
@@ -650,6 +654,9 @@ const coverPanel: WebUiPanel = {
       ui.h('div', 'rvc-detail', t.coverStagesHint),
       ui.field(t.file, fileInput),
       ui.h('div', 'rvc-detail', t.fileHint),
+      sourceLine,
+      ui.field(t.keepSource, keepSource),
+      ui.h('div', 'rvc-detail', t.keepSourceHint),
       ui.field(t.voice, voiceSelect),
       ui.h('div', 'rvc-detail', t.coverInferHint),
       inferKnobs,
@@ -830,6 +837,8 @@ const coverPanel: WebUiPanel = {
       msg.textContent = '';
       msg.classList.remove('bad');
       if (file) resultLine.textContent = `${file.name} · ${ui.fmt.bytes(file.size)}`;
+      bindSource();
+      updateCoverButton();
     });
 
     // 任一参数变动都重算「本次会做什么」；改回去就恢复原样，不靠手点。
@@ -903,8 +912,22 @@ const coverPanel: WebUiPanel = {
     }
 
     function actionOf(): CoverAction {
+      // 新选的文件优先：那是另一首歌，点按钮会新建一次翻唱，不走原地重跑。
+      if (file) return 'cover';
       if (!selectedId || !applied) return 'cover';
       return coverAction(coverDirty(currentParams(), applied), true);
+    }
+
+    /** 音频输入下方的「当前音源」：新选的文件优先，其次会话原声，最后提示未选。 */
+    function bindSource(): void {
+      if (file) {
+        sourceLine.textContent = t.sourcePicked(file.name, ui.fmt.bytes(file.size));
+        return;
+      }
+      const summary = selectedId ? summaries.find((s) => s.id === selectedId) : undefined;
+      sourceLine.textContent = summary?.source
+        ? t.sourceFromSession(summary.source.file, ui.fmt.bytes(summary.source.bytes))
+        : selectedId ? t.sourceMissing : '';
     }
 
     /** 主按钮在「开始翻唱 / 重新翻唱 / 重新混音 / 重新翻唱混音」之间切换，并说明本次会做什么。 */
@@ -919,13 +942,17 @@ const coverPanel: WebUiPanel = {
       const dirty = selectedId && applied
         ? coverDirty(currentParams(), applied)
         : { inference: false, mix: false };
-      dirtyLine.textContent = !selectedId ? ''
-        : dirty.inference && dirty.mix ? t.coverDirtyBoth
-          : dirty.inference ? t.coverDirtyInfer
-            : dirty.mix ? t.coverDirtyMix
-              : '';
+      const summary = selectedId ? summaries.find((s) => s.id === selectedId) : undefined;
+      // 原地重跑必须有可用源：会话里有原声副本，或用户刚选了一个新文件；重混不需要。
+      const needSource = (action === 'rerun' || action === 'rerunMix') && !summary?.source;
+      dirtyLine.textContent = needSource ? t.needSource
+        : !selectedId ? ''
+          : dirty.inference && dirty.mix ? t.coverDirtyBoth
+            : dirty.inference ? t.coverDirtyInfer
+              : dirty.mix ? t.coverDirtyMix
+                : '';
       const busy = state?.job?.phase === 'working';
-      coverBtn.disabled = busy || !state?.ready || (action === 'cover' && !state?.uvr5);
+      coverBtn.disabled = busy || !state?.ready || (action === 'cover' && !state?.uvr5) || needSource;
     }
 
     async function onCoverClick(): Promise<void> {
@@ -938,6 +965,10 @@ const coverPanel: WebUiPanel = {
     function chooseSession(id: string): void {
       selectedId = id;
       sessionSelect.value = id;
+      // 切工程时丢掉上一次选的新文件，音频输入改显示这个会话的原声（没有就提示未选）。
+      file = null;
+      fileInput.value = '';
+      bindSource();
       mixKey = '';
       rangeParamsKey = '';
       peaks = null;
@@ -1009,7 +1040,7 @@ const coverPanel: WebUiPanel = {
       }
     }
 
-    /** 另存：宿主只有打开型选择器，所以先选目录，再用这里的文件名复制一份。 */
+    /** 另存：先调浏览器原生保存框（File System Access），不支持或拒绝时退回下载，全程不碰 PowerShell。 */
     function toggleExport(row: HTMLElement, s: SessionSummary): void {
       if (exportForm) {
         exportForm.remove();
@@ -1024,7 +1055,7 @@ const coverPanel: WebUiPanel = {
           ...(s.source ? [{ value: 'source', label: t.exportSource }] : []),
         ],
       });
-      const line = ui.h('div', 'rvc-detail', s.source ? '' : t.exportNeedSource);
+      const line = ui.h('div', 'rvc-detail', t.exportHint);
       const grid = ui.h('div', 'rvc-grid');
       grid.append(ui.field(t.exportName, name), ui.field(t.exportWhich, which));
       const acts = ui.actions();
@@ -1042,9 +1073,22 @@ const coverPanel: WebUiPanel = {
       form.append(grid, acts, line);
       row.after(form);
       exportForm = form;
-      if (which.value === 'output' && !s.outputFiles.length) {
-        line.textContent = t.exportNeedOutput;
-      }
+    }
+
+    function extOf(file: string): string {
+      const match = /\.[a-z0-9]{1,5}$/i.exec(file);
+      return match ? match[0].toLowerCase() : '.wav';
+    }
+
+    interface SaveHandle {
+      name: string;
+      createWritable(): Promise<{ write(data: Blob): Promise<void>; close(): Promise<void> }>;
+    }
+    type SavePicker = (options: { suggestedName?: string }) => Promise<SaveHandle>;
+
+    function savePicker(): SavePicker | null {
+      const host = window as unknown as { showSaveFilePicker?: SavePicker };
+      return typeof host.showSaveFilePicker === 'function' ? host.showSaveFilePicker.bind(window) : null;
     }
 
     async function doExport(
@@ -1053,22 +1097,48 @@ const coverPanel: WebUiPanel = {
       which: HTMLSelectElement,
       line: HTMLElement,
     ): Promise<void> {
-      line.textContent = '';
+      line.textContent = t.exportHint;
       line.classList.remove('bad');
-      let dir: string | null = null;
-      try {
-        dir = await ctx.pickPath({ kind: 'directory', title: t.recentExport });
-      } catch (err) {
-        line.textContent = errText(err);
-        line.classList.add('bad');
-        return;
+      const ext = which.value === 'source'
+        ? extOf(s.source?.file ?? '')
+        : `.${s.outputFiles[s.outputFiles.length - 1]?.format ?? 'wav'}`;
+      const base = (name.value.trim() || `cover-${songName(s)}`)
+        .replace(/\.(wav|mp3|flac|ogg|m4a)$/i, '')
+        .replace(/[\\/:*?"<>|]/g, ' ')
+        .trim() || `cover-${songName(s)}`;
+      const suggested = `${base}${ext}`;
+      // 原生保存框必须在点击的同一拍里调起，所以先开框、再取字节。
+      let handle: SaveHandle | null = null;
+      const picker = savePicker();
+      if (picker) {
+        try {
+          handle = await picker({ suggestedName: suggested });
+        } catch (err) {
+          // 用户取消就什么都不做；不安全上下文/被策略禁用则退回下载。
+          if ((err as { name?: string } | null)?.name === 'AbortError') return;
+        }
       }
-      if (!dir) return;
       try {
-        const r = await ctx.invoke<{ path: string; bytes: number }>('sessionExport', [s.id, {
-          dir, name: name.value, which: which.value,
-        }]);
-        ui.toast(t.exportDone(r.path, ui.fmt.bytes(r.bytes)));
+        const r = await ctx.invoke<{
+          name: string; ext: string; bytes: number; mime: string; base64: string;
+        }>('sessionFile', [s.id, which.value]);
+        const blob = blobFromBase64(r.base64, r.mime);
+        if (handle) {
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          line.textContent = t.exportDone(handle.name, ui.fmt.bytes(blob.size));
+          ui.toast(line.textContent);
+        } else {
+          const href = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = href;
+          link.download = suggested;
+          link.click();
+          setTimeout(() => URL.revokeObjectURL(href), 30_000);
+          line.textContent = t.exportDownloaded(suggested);
+          ui.toast(line.textContent);
+        }
       } catch (err) {
         line.textContent = errText(err);
         line.classList.add('bad');
@@ -1104,6 +1174,7 @@ const coverPanel: WebUiPanel = {
       })));
       const session = r.session;
       summaries = r.sessions;
+      bindSource();
       selectedId = session?.id ?? '';
       sessionSelect.value = selectedId;
       // 换会话时把顶部参数按会话回填（「继续编辑」也走这里），之后不再覆盖用户正在改的值。
@@ -1613,6 +1684,7 @@ const coverPanel: WebUiPanel = {
           vocalGain: Number(vocalGainDb.input.value),
           format: mixFormat.value,
           chunk: chunk.value === 'chunk',
+          keepSource: keepSource.checked,
         }]);
       } catch (err) {
         pendingApplied = null;
@@ -2202,6 +2274,10 @@ const coverPanel: WebUiPanel = {
           done.savedPath ? t.saved(done.savedPath) : '',
         ].filter(Boolean).join(' · ');
         if (done.sessionId) selectedId = done.sessionId;
+        // 这次上传已经进（或按勾选没进）会话；清掉文件输入，音频处改显示当前工程的原声。
+        file = null;
+        fileInput.value = '';
+        bindSource();
       }
     }
 
