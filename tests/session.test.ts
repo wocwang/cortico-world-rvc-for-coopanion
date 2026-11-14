@@ -113,4 +113,30 @@ describe('翻唱会话', () => {
     expect(got.removed).toEqual([older.id]);
     expect(existsSync(newer.dir)).toBe(true);
   });
+
+  it('摘要带原声副本与成品逐文件体积；老会话的原声为 null', () => {
+    const data = tempDir();
+    const at = '2026-11-03T00:00:00.000Z';
+    const current = seed(data, at);
+    const rec = record(current.id, at);
+    rec.source = { ...rec.source, file: 'source.wav', bytes: 4096 };
+    rec.outputs = [
+      { format: 'wav', path: 'out/mix-1.wav', at },
+      { format: 'mp3', path: 'out/mix-2.mp3', at },
+    ];
+    writeSession(data, current.id, rec);
+    writeFileSync(join(current.dir, 'source.wav'), Buffer.alloc(4096));
+    writeFileSync(join(current.dir, 'out', 'mix-1.wav'), Buffer.alloc(2048));
+    // mix-2 故意不写：记录还在但文件被删，体积应为 0。
+
+    const old = seed(data, '2026-11-01T00:00:00.000Z');
+    const list = listSessions(data);
+    const fresh = list.find((item) => item.id === current.id)!;
+    expect(fresh.source).toEqual({ file: 'source.wav', bytes: 4096 });
+    expect(fresh.outputFiles).toEqual([
+      { format: 'wav', path: 'out/mix-1.wav', at, bytes: 2048 },
+      { format: 'mp3', path: 'out/mix-2.mp3', at, bytes: 0 },
+    ]);
+    expect(list.find((item) => item.id === old.id)?.source).toBeNull();
+  });
 });

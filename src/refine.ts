@@ -10,7 +10,7 @@
  */
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
-import type { ConvertDone, PeaksDone, RangeConvertRequest, RestoreRangeRequest } from './engine.ts';
+import type { ConvertDone, PeaksDone, RangeConvertRequest, ReconvertRequest, RestoreRangeRequest } from './engine.ts';
 import {
   defaultSegments,
   readSession,
@@ -35,6 +35,11 @@ export interface EngineAdapter {
   peaks(req: { path: string; buckets?: number }): Promise<PeaksDone>;
   convertRange(req: RangeConvertRequest): Promise<ConvertDone>;
   restoreRange(req: RestoreRangeRequest): Promise<ConvertDone>;
+}
+
+/** 原地重新翻唱需要的能力：复用分轨重跑变声。 */
+export interface CoverEngineAdapter extends EngineAdapter {
+  reconvert(req: ReconvertRequest): Promise<ConvertDone>;
 }
 
 export interface RangeSamples {
@@ -203,6 +208,64 @@ export async function rerunRange(
   const segment = appendSegment(session, clampedStart, clampedEnd, params);
   writeSession(dataDir, id, session);
   return { id, session, segment, done };
+}
+
+/**
+ * 原地重新翻唱：复用会话里的分轨重跑整首变声（不重新分离），
+ * `vocals/conv.wav` 原地替换，旧结果由 worker 备份成 `conv.bak.wav`。
+ *
+ * 段落参数、静音状态、成品历史、母带记录都不动；只更新默认参数、音色与
+ * 冻结的电平比例（新变声结果的 RMS 与旧的不同，不更新会让重混音量跳变）。
+ */
+export interface RerunOptions {
+  pitch?: number;
+  indexRate?: number;
+  protect?: number;
+  chunk?: boolean;
+  voice?: string;
+}
+
+export async function rerunSession(
+  dataDir: string,
+  engine: CoverEngineAdapter,
+  id: string,
+  opts: RerunOptions = {},
+): Promise<{ session: RefineSession; done: ConvertDone }> {
+  const { dir, session } = mustRead(dataDir, id);
+  for (const rel of [session.stems.vocals, session.stems.inst, session.converted.path]) {
+    if (!existsSync(join(dir, rel))) {
+      throw new Error(`会话缺少 ${rel}，无法原地重跑；请重新上传原声翻唱一次`);
+    }
+  }
+  const params = clampParams(session.converted.defaults, opts);
+  const chunk = opts.chunk === undefined ? session.converted.defaults.chunk : Boolean(opts.chunk);
+  const voice = (opts.voice ?? '').trim() || session.engine.voice;
+  const done = await engine.reconvert({
+    stem: join(dir, session.stems.vocals),
+    inst: join(dir, session.stems.inst),
+    conv: join(dir, session.converted.path),
+    voice,
+    pitch: params.pitch,
+    indexRate: params.indexRate,
+    protect: params.protect,
+    chunk,
+    expectedSec: session.source.durationSec,
+  });
+
+  const at = new Date().toISOString();
+  session.converted.defaults = { ...params, chunk };
+  if (voice) session.engine.voice = voice;
+  if (typeof done.modelSampleRate === 'number' && done.modelSampleRate > 0) {
+    session.engine.modelSampleRate = done.modelSampleRate;
+  }
+  // 新结果的 RMS 比例必须立刻冻结进会话，后续重混才和这次翻唱同一电平。
+  if (typeof done.rmsRatio === 'number' && Number.isFinite(done.rmsRatio) && done.rmsRatio > 0) {
+    session.mix.rmsRatio = done.rmsRatio;
+    session.mix.rmsFrozen = true;
+  }
+  session.updatedAt = at;
+  writeSession(dataDir, id, session);
+  return { session, done };
 }
 
 /**

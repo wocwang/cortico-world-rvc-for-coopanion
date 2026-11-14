@@ -72,6 +72,8 @@ interface SessionSummary {
   durationSec: number;
   voice: string;
   outputs: number;
+  source: { file: string; bytes: number } | null;
+  outputFiles: Array<{ format: string; path: string; bytes: number; at: string }>;
 }
 interface SessionMix {
   vocalGainDb: number;
@@ -85,7 +87,7 @@ interface SessionMix {
 interface RefineSession {
   id: string;
   engine: { kind: string; voice: string; modelSampleRate: number };
-  source: { durationSec: number; inputPeak: number; format: string };
+  source: { durationSec: number; inputPeak: number; format: string; file?: string; bytes?: number };
   converted: {
     path: string;
     sampleRate: number;

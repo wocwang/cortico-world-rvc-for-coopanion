@@ -101,7 +101,11 @@ export interface RefineSession {
   createdAt: string;
   updatedAt: string;
   engine: { kind: string; voice: string; modelSampleRate: number };
-  source: { durationSec: number; inputPeak: number; format: string };
+  /**
+   * `file` / `bytes` 是翻唱时留在会话目录里的原声副本（`source.<ext>`）；
+   * 老会话没有这两个字段，菜单显示「原声未保存」。
+   */
+  source: { durationSec: number; inputPeak: number; format: string; file?: string; bytes?: number };
   stems: { vocals: string; inst: string };
   converted: {
     path: string;
@@ -117,6 +121,20 @@ export interface RefineSession {
   masters?: SessionMaster[];
 }
 
+/** 原声副本的摘要：老会话没有副本时为 null。 */
+export interface SessionSourceSummary {
+  file: string;
+  bytes: number;
+}
+
+/** 会话里一份成品文件的实际体积；菜单显示「翻唱文件」用。 */
+export interface SessionFileSummary {
+  format: 'wav' | 'mp3';
+  path: string;
+  bytes: number;
+  at: string;
+}
+
 export interface SessionSummary {
   id: string;
   createdAt: string;
@@ -125,6 +143,10 @@ export interface SessionSummary {
   durationSec: number;
   voice: string;
   outputs: number;
+  /** 原声副本；老会话为 null（面板显示「原声未保存」）。 */
+  source: SessionSourceSummary | null;
+  /** 成品逐文件体积；文件被删时 bytes 为 0。 */
+  outputFiles: SessionFileSummary[];
 }
 
 export interface GcOptions {
@@ -213,10 +235,34 @@ export function listSessions(dataDir: string): SessionSummary[] {
       durationSec: s.source.durationSec,
       voice: s.engine.voice,
       outputs: s.outputs.length,
+      source: sourceSummary(join(root, id), s),
+      outputFiles: s.outputs.map((item) => ({
+        format: item.format,
+        path: item.path,
+        at: item.at,
+        bytes: fileBytes(join(root, id, item.path)),
+      })),
     });
   }
   out.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   return out;
+}
+
+/** 原声副本还在才算「已保存」；清单里有记录但文件被删，按未保存处理。 */
+function sourceSummary(dir: string, session: RefineSession): SessionSourceSummary | null {
+  const file = session.source.file;
+  if (!file) return null;
+  const bytes = fileBytes(join(dir, file));
+  return bytes > 0 ? { file, bytes } : null;
+}
+
+function fileBytes(path: string): number {
+  try {
+    const st = statSync(path);
+    return st.isFile() ? st.size : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export function removeSession(dataDir: string, id: string): boolean {

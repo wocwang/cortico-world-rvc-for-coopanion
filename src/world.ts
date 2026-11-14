@@ -26,7 +26,7 @@ import { createSession, defaultSegments, dirBytes, gcSessions, listSessions, rea
 import { analyzePitch, parseF0Csv } from './pitch.ts';
 import {
   cutSegment, ensureSegments, mergeSegments, muteSegment, mutedRanges, readPeaks, redoSegment,
-  rerunRange, revertSegment, type RangeOptions,
+  rerunRange, rerunSession, revertSegment, type RangeOptions,
 } from './refine.ts';
 import { panelText } from './webui/text.ts';
 
@@ -529,13 +529,28 @@ export class RvcWorld implements World {
         const now = new Date().toISOString();
         const rel = `out/mix-1.${job.format}`;
         writeFileSync(join(session.dir, rel), audio);
+        // 原声副本：之后「重新翻唱」直接用它，不必再让用户选文件；
+        // 写不进去不影响这次翻唱，只是菜单里会显示「原声未保存」。
+        let sourceFile = '';
+        try {
+          sourceFile = `source${/^\.[a-z0-9]{1,5}$/.test(ext) ? ext : '.bin'}`;
+          writeFileSync(join(session.dir, sourceFile), job.file);
+        } catch {
+          sourceFile = '';
+          this.log?.warn('写原声副本失败，本次会话不保存原声', { id: session.id });
+        }
         const record: RefineSession = {
           version: 1,
           id: session.id,
           createdAt: now,
           updatedAt: now,
           engine: { kind: 'rvc', voice: job.voice || engine.state().model || '', modelSampleRate: done.modelSampleRate ?? done.sampleRate ?? 0 },
-          source: { durationSec: done.durationSec ?? 0, inputPeak: done.inputPeak ?? 0, format: job.format },
+          source: {
+            durationSec: done.durationSec ?? 0,
+            inputPeak: done.inputPeak ?? 0,
+            format: job.format,
+            ...(sourceFile ? { file: sourceFile, bytes: job.file.length } : {}),
+          },
           stems: { vocals: 'stems/vocals.wav', inst: 'stems/inst.wav' },
           converted: {
             path: 'vocals/conv.wav',
@@ -579,6 +594,63 @@ export class RvcWorld implements World {
       rmSync(output, { force: true });
       this.armIdle();
     }
+  }
+
+  /**
+   * 面板「重新翻唱」：复用会话里已有的分轨，只重跑变声再重混，更新同一会话目录。
+   * 不重新分离、不新建会话；段落参数 / 静音 / 成品历史 / 母带记录都保留。
+   */
+  private async rerunFromPanel(args: unknown[]): Promise<unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    for (const rel of [session.stems.vocals, session.stems.inst, session.converted.path]) {
+      if (!existsSync(join(dir, rel))) {
+        throw new RvcError('param', `会话缺少 ${rel}，无法原地重跑；请重新上传原声翻唱一次`);
+      }
+    }
+    const engine = this.engine;
+    if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
+
+    const format = raw.format === 'mp3' ? 'mp3' : 'wav';
+    let result;
+    try {
+      result = await rerunSession(this.opts.dataDir, engine, id, {
+        pitch: raw.pitch === undefined ? undefined : Number(raw.pitch),
+        indexRate: raw.indexRate === undefined ? undefined : Number(raw.indexRate),
+        protect: raw.protect === undefined ? undefined : Number(raw.protect),
+        chunk: raw.chunk === undefined ? undefined : raw.chunk === true || raw.chunk === 'true',
+        voice: typeof raw.voice === 'string' ? raw.voice : undefined,
+      });
+    } catch (err) {
+      if (err instanceof RvcError) throw err;
+      throw new RvcError('param', err instanceof Error ? err.message : String(err));
+    }
+    this.activeSession = id;
+    const { audio, done, path } = await this.mixSession(id, result.session, {
+      format,
+      vocalGainDb: clampNumber(raw.vocalGainDb, -24, 24, result.session.mix.vocalGainDb),
+      instGainDb: clampNumber(raw.instGainDb, -24, 24, result.session.mix.instGainDb),
+      fadeInSec: clampNumber(raw.fadeInSec, 0, 30, result.session.mix.fadeInSec),
+      fadeOutSec: clampNumber(raw.fadeOutSec, 0, 30, result.session.mix.fadeOutSec),
+    }, true);
+    this.lastCover = {
+      at: Date.now(), ms: result.done.ms + done.ms, bytes: audio.length, savedPath: path,
+      voice: result.session.engine.voice, format,
+      stages: { convert: result.done.ms, mix: done.ms },
+      peakScale: done.peakScale,
+      sessionId: id,
+    };
+    this.log?.info('RVC 原地重新翻唱完成', {
+      id, pitch: result.session.converted.defaults.pitch, ms: result.done.ms, format,
+    });
+    return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
   }
 
   /** 面板「重新混音」：只读会话里的分轨与变声结果，重做混音后落盘，不跑模型。 */
@@ -1038,6 +1110,10 @@ export class RvcWorld implements World {
       this.beginJob(method, args);
       return this.status();
     }
+    if (method === 'coverRerun') {
+      this.beginJob('cover', args, 'coverRerun');
+      return this.status();
+    }
     if (method === 'rangeConvert') {
       this.beginJob('range', args);
       return this.status();
@@ -1116,11 +1192,12 @@ export class RvcWorld implements World {
   private beginJob(
     kind: 'convert' | 'cover' | 'remix' | 'range' | 'master',
     args: unknown[],
-    action: 'convert' | 'cover' | 'remix' | 'range' | 'master' | 'segmentRedo' | 'segmentRevert' = kind,
+    action: 'convert' | 'cover' | 'coverRerun' | 'remix' | 'range' | 'master' | 'segmentRedo' | 'segmentRevert' = kind,
   ): void {
     if (this.job?.phase === 'working') throw new RvcError('param', '已有任务在跑，等它结束再试');
     const at = Date.now();
     const detail = action === 'cover' ? '分离人声'
+      : action === 'coverRerun' ? '重跑变声并混音'
       : action === 'range' ? '重跑选段'
         : action === 'segmentRedo' ? '重做段落'
           : action === 'segmentRevert' ? '还原段落'
@@ -1130,7 +1207,9 @@ export class RvcWorld implements World {
     this.jobResult = null;
     const task = action === 'cover'
       ? this.coverFromPanel(args)
-      : action === 'range'
+      : action === 'coverRerun'
+        ? this.rerunFromPanel(args)
+        : action === 'range'
         ? this.rangeFromPanel(args)
         : action === 'segmentRedo'
           ? this.segmentFromPanel(args, 'redo')

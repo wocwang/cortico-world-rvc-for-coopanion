@@ -174,6 +174,18 @@ describe('World 面板数据面', () => {
     expect((await invoke('state') as State).lastCover).toBeNull();
   });
 
+  it('原地重新翻唱先查会话与分轨，不需要重新上传原声', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    expect(await jobError(invoke, 'coverRerun', ['nope'])).toContain('找不到会话');
+
+    const empty = seedSession(dataDir);
+    expect(await jobError(invoke, 'coverRerun', [empty.id])).toContain('会话缺少 stems/vocals.wav');
+
+    const half = seedSession(dataDir, { stems: true });
+    expect(await jobError(invoke, 'coverRerun', [half.id])).toContain('会话缺少 stems/inst.wav');
+    expect((await invoke('state') as State).lastCover).toBeNull();
+  });
+
   it('关掉「随软件自动启动」后，挂载完引擎仍是 stopped', async () => {
     const { invoke } = await makeWorld({ autoStart: false });
     const state = (await invoke('state')) as State;

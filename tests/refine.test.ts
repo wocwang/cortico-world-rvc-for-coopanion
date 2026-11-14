@@ -1,8 +1,12 @@
+import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  MIN_RANGE_SEC, appendSegment, ensureSegments, mergeSegmentWithNext, mutedRanges, rangeSamples, splitSegmentIn,
+  MIN_RANGE_SEC, appendSegment, ensureSegments, mergeSegmentWithNext, mutedRanges, rangeSamples,
+  rerunSession, splitSegmentIn, type CoverEngineAdapter,
 } from '../src/refine.ts';
-import { defaultSegments } from '../src/session.ts';
+import { createSession, defaultSegments, readSession, writeSession } from '../src/session.ts';
 import type { RefineSession, RefineSegment } from '../src/session.ts';
 
 function record(): RefineSession {
@@ -176,5 +180,86 @@ describe('段落切分与合并', () => {
     const session = record();
     ensureSegments(session, at);
     expect(() => splitSegmentIn(session, 's9', 6, at)).toThrow(/找不到段落/);
+  });
+});
+
+describe('原地重新翻唱', () => {
+  it('复用分轨重跑变声，只更新默认参数与电平比例，段落/静音/成品/母带都保留', async () => {
+    const data = mkdtempSync(join(tmpdir(), 'rvc-rerun-'));
+    try {
+      const { id, dir } = createSession(data);
+      const rec = record();
+      rec.id = id;
+      rec.source.file = 'source.wav';
+      rec.source.bytes = 4096;
+      rec.segments = defaultSegments(rec.source.durationSec, rec.converted.defaults);
+      rec.segments[0].muted = true;
+      rec.segments[0].revision = 3;
+      rec.outputs = [{ format: 'wav', path: 'out/mix-1.wav', at: rec.createdAt }];
+      rec.masters = [{
+        format: 'wav', path: 'out/master-1.wav', at: rec.createdAt, targetLufs: -14,
+        ceilingDb: -1, inputLufs: -20, inputTruePeakDb: -3, outputLufs: -14,
+        outputTruePeakDb: -1.2, gainDb: 6, limitedDb: 0.4,
+      }];
+      writeSession(data, id, rec);
+      for (const rel of ['stems/vocals.wav', 'stems/inst.wav', 'vocals/conv.wav']) {
+        writeFileSync(join(dir, rel), Buffer.alloc(1024));
+      }
+
+      let seen: Record<string, unknown> | null = null;
+      const engine: CoverEngineAdapter = {
+        peaks: async () => { throw new Error('不该调用'); },
+        convertRange: async () => { throw new Error('不该调用'); },
+        restoreRange: async () => { throw new Error('不该调用'); },
+        reconvert: async (req) => {
+          seen = req as unknown as Record<string, unknown>;
+          return { ms: 1234, sampleRate: 44100, rmsRatio: 2.5, modelSampleRate: 48000, durationSec: 12.5 };
+        },
+      };
+
+      const result = await rerunSession(data, engine, id, { pitch: 5 });
+      expect(seen).toMatchObject({
+        stem: join(dir, 'stems/vocals.wav'),
+        inst: join(dir, 'stems/inst.wav'),
+        conv: join(dir, 'vocals/conv.wav'),
+        voice: 'daifeiyu',
+        pitch: 5,
+        indexRate: 0.3,
+        protect: 0.33,
+        chunk: true,
+        expectedSec: 12.5,
+      });
+      expect(result.session.converted.defaults).toEqual({ pitch: 5, indexRate: 0.3, protect: 0.33, chunk: true });
+      expect(result.session.mix.rmsRatio).toBe(2.5);
+      expect(result.session.engine.modelSampleRate).toBe(48000);
+      expect(result.session.segments[0].muted).toBe(true);
+      expect(result.session.segments[0].revision).toBe(3);
+      expect(result.session.outputs).toHaveLength(1);
+      expect(result.session.masters).toHaveLength(1);
+      expect(readSession(data, id)?.converted.defaults.pitch).toBe(5);
+    } finally {
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
+  it('分轨缺失时直接报错，不调用引擎', async () => {
+    const data = mkdtempSync(join(tmpdir(), 'rvc-rerun-'));
+    try {
+      const { id, dir } = createSession(data);
+      const rec = record();
+      rec.id = id;
+      writeSession(data, id, rec);
+      writeFileSync(join(dir, 'stems/vocals.wav'), Buffer.alloc(16));
+      unlinkSync(join(dir, 'stems/vocals.wav'));
+      const engine: CoverEngineAdapter = {
+        peaks: async () => { throw new Error('不该调用'); },
+        convertRange: async () => { throw new Error('不该调用'); },
+        restoreRange: async () => { throw new Error('不该调用'); },
+        reconvert: async () => { throw new Error('不该调用'); },
+      };
+      await expect(rerunSession(data, engine, id)).rejects.toThrow(/会话缺少 stems\/vocals\.wav/);
+    } finally {
+      rmSync(data, { recursive: true, force: true });
+    }
   });
 });

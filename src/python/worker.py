@@ -782,6 +782,130 @@ def main() -> int:
             "durationSec": round(n / 44100.0, 3),
         })
 
+    def reconvert(req: dict) -> None:
+        """复用已分离的人声分轨重跑整首变声，原地替换 conv.wav（不改伴奏、不重做分离）。
+
+        与 cover 的区别：跳过 UVR 分离。旧 conv 先备份成 `conv.bak.wav`，新结果写到临时文件
+        再原子替换；模型输出长度与旧成品差太多就中止，绝不静默产生错位的混音。
+        """
+        import shutil
+
+        import numpy as np
+        import soundfile as sf
+
+        req_id = req.get("id")
+        voice_name = (req.get("voice") or "").strip() or default_voice
+        stem = req.get("stem") or ""
+        inst = req.get("inst") or ""
+        conv_path = req.get("conv") or ""
+        if not stem or not os.path.isfile(stem):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到人声分轨：%s" % stem})
+            return
+        if not inst or not os.path.isfile(inst):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到伴奏分轨：%s" % inst})
+            return
+        if not conv_path or not os.path.isfile(conv_path):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "旧变声结果不存在，无法原地重跑：%s" % conv_path})
+            return
+        try:
+            load_voice(voice_name)
+        except Exception as error:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": str(error)})
+            return
+
+        try:
+            inst_frames = int(sf.info(inst).frames)
+            old_frames = int(sf.info(conv_path).frames)
+        except Exception as error:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到会话音频信息：%s" % error})
+            return
+        if inst_frames <= 0:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "伴奏是空文件"})
+            return
+        # 旧 conv 应当与伴奏等长（cover 写盘前已对齐）；对不上说明会话本身已经错位。
+        if abs(old_frames - inst_frames) > int(0.05 * 44100):
+            emit({
+                "type": "result", "id": req_id, "ok": False, "kind": "param",
+                "error": "旧成品与分轨时长不一致（%.3f 秒 vs %.3f 秒），已中止，未覆盖原成品"
+                         % (old_frames / 44100.0, inst_frames / 44100.0),
+            })
+            return
+        expected = float(req.get("expectedSec") or 0)
+        if expected > 0 and abs(inst_frames / 44100.0 - expected) > 0.05:
+            emit({
+                "type": "result", "id": req_id, "ok": False, "kind": "param",
+                "error": "分轨时长（%.3f 秒）与原始记录（%.3f 秒）不一致，已中止，未覆盖原成品"
+                         % (inst_frames / 44100.0, expected),
+            })
+            return
+
+        began = time.time()
+        try:
+            result = run_vc(
+                stem,
+                int(req.get("pitch") or 0),
+                float(req.get("indexRate", 0.3)),
+                float(req.get("protect", 0.33)),
+                bool(req.get("chunk", 1)),
+            )
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
+            return
+        if not result or result[0] is None or result[1] is None:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": str(result[0] if result else "没有可转换的音频")[-1500:]})
+            return
+
+        conv_sr, conv = int(result[0]), np.asarray(result[1])
+        if conv.ndim > 1:
+            conv = conv.mean(axis=1)
+        conv = conv.astype(np.float32) / 32768.0 if conv.dtype.kind in "iu" else conv.astype(np.float32)
+        conv = resample_to_44100(conv, conv_sr)
+        if abs(conv.size - inst_frames) > int(0.2 * 44100):
+            emit({
+                "type": "result", "id": req_id, "ok": False, "kind": "param",
+                "error": "重跑时长（%.3f 秒）与旧成品（%.3f 秒）不一致，已中止，未覆盖原成品"
+                         % (conv.size / 44100.0, inst_frames / 44100.0),
+            })
+            return
+        conv = conv[:inst_frames] if conv.size >= inst_frames else np.pad(conv, (0, inst_frames - conv.size))
+
+        backup_path = (req.get("backup") or "").strip() or os.path.join(os.path.dirname(os.path.abspath(conv_path)), "conv.bak.wav")
+        tmp_path = conv_path + ".new.wav"
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(conv_path)), exist_ok=True)
+            shutil.copyfile(conv_path, backup_path)
+            sf.write(tmp_path, conv, 44100, subtype="FLOAT")
+            os.replace(tmp_path, conv_path)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "写回变声结果失败：%s" % traceback.format_exc()[-800:]})
+            return
+
+        try:
+            vocal, _ = sf.read(stem, dtype="float32", always_2d=False)
+            if getattr(vocal, "ndim", 1) > 1:
+                vocal = vocal.mean(axis=1)
+            rms_vocal = float(np.sqrt(np.mean(np.asarray(vocal, dtype=np.float64) ** 2)))
+            rms_conv = float(np.sqrt(np.mean(conv.astype(np.float64) ** 2)))
+            ratio = 1.0 if rms_vocal < 1e-5 or rms_conv < 1e-5 else min(4.0, max(0.25, rms_vocal / rms_conv))
+        except Exception:
+            ratio = 1.0
+
+        emit({
+            "type": "result",
+            "id": req_id,
+            "ok": True,
+            "ms": int((time.time() - began) * 1000),
+            "sampleRate": 44100,
+            "modelSampleRate": conv_sr,
+            "durationSec": round(inst_frames / 44100.0, 3),
+            "rmsRatio": round(ratio, 4),
+            "backupPath": backup_path,
+        })
+
     def remix(req: dict) -> None:
         """只重做混音：读已分离的伴奏与变声后人声，按增益/淡入淡出混成一条。
 
@@ -1301,6 +1425,9 @@ def main() -> int:
             continue
         if op == "cover":
             cover(req)
+            continue
+        if op == "reconvert":
+            reconvert(req)
             continue
         if op == "remix":
             remix(req)

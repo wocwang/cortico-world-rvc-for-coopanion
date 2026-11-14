@@ -92,6 +92,23 @@ export interface CoverRequest {
   sessionDir?: string;
 }
 
+/** 复用已分离的人声分轨重跑整首变声，原地替换 conv.wav。 */
+export interface ReconvertRequest {
+  /** 已分离的人声（44.1 kHz）。 */
+  stem: string;
+  /** 伴奏（44.1 kHz），只用来校准长度。 */
+  inst: string;
+  /** 旧变声结果，会被原地替换；替换前备份成 `conv.bak.wav`。 */
+  conv: string;
+  voice?: string;
+  pitch: number;
+  indexRate: number;
+  protect: number;
+  chunk?: boolean;
+  /** 会话里记录的整首时长；分轨与它对不上就中止，不覆盖成品。 */
+  expectedSec?: number;
+}
+
 export interface SeparateRequest {
   input: string;
   /** 人声输出路径。 */
@@ -364,6 +381,15 @@ export class RvcEngine {
     }, COVER_TIMEOUT_MS);
   }
 
+  /** 复用会话分轨重跑整首变声（跳过分离），原地替换 conv.wav。 */
+  async reconvert(req: ReconvertRequest): Promise<ConvertDone> {
+    return this.run('reconvert', {
+      stem: req.stem, inst: req.inst, conv: req.conv, voice: req.voice ?? '',
+      pitch: req.pitch, indexRate: req.indexRate, protect: req.protect,
+      chunk: req.chunk === false ? 0 : 1, expectedSec: req.expectedSec ?? 0,
+    }, COVER_TIMEOUT_MS);
+  }
+
   /** 只重做混音：不重新分离、不变声。 */
   async remix(req: RemixRequest): Promise<ConvertDone> {
     return this.run('remix', {
@@ -435,7 +461,7 @@ export class RvcEngine {
     return { ...done, loudness: done.loudness };
   }
 
-  private async run(op: 'convert' | 'separate' | 'cover' | 'remix' | 'convertRange' | 'restoreRange' | 'peaks' | 'f0' | 'master', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
+  private async run(op: 'convert' | 'separate' | 'cover' | 'reconvert' | 'remix' | 'convertRange' | 'restoreRange' | 'peaks' | 'f0' | 'master', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
     if (!this.ready()) throw new RvcError('unavailable', this.st.detail ?? 'RVC 引擎未就绪');
     const id = ++this.seq;
     const run = () => new Promise<ConvertDone>((resolve, reject) => {
