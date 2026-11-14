@@ -948,16 +948,18 @@ export class RvcWorld implements World {
   }
 
   /**
-   * 面板 A/B：按 `session.outputs` 下标把成品文件交给浏览器（`$file` 由宿主校验并流式返回，
-   * 不在 JSON 里塞 base64）。只允许读本会话已登记的成品。
+   * 面板 A/B：按 `session.outputs` / `session.masters` 下标把成品交给浏览器
+   * （`$file` 由宿主校验并流式返回，不在 JSON 里塞 base64）。只允许读本会话已登记的文件。
    */
   private audioFromPanel(args: unknown[]): Record<string, unknown> {
     const id = typeof args[0] === 'string' ? args[0] : '';
     const index = Number(args[1]);
+    const kind = args[2] === 'master' ? 'master' : 'output';
     const dir = sessionDir(this.opts.dataDir, id);
     const session = dir ? readSession(this.opts.dataDir, id) : null;
     if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
-    const output = Number.isInteger(index) ? session.outputs[index] : undefined;
+    const list = kind === 'master' ? session.masters ?? [] : session.outputs;
+    const output = Number.isInteger(index) ? list[index] : undefined;
     if (!output) throw new RvcError('param', `成品序号无效：${String(args[1] ?? '')}`);
     const full = join(dir, output.path);
     if (!existsSync(full)) throw new RvcError('param', '成品文件不存在，可能已被清理');
@@ -1056,7 +1058,10 @@ export class RvcWorld implements World {
     return this.refineState(id);
   }
 
-  /** 面板「结果编辑」：会话列表 + 当前会话的混音参数。 */
+  /**
+   * 面板「结果编辑」：会话列表 + 当前会话的混音参数。
+   * `files` 把成品（混音 + 母带）按时间排成一份清单，面板据此做成品选择。
+   */
   private refineState(id = ''): Record<string, unknown> {
     const sessions = listSessions(this.opts.dataDir);
     const has = (value: string): boolean => sessions.some((s) => s.id === value);
@@ -1076,7 +1081,37 @@ export class RvcWorld implements World {
       active: this.activeSession,
       sessions,
       session,
+      files: session && wanted ? this.outputFiles(wanted, session) : [],
     };
+  }
+
+  /** 成品清单：混音与母带合在一起按时间升序；`index` 是各自数组里的下标。 */
+  private outputFiles(id: string, session: RefineSession): Array<{
+    kind: 'output' | 'master';
+    index: number;
+    format: string;
+    path: string;
+    at: string;
+    bytes: number;
+    targetLufs?: number;
+  }> {
+    const dir = sessionDir(this.opts.dataDir, id);
+    if (!dir) return [];
+    const size = (rel: string): number => {
+      const full = join(dir, rel);
+      try { return existsSync(full) ? statSync(full).size : 0; } catch { return 0; }
+    };
+    const files = [
+      ...session.outputs.map((item, index) => ({
+        kind: 'output' as const, index, format: item.format, path: item.path, at: item.at, bytes: size(item.path),
+      })),
+      ...(session.masters ?? []).map((item, index) => ({
+        kind: 'master' as const, index, format: item.format, path: item.path, at: item.at,
+        bytes: size(item.path), targetLufs: item.targetLufs,
+      })),
+    ];
+    files.sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.path.localeCompare(b.path));
+    return files;
   }
 
   private deleteSession(id: string): Record<string, unknown> {
@@ -1093,16 +1128,30 @@ export class RvcWorld implements World {
     return { ...this.refineState(), cleaned: result.removed.length, freed: result.freed };
   }
 
-  /** 面板「另存」：把成品或原声读成 base64 交给浏览器保存（原生保存框或下载），不经过 PowerShell。 */
+  /**
+   * 面板「另存」：把成品（混音或母带）或原声读成 base64 交给浏览器保存
+   * （原生保存框或下载），不经过 PowerShell。`args[2]` 是成品序号，省略则取最近一条。
+   */
   private sessionFile(args: unknown[]): Record<string, unknown> {
     const id = typeof args[0] === 'string' ? args[0] : '';
-    const which = args[1] === 'source' ? 'source' : 'output';
+    const requested = args[1] === 'source' ? 'source' : args[1] === 'master' ? 'master' : 'output';
+    const index = Number(args[2]);
     const dir = sessionDir(this.opts.dataDir, id);
     const session = dir ? readSession(this.opts.dataDir, id) : null;
     if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
-    const last = session.outputs[session.outputs.length - 1];
-    const rel = which === 'source' ? session.source.file : last?.path;
-    if (!rel) throw new RvcError('param', which === 'source' ? '这个会话没有原声副本' : '这个会话还没有成品');
+    let rel: string | undefined;
+    if (requested === 'source') {
+      rel = session.source.file;
+    } else {
+      const list = requested === 'master' ? session.masters ?? [] : session.outputs;
+      const item = Number.isInteger(index) ? list[index] : list[list.length - 1];
+      rel = item?.path;
+    }
+    if (!rel) {
+      throw new RvcError('param', requested === 'source'
+        ? '这个会话没有原声副本'
+        : requested === 'master' ? '这个会话还没有母带' : '这个会话还没有成品');
+    }
     const source = join(dir, rel);
     if (!existsSync(source)) throw new RvcError('param', `文件不在了：${rel}`);
     const ext = extname(rel).toLowerCase() || '.wav';

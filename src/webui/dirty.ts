@@ -49,3 +49,11 @@ export function coverAction(dirty: CoverDirty, hasResult: boolean): CoverAction 
   if (dirty.inference) return dirty.mix ? 'rerunMix' : 'rerun';
   return dirty.mix ? 'remix' : 'rerun';
 }
+
+/**
+ * 哪几种动作必须有原声：重新翻唱要用分轨重跑变声，没原声就得让用户先补一份。
+ * 「重新混音」只读会话里的 conv.wav + 伴奏，不碰原声，所以不在此列。
+ */
+export function actionNeedsSource(action: CoverAction): boolean {
+  return action === 'rerun' || action === 'rerunMix';
+}

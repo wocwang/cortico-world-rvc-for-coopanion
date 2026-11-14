@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { coverAction, coverDirty, type CoverParams } from '../src/webui/dirty.ts';
+import { actionNeedsSource, coverAction, coverDirty, type CoverParams } from '../src/webui/dirty.ts';
 
 const base: CoverParams = {
   pitch: 0,
@@ -61,5 +61,13 @@ describe('翻唱按钮的 dirty 判定', () => {
     expect(coverAction({ inference: false, mix: true }, true)).toBe('remix');
     expect(coverAction({ inference: true, mix: false }, true)).toBe('rerun');
     expect(coverAction({ inference: true, mix: true }, true)).toBe('rerunMix');
+  });
+
+  it('只有重新翻唱/重新翻唱混音需要原声，重新混音不需要', () => {
+    expect(actionNeedsSource('remix')).toBe(false);
+    expect(actionNeedsSource('rerun')).toBe(true);
+    expect(actionNeedsSource('rerunMix')).toBe(true);
+    // 首次翻唱走的是新上传文件，门槛由文件输入负责，不是「会话原声」。
+    expect(actionNeedsSource('cover')).toBe(false);
   });
 });

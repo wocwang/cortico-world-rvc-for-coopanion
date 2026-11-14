@@ -224,7 +224,11 @@ describe('World 面板数据面', () => {
 /** 造一个会话：默认是 P1 时代的老清单（没有 masters 字段），可按需登记成品与分轨。 */
 function seedSession(
   dataDir: string,
-  opts: { outputs?: string[]; stems?: boolean } = {},
+  opts: {
+    outputs?: string[];
+    stems?: boolean;
+    masters?: Array<{ path: string; at?: string; targetLufs?: number }>;
+  } = {},
 ): { id: string; dir: string } {
   const { id, dir } = createSession(dataDir);
   const at = new Date().toISOString();
@@ -250,9 +254,25 @@ function seedSession(
       at,
     })),
   };
+  if (opts.masters) {
+    rec.masters = opts.masters.map((item) => ({
+      format: item.path.endsWith('.mp3') ? 'mp3' as const : 'wav' as const,
+      path: item.path,
+      at: item.at ?? at,
+      targetLufs: item.targetLufs ?? -14,
+      ceilingDb: -1,
+      inputLufs: -18,
+      inputTruePeakDb: -3,
+      outputLufs: item.targetLufs ?? -14,
+      outputTruePeakDb: -2,
+      gainDb: 4,
+      limitedDb: 0,
+    }));
+  }
   writeSession(dataDir, id, rec);
   if (opts.stems) writeFileSync(join(dir, 'stems', 'vocals.wav'), Buffer.alloc(1024));
   for (const path of opts.outputs ?? []) writeFileSync(join(dir, path), Buffer.alloc(2048, 0x33));
+  for (const item of opts.masters ?? []) writeFileSync(join(dir, item.path), Buffer.alloc(3072, 0x55));
   return { id, dir };
 }
 
@@ -283,6 +303,35 @@ describe('母带 / 音高 / A/B 的数据面', () => {
     await expect(invoke('refineAudio', [id, 2])).rejects.toThrow('成品序号无效');
     await expect(invoke('refineAudio', [id, -1])).rejects.toThrow('成品序号无效');
     await expect(invoke('refineAudio', ['nope', 0])).rejects.toThrow('找不到会话');
+  });
+
+  it('成品清单把混音与母带按时间排在一起，可取指定母带试听/另存', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const { id } = seedSession(dataDir, {
+      outputs: ['out/mix-1.wav'],
+      masters: [{ path: 'out/master-1.wav', at: '2099-01-01T00:00:00.000Z', targetLufs: -16 }],
+    });
+    const state = (await invoke('refineState', [id])) as {
+      files?: Array<{ kind: string; index: number; format: string; path: string; bytes: number }>;
+    };
+    expect(state.files?.map((f) => [f.kind, f.index, f.path, f.bytes])).toEqual([
+      ['output', 0, 'out/mix-1.wav', 2048],
+      ['master', 0, 'out/master-1.wav', 3072],
+    ]);
+
+    const master = (await invoke('refineAudio', [id, 0, 'master'])) as {
+      $file?: { mime: string; bytes: number };
+    };
+    expect(master.$file?.mime).toBe('audio/wav');
+    expect(master.$file?.bytes).toBe(3072);
+    await expect(invoke('refineAudio', [id, 1, 'master'])).rejects.toThrow('成品序号无效');
+
+    const saved = (await invoke('sessionFile', [id, 'master', 0])) as { ext: string; bytes: number };
+    expect(saved.ext).toBe('.wav');
+    expect(saved.bytes).toBe(3072);
+    const first = (await invoke('sessionFile', [id, 'output', 0])) as { bytes: number };
+    expect(first.bytes).toBe(2048);
+    await expect(invoke('sessionFile', [id, 'master', 1])).rejects.toThrow('还没有母带');
   });
 
   it('音高体检缺人声分轨时报错；没有 masters 的老会话照常打开', async () => {

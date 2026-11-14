@@ -8,7 +8,7 @@
 import type { WebUiClientBundle, WebUiPanel, WebUiPanelContext, WebUi, Disposable } from 'cortico/web/shared/client-panel.ts';
 import { panelText } from './text.ts';
 import { abRange, abSeek, carryPosition } from './ab.ts';
-import { coverAction, coverDirty, type CoverAction, type CoverParams } from './dirty.ts';
+import { actionNeedsSource, coverAction, coverDirty, type CoverAction, type CoverParams } from './dirty.ts';
 import { segmentWindow } from './preview.ts';
 import type { PitchAnalysis } from '../pitch.ts';
 import './style.css';
@@ -122,6 +122,16 @@ interface PeaksResp {
   min: number[];
   max: number[];
 }
+/** 会话里登记的成品：混音（outputs）或母带（masters）。`index` 是对应数组的下标。 */
+interface SessionOutputFile {
+  kind: 'output' | 'master';
+  index: number;
+  format: string;
+  path: string;
+  at: string;
+  bytes: number;
+  targetLufs?: number;
+}
 interface RefineState {
   root: string;
   keep: boolean;
@@ -130,6 +140,8 @@ interface RefineState {
   active: string | null;
   sessions: SessionSummary[];
   session: RefineSession | null;
+  /** 当前会话的成品清单（混音 + 母带，时间升序）；旧版 World 没有这个字段。 */
+  files?: SessionOutputFile[];
   cleaned?: number;
   freed?: number;
 }
@@ -689,6 +701,13 @@ const coverPanel: WebUiPanel = {
     let pendingApplied: CoverParams | null = null;
     /** 最近一次 refineState 的会话摘要；菜单「另存」要知道原声副本在不在。 */
     let summaries: SessionSummary[] = [];
+    /** 结果编辑的成品清单与当前选择；用文件相对路径做稳定键（下标会随裁剪前移）。 */
+    let outputFiles: SessionOutputFile[] = [];
+    let pickedOutput = '';
+    let outputLoadKey = '';
+    let outputSeq = 0;
+    let outputsSessionId = '';
+    let currentSession: RefineSession | null = null;
     /** 只让最后一次 refineState 请求落地，避免切会话时被慢响应弹回去。 */
     let refineSeq = 0;
     /** 波形包络与当前拖选（秒）。 */
@@ -715,13 +734,21 @@ const coverPanel: WebUiPanel = {
     let abLoaded = false;
     let abLabelA = '';
     let abLabelB = '';
-    let abOutputs: RefineSession['outputs'] = [];
 
     const refineSheet = ui.section(t.refineTitle, t.refineHint);
     const sessionSelect = ui.select({
       options: [],
       onChange: (value) => chooseSession(value),
     });
+    // 成品选择：一个会话可能有多条混音/母带，A/B、试听、下载与另存都跟着它走。
+    const outputSelect = ui.select({
+      options: [],
+      onChange: (value) => chooseOutput(value),
+    });
+    const outputRow = ui.field(t.output, outputSelect);
+    const outputLine = ui.h('div', 'rvc-detail', t.outputHint);
+    outputRow.hidden = true;
+    outputLine.hidden = true;
 
     // 选段重跑：波形上拖出 [a,b)，只重渲这一段，区间外样本保持不变。
     const waveSheet = ui.section(t.rangeTitle, t.rangeHint);
@@ -780,7 +807,15 @@ const coverPanel: WebUiPanel = {
     const refineDisk = ui.h('div', 'rvc-detail');
     const refineLine = ui.h('div', 'rvc-detail');
     const mixLine = ui.h('div', 'rvc-detail');
-    refineSheet.append(ui.field(t.session, sessionSelect), refineActs, refineDisk, refineLine, mixLine);
+    refineSheet.append(
+      ui.field(t.session, sessionSelect),
+      outputRow,
+      outputLine,
+      refineActs,
+      refineDisk,
+      refineLine,
+      mixLine,
+    );
 
     // 顶部「最近翻唱」：原声/成品、体积、时间、时长、音色，以及继续编辑 / 另存 / 删除与保留策略。
     const recentSheet = ui.foldSheet('rvc-cover-recent', { title: t.recentTitle, desc: t.recentHint });
@@ -959,6 +994,91 @@ const coverPanel: WebUiPanel = {
       fileInput.setAttribute('aria-label', mode === 'empty' ? t.filePick : `${t.file}：${badge} ${name}`);
     }
 
+    // ---- 结果编辑的成品选择 ------------------------------------------------
+    function outputKindLabel(item: SessionOutputFile): string {
+      return item.kind === 'master' ? t.outputKindMaster : t.outputKindMix;
+    }
+
+    function outputLabel(item: SessionOutputFile): string {
+      const time = new Date(item.at).toLocaleTimeString();
+      return t.outputOption(time, item.format.toUpperCase(), ui.fmt.bytes(item.bytes), outputKindLabel(item));
+    }
+
+    /** 把所选成品载入顶部播放器与下载链接；切换会话/成品时都走这里。 */
+    async function loadOutput(key: string): Promise<void> {
+      const item = outputFiles.find((f) => f.path === key);
+      if (!item || !selectedId) return;
+      const token = ++outputSeq;
+      try {
+        const blob = await ctx.invokeBinary('refineAudio', [selectedId, item.index, item.kind]);
+        if (token !== outputSeq) return;
+        if (url) URL.revokeObjectURL(url);
+        url = URL.createObjectURL(blob);
+        audio.src = url;
+        audio.hidden = false;
+        dl.href = url;
+        dl.download = `${item.kind === 'master' ? 'master' : 'cover'}-${selectedId}.${item.format}`;
+        dl.hidden = false;
+      } catch (err) {
+        if (token !== outputSeq) return;
+        outputLoadKey = '';
+        clearOutputPlayer();
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      }
+    }
+
+    /** 清空顶部播放器与下载链接，避免切会话/文件被删后还指着上一个文件。 */
+    function clearOutputPlayer(): void {
+      stopPreview();
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.hidden = true;
+      dl.removeAttribute('href');
+      dl.hidden = true;
+      if (url) {
+        URL.revokeObjectURL(url);
+        url = null;
+      }
+    }
+
+    /** 选了哪条成品：播放器、下载、另存与 A/B 的「改动后」一侧都指向它。 */
+    function chooseOutput(key: string): void {
+      pickedOutput = key;
+      outputLoadKey = '';
+      abKey = '';
+      stopPreview();
+      void loadOutput(key);
+      if (currentSession) renderAB(currentSession, state?.job?.phase === 'working');
+    }
+
+    /** 按 refineState 的 `files` 重建下拉；默认最近一条，用户选过的路径还在就保留。 */
+    function renderOutputs(r: RefineState, busy: boolean): void {
+      const files = r.files ?? [];
+      if ((r.session?.id ?? '') !== outputsSessionId) {
+        outputsSessionId = r.session?.id ?? '';
+        pickedOutput = '';
+        outputLoadKey = '';
+        outputSeq += 1;
+        clearOutputPlayer();
+      }
+      outputFiles = files;
+      if (!files.some((f) => f.path === pickedOutput)) {
+        pickedOutput = files.length ? files[files.length - 1]!.path : '';
+        outputLoadKey = '';
+      }
+      fillSelect(ui, outputSelect, files.map((f) => ({ value: f.path, label: outputLabel(f) })));
+      if (pickedOutput) outputSelect.value = pickedOutput;
+      outputSelect.disabled = busy || !files.length;
+      outputRow.hidden = !files.length;
+      outputLine.hidden = !r.session;
+      outputLine.textContent = files.length ? t.outputHint : t.outputNone;
+      if (pickedOutput && outputLoadKey !== pickedOutput) {
+        outputLoadKey = pickedOutput;
+        void loadOutput(pickedOutput);
+      }
+    }
+
     /** 主按钮在「开始翻唱 / 重新翻唱 / 重新混音 / 重新翻唱混音」之间切换，并说明本次会做什么。 */
     function updateCoverButton(): void {
       const action = actionOf();
@@ -973,7 +1093,7 @@ const coverPanel: WebUiPanel = {
         : { inference: false, mix: false };
       const summary = selectedId ? summaries.find((s) => s.id === selectedId) : undefined;
       // 原地重跑必须有可用源：会话里有原声副本，或用户刚选了一个新文件；重混不需要。
-      const needSource = (action === 'rerun' || action === 'rerunMix') && !summary?.source;
+      const needSource = actionNeedsSource(action) && !summary?.source;
       dirtyLine.textContent = needSource ? t.needSource
         : !selectedId ? ''
           : dirty.inference && dirty.mix ? t.coverDirtyBoth
@@ -998,6 +1118,11 @@ const coverPanel: WebUiPanel = {
       file = null;
       fileInput.value = '';
       bindSource();
+      // 成品选择也回到这个会话的最近一条。
+      outputsSessionId = '';
+      pickedOutput = '';
+      outputLoadKey = '';
+      outputSeq += 1;
       mixKey = '';
       rangeParamsKey = '';
       peaks = null;
@@ -1077,9 +1202,15 @@ const coverPanel: WebUiPanel = {
       }
       const form = ui.h('div', 'rvc-recent-form');
       const name = ui.input({ value: `cover-${songName(s)}` });
+      // 当前会话有选中的成品时，另存默认就存它；其它会话仍按最新混音。
+      const picked = s.id === selectedId ? outputFiles.find((f) => f.path === pickedOutput) : undefined;
       const which = ui.select({
-        value: 'output',
+        value: picked ? 'current' : 'output',
         options: [
+          ...(picked ? [{
+            value: 'current',
+            label: t.exportCurrent(outputKindLabel(picked), picked.format.toUpperCase()),
+          }] : []),
           { value: 'output', label: t.exportOutput },
           ...(s.source ? [{ value: 'source', label: t.exportSource }] : []),
         ],
@@ -1128,9 +1259,12 @@ const coverPanel: WebUiPanel = {
     ): Promise<void> {
       line.textContent = t.exportHint;
       line.classList.remove('bad');
+      const picked = which.value === 'current'
+        ? outputFiles.find((f) => f.path === pickedOutput)
+        : undefined;
       const ext = which.value === 'source'
         ? extOf(s.source?.file ?? '')
-        : `.${s.outputFiles[s.outputFiles.length - 1]?.format ?? 'wav'}`;
+        : picked ? `.${picked.format}` : `.${s.outputFiles[s.outputFiles.length - 1]?.format ?? 'wav'}`;
       const base = (name.value.trim() || `cover-${songName(s)}`)
         .replace(/\.(wav|mp3|flac|ogg|m4a)$/i, '')
         .replace(/[\\/:*?"<>|]/g, ' ')
@@ -1148,9 +1282,10 @@ const coverPanel: WebUiPanel = {
         }
       }
       try {
+        const args = picked ? [s.id, picked.kind, picked.index] : [s.id, which.value];
         const r = await ctx.invoke<{
           name: string; ext: string; bytes: number; mime: string; base64: string;
-        }>('sessionFile', [s.id, which.value]);
+        }>('sessionFile', args);
         const blob = blobFromBase64(r.base64, r.mime);
         if (handle) {
           const writable = await handle.createWritable();
@@ -1296,6 +1431,8 @@ const coverPanel: WebUiPanel = {
       } else if (!state?.ready && !pitchData) {
         pitchLine.textContent = t.pitchNeedsReady;
       }
+      currentSession = session;
+      renderOutputs(r, busy);
       renderAB(session, busy);
       refineDisk.textContent = t.refineDisk(r.days, r.maxGb);
       // 保留策略与配置页同一份设置：轮询时刷新，正在输入的框不抢。
@@ -1562,16 +1699,21 @@ const coverPanel: WebUiPanel = {
       return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString();
     }
 
-    /** 载入最近两条成品，保留当前播放位置；切会话/新成品时自动重载。 */
-    async function loadAB(aIndex: number, bIndex: number): Promise<void> {
+    function abSideLabel(item: SessionOutputFile | undefined): string {
+      if (!item) return '';
+      return [clockOf(item.at), item.kind === 'master' ? t.masterTag : ''].filter(Boolean).join(' ');
+    }
+
+    /** 载入 A/B 两条：A = 所选成品的上一条，B = 所选成品；保留当前播放位置。 */
+    async function loadAB(a: SessionOutputFile, b: SessionOutputFile): Promise<void> {
       if (!selectedId) return;
       const token = ++abToken;
       abLoaded = false;
       abLine.textContent = t.abLoading;
       try {
         const [blobA, blobB] = await Promise.all([
-          ctx.invokeBinary('refineAudio', [selectedId, aIndex]),
-          ctx.invokeBinary('refineAudio', [selectedId, bIndex]),
+          ctx.invokeBinary('refineAudio', [selectedId, a.index, a.kind]),
+          ctx.invokeBinary('refineAudio', [selectedId, b.index, b.kind]),
         ]);
         if (token !== abToken) return;
         const wasPlaying = !abCurrent().paused;
@@ -1588,8 +1730,8 @@ const coverPanel: WebUiPanel = {
         const at = Number.isFinite(position) && position > 0 && position < duration ? position : 0;
         abAudioA.currentTime = at;
         abAudioB.currentTime = at;
-        abLabelA = clockOf(abOutputs[aIndex]?.at);
-        abLabelB = clockOf(abOutputs[bIndex]?.at);
+        abLabelA = abSideLabel(a);
+        abLabelB = abSideLabel(b);
         abABtn.textContent = t.abA(abLabelA ? ` · ${abLabelA}` : '');
         abBBtn.textContent = t.abB(abLabelB ? ` · ${abLabelB}` : '');
         abLoaded = true;
@@ -1604,19 +1746,21 @@ const coverPanel: WebUiPanel = {
     }
 
     function renderAB(session: RefineSession | null, busy: boolean): void {
-      abOutputs = session?.outputs ?? [];
-      const pair = abOutputs.slice(-2);
-      const key = session ? `${session.id}:${pair.map((item) => item.path).join('|')}` : '';
+      const index = outputFiles.findIndex((f) => f.path === pickedOutput);
+      const b = index >= 0 ? outputFiles[index] : outputFiles[outputFiles.length - 1];
+      const a = index > 0 ? outputFiles[index - 1] : outputFiles.find((f) => f.path !== b?.path);
+      const key = session && a && b ? `${session.id}:${a.path}|${b.path}` : '';
       if (key !== abKey) {
         abKey = key;
-        if (!session || pair.length < 2) {
+        if (!session || !a || !b) {
+          abToken += 1;
           abLoaded = false;
           stopAB();
           abAudioA.removeAttribute('src');
           abAudioB.removeAttribute('src');
           abLine.textContent = t.abNeedTwo;
         } else {
-          void loadAB(abOutputs.length - 2, abOutputs.length - 1);
+          void loadAB(a, b);
         }
       }
       const ready = abLoaded && !busy;
@@ -2220,6 +2364,9 @@ const coverPanel: WebUiPanel = {
       }
       if (!s.resultReady || settledKey === key) return;
       settledKey = key;
+      // 这次任务多半新增了一条成品：让选择器回到最新一条，播放器/下载随选择器重载。
+      pickedOutput = '';
+      outputLoadKey = '';
       // 任务真的跑完了才算「生效」：改了又改回去的判定从这里重新起步。
       if (pendingApplied && (job.kind === 'cover' || job.kind === 'remix')) {
         applied = pendingApplied;
