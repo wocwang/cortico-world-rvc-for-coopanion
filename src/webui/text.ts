@@ -167,6 +167,9 @@ const TEXT = {
     segmentRevert: '还原',
     segmentCut: '切开',
     segmentMerge: '并入下一段',
+    segmentAudition: '试听',
+    segmentAuditionLine: (start: string, end: string) => `试听 ${start} – ${end}（前后各留 0.3 秒上下文）`,
+    segmentAuditionFailed: '试听失败',
     segmentState: (revision: number, muted: boolean, backed: boolean) => [
       revision > 0 ? `已重做 ${revision} 次` : '原始',
       muted ? '静音' : '',
@@ -388,6 +391,9 @@ const TEXT = {
     segmentRevert: 'Revert',
     segmentCut: 'Split',
     segmentMerge: 'Merge next',
+    segmentAudition: 'Audition',
+    segmentAuditionLine: (start: string, end: string) => `Auditioning ${start} – ${end} (0.3 s of context on each side)`,
+    segmentAuditionFailed: 'Audition failed',
     segmentState: (revision: number, muted: boolean, backed: boolean) => [
       revision > 0 ? `re-run ${revision}×` : 'original',
       muted ? 'muted' : '',

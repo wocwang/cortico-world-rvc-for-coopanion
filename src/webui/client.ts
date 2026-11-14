@@ -9,6 +9,7 @@ import type { WebUiClientBundle, WebUiPanel, WebUiPanelContext, WebUi, Disposabl
 import { panelText } from './text.ts';
 import { abRange, abWrap, carryPosition } from './ab.ts';
 import { coverAction, coverDirty, type CoverAction, type CoverParams } from './dirty.ts';
+import { segmentWindow } from './preview.ts';
 import type { PitchAnalysis } from '../pitch.ts';
 import './style.css';
 
@@ -817,8 +818,9 @@ const coverPanel: WebUiPanel = {
 
     ctx.root.append(recentSheet.el, sheet, audio, resultLine, dl, refineSheet, waveSheet, masterSheet, segmentSheet, abSheet, abAudioA, abAudioB, msg);
     ctx.own(disposable(() => {
-      stopPreviewTimer();
+      stopPreview();
       stopAB();
+      if (previewCtx) void previewCtx.close();
       if (abUrlA) URL.revokeObjectURL(abUrlA);
       if (abUrlB) URL.revokeObjectURL(abUrlB);
     }));
@@ -1279,8 +1281,12 @@ const coverPanel: WebUiPanel = {
         const mergeBtn = ui.button(t.segmentMerge, {
           size: 'sm', onClick: () => void segmentAction('segmentMerge', segment),
         });
+        const auditionBtn = ui.button(t.segmentAudition, {
+          size: 'sm', onClick: () => void auditionSegment(segment),
+        });
+        auditionBtn.dataset.needModel = '1';
         const rowActs = ui.actions();
-        rowActs.append(redoBtn, muteBtn, revertBtn, cutBtn, mergeBtn);
+        rowActs.append(auditionBtn, redoBtn, muteBtn, revertBtn, cutBtn, mergeBtn);
 
         const status = ui.h('div', 'rvc-detail', t.segmentState(segment.revision, Boolean(segment.muted), Boolean(segment.backup)));
         const row = ui.h('div', 'rvc-seg');
@@ -1288,6 +1294,7 @@ const coverPanel: WebUiPanel = {
         segmentList.append(row);
         redoBtn.disabled = busy || !state?.ready;
         revertBtn.disabled = busy || !state?.ready;
+        auditionBtn.disabled = busy || !state?.ready;
         muteBtn.disabled = busy;
         cutBtn.disabled = busy;
         mergeBtn.disabled = busy;
@@ -1419,6 +1426,8 @@ const coverPanel: WebUiPanel = {
     /** 切到 A 或 B：先搬 currentTime，再决定是否继续播。 */
     async function abPlay(which: 'A' | 'B'): Promise<void> {
       if (!abLoaded) return;
+      // 互斥：A/B 一开声就停掉试听，避免两个播放器叠在一起。
+      stopPreview();
       const from = abCurrent();
       const to = abEl(which);
       const playing = !from.paused;
@@ -1916,6 +1925,87 @@ const coverPanel: WebUiPanel = {
       }
     }
 
+    /** 试听播放层的 40 ms 淡出：只作用在播放上，不写进文件，避免段边界「啪」一声。 */
+    const PREVIEW_FADE_SEC = 0.04;
+    let previewGain: GainNode | null = null;
+    let previewCtx: AudioContext | null = null;
+
+    function previewGainNode(): GainNode | null {
+      if (previewGain) return previewGain;
+      const Ctor = window.AudioContext
+        ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctor) return null;
+      try {
+        previewCtx = new Ctor();
+        previewGain = previewCtx.createGain();
+        previewCtx.createMediaElementSource(audio).connect(previewGain).connect(previewCtx.destination);
+      } catch {
+        previewGain = null;
+        return null;
+      }
+      return previewGain;
+    }
+
+    /** 互斥：试听一开始就停掉 A/B，两个播放器不再同时出声。 */
+    function stopPreview(): void {
+      stopPreviewTimer();
+      audio.pause();
+      if (previewGain) previewGain.gain.value = 1;
+    }
+
+    /** 在同一个 audio 元素上只播 [from,to)，末尾 40 ms 线性淡出。 */
+    function playWindow(from: number, to: number): void {
+      stopAB();
+      const gain = previewGainNode();
+      if (gain && previewCtx) {
+        gain.gain.cancelScheduledValues(previewCtx.currentTime);
+        gain.gain.setValueAtTime(1, previewCtx.currentTime);
+      }
+      if (previewCtx) void previewCtx.resume().catch(() => undefined);
+      audio.currentTime = Math.max(0, from);
+      void audio.play().catch(() => undefined);
+      stopPreviewTimer();
+      const tick = (): void => {
+        if (audio.paused) {
+          if (gain) gain.gain.value = 1;
+          previewTimer = 0;
+          return;
+        }
+        const remain = to - audio.currentTime;
+        if (gain) gain.gain.value = remain <= PREVIEW_FADE_SEC ? Math.max(0, remain / PREVIEW_FADE_SEC) : 1;
+        if (remain <= 0) {
+          audio.pause();
+          audio.currentTime = Math.max(0, from);
+          if (gain) gain.gain.value = 1;
+          previewTimer = 0;
+          return;
+        }
+        previewTimer = requestAnimationFrame(tick);
+      };
+      previewTimer = requestAnimationFrame(tick);
+    }
+
+    /** 用当前滑杆参数混一条临时成品（不写 outputs、不改会话）。 */
+    async function auditionPreview(from: number, to: number): Promise<void> {
+      msg.textContent = t.previewing;
+      const r = await ctx.invoke<JobResult>('refinePreview', [selectedId, {
+        vocalGainDb: Number(vocalGainDb.input.value),
+        instGainDb: Number(instGainDb.input.value),
+        fadeInSec: Number(fadeIn.input.value),
+        fadeOutSec: Number(fadeOut.input.value),
+        format: 'wav',
+      }]);
+      if (r.error || !r.base64) throw new Error(r.error ?? '没有拿到音频');
+      const blob = blobFromBase64(r.base64, r.mime ?? 'audio/wav');
+      if (url) URL.revokeObjectURL(url);
+      url = URL.createObjectURL(blob);
+      audio.src = url;
+      audio.hidden = false;
+      msg.textContent = '';
+      if (audio.readyState >= 1) playWindow(from, to);
+      else audio.addEventListener('loadedmetadata', () => playWindow(from, to), { once: true });
+    }
+
     /** 用当前滑杆参数混出临时成品，只播放选区那一段。 */
     async function auditionRange(): Promise<void> {
       msg.textContent = '';
@@ -1925,46 +2015,35 @@ const coverPanel: WebUiPanel = {
       if (!peaks || selEnd - selStart < 0.05) { msg.textContent = t.rangeSelectFirst; msg.classList.add('bad'); return; }
       const from = selStart;
       const to = selEnd;
-      msg.textContent = t.previewing;
       auditionBtn.disabled = true;
       try {
-        const r = await ctx.invoke<JobResult>('refinePreview', [selectedId, {
-          vocalGainDb: Number(vocalGainDb.input.value),
-          instGainDb: Number(instGainDb.input.value),
-          fadeInSec: Number(fadeIn.input.value),
-          fadeOutSec: Number(fadeOut.input.value),
-          format: mixFormat.value,
-        }]);
-        if (r.error || !r.base64) throw new Error(r.error ?? '没有拿到音频');
-        const blob = blobFromBase64(r.base64, r.mime ?? 'audio/wav');
-        if (url) URL.revokeObjectURL(url);
-        url = URL.createObjectURL(blob);
-        audio.src = url;
-        audio.hidden = false;
-        msg.textContent = '';
-        const playSpan = (): void => {
-          audio.currentTime = from;
-          void audio.play().catch(() => undefined);
-          stopPreviewTimer();
-          const tick = (): void => {
-            if (audio.paused) { previewTimer = 0; return; }
-            if (audio.currentTime >= to) {
-              audio.pause();
-              audio.currentTime = from;
-              previewTimer = 0;
-              return;
-            }
-            previewTimer = requestAnimationFrame(tick);
-          };
-          previewTimer = requestAnimationFrame(tick);
-        };
-        if (audio.readyState >= 1) playSpan();
-        else audio.addEventListener('loadedmetadata', playSpan, { once: true });
+        await auditionPreview(from, to);
       } catch (err) {
         msg.textContent = errText(err);
         msg.classList.add('bad');
       } finally {
         auditionBtn.disabled = !(state?.ready && selectedId);
+      }
+    }
+
+    /** 段落试听：前后各留 0.3 秒上下文，播放层 40 ms 淡出，不写 outputs。 */
+    async function auditionSegment(segment: RefineSession['segments'][number]): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      const { from, to } = segmentWindow(segment.start, segment.end, peaks?.durationSec ?? 0);
+      // 选区跟着这一段走，波形高亮与 A/B 循环都落到同一个窗口。
+      selStart = from;
+      selEnd = to;
+      updateRangeLine();
+      drawWave();
+      try {
+        await auditionPreview(from, to);
+        msg.textContent = t.segmentAuditionLine(fmtSeconds(segment.start), fmtSeconds(segment.end));
+      } catch (err) {
+        msg.textContent = `${t.segmentAuditionFailed}：${errText(err)}`;
+        msg.classList.add('bad');
       }
     }
 
