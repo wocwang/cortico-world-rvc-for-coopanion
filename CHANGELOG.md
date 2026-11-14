@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.17 — 2026-11-14
+
+- 修 A/B 切换后慢放：A/B 计时器原先每帧都写 `currentTime`（即使值没变），
+  浏览器会当成一次 seek 反复重解码，播放明显变慢、发顿。改为只在越过循环终点时
+  跳回起点（`abSeek` 返回 null 时不动），切换位置仍由 `carryPosition` 原样搬运。
+  实测两条成品均为 WAV 44.1 kHz / 2 声道 / 139.861s，未设置 `playbackRate`。
+- 推理内存：worker 每个重任务结束后 `gc.collect()`，Windows 上再 `msvcrt._heapmin()`
+  把已释放的堆还给系统；推理失败命中 `_ArrayMemoryError` / `MemoryError` /
+  `Unable to allocate` 时，World 主动停掉 worker（不设手动停止印记，下次请求自动重启），
+  并在面板错误里说明内存不足与恢复方式。
+- 实测：140 秒会话连续原地重跑 3 次，worker Private 7811→7719 MB（-92 MB），
+  conv 始终 139.861 秒；复现截图报错时系统提交内存已达 78.4/79.2 GB，
+  新建 worker 直接报 WinError 1455（页面文件太小），属系统内存耗尽而非插件逻辑错误。
+
 ## 0.4.16 — 2026-11-14
 
 - 翻唱页新增「保存原声副本」勾选（默认勾上）：勾了才把原文件复制进会话目录；
