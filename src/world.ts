@@ -92,6 +92,11 @@ export function hasUvr5(uvrDir: string): boolean {
   }
 }
 
+/** 推理失败是不是内存不足（worker 堆膨胀 / 系统提交内存吃紧）。 */
+export function isMemoryError(message: string): boolean {
+  return /(_ArrayMemoryError|MemoryError|Unable to allocate|out of memory)/i.test(message);
+}
+
 /** 另存时交给浏览器的 MIME：按扩展名映射，未知按二进制。 */
 const AUDIO_MIME: Record<string, string> = {
   '.wav': 'audio/wav',
@@ -1269,7 +1274,18 @@ export class RvcWorld implements World {
         this.job = { kind, at, phase: 'error', detail: '失败', error: '没有拿到音频' };
       }
     }).catch((err) => {
-      this.job = { kind, at, phase: 'error', detail: '失败', error: err instanceof Error ? err.message : String(err) };
+      const message = err instanceof Error ? err.message : String(err);
+      if (isMemoryError(message)) {
+        // 提交内存被 worker 自己越吃越多时，30 MB 的分配也会失败。把 worker 停掉把内存还给系统，
+        // 下一次请求会自动拉起新进程；不设 engineHeld，用户不需要再手动点「启动引擎」。
+        void this.engine?.stop().catch(() => undefined);
+        this.job = {
+          kind, at, phase: 'error', detail: '失败',
+          error: `${message}\n\n内存不足：已停止 RVC 引擎释放内存。关掉占内存的程序后再点一次，引擎会自动重新启动。`,
+        };
+        return;
+      }
+      this.job = { kind, at, phase: 'error', detail: '失败', error: message };
     }).finally(() => {
       // 任务结束后再排期：`armIdle()` 在 job 还是 working 时会直接返回。
       this.armIdle();

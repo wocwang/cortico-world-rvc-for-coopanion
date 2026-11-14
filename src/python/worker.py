@@ -242,6 +242,27 @@ def master_audio(audio, sample_rate, target_lufs, ceiling_db=-1.0):
     }
 
 
+def _release_memory() -> None:
+    """把本轮推理释放的堆还给系统。
+
+    Windows 上 Python/CRT 的堆不会因为引用归零就收缩；反复整首重跑会把提交内存
+    越推越高，最后连 30 MB 的 numpy 分配都会失败（_ArrayMemoryError）。
+    """
+    try:
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.CDLL("msvcrt")._heapmin()
+        except Exception:
+            pass
+
+
 def main() -> int:
     if len(sys.argv) < 4:
         print("usage: worker.py <codeDir> <voicesDir> <assetsDir>", file=sys.stderr)
@@ -1417,37 +1438,28 @@ def main() -> int:
         op = req.get("op")
         if op == "shutdown":
             break
-        if op == "convert":
-            convert(req)
+        handler = {
+            "convert": convert,
+            "separate": separate,
+            "cover": cover,
+            "reconvert": reconvert,
+            "remix": remix,
+            "convertRange": convert_range,
+            "peaks": peaks,
+            "restoreRange": restore_range,
+            "f0": export_f0,
+            "master": master,
+        }.get(op)
+        if not handler:
+            print("[rvc] 未知指令：%s" % op, file=sys.stderr)
             continue
-        if op == "separate":
-            separate(req)
-            continue
-        if op == "cover":
-            cover(req)
-            continue
-        if op == "reconvert":
-            reconvert(req)
-            continue
-        if op == "remix":
-            remix(req)
-            continue
-        if op == "convertRange":
-            convert_range(req)
-            continue
-        if op == "peaks":
-            peaks(req)
-            continue
-        if op == "restoreRange":
-            restore_range(req)
-            continue
-        if op == "f0":
-            export_f0(req)
-            continue
-        if op == "master":
-            master(req)
-            continue
-        print("[rvc] 未知指令：%s" % op, file=sys.stderr)
+        try:
+            handler(req)
+        finally:
+            # 整首重跑/切片推理会留下大量已释放但不还给系统的堆；不收缩的话，
+            # 反复重跑会把提交内存越推越高，最后连 30 MB 的分配都失败。
+            if op != "peaks":
+                _release_memory()
     return 0
 
 

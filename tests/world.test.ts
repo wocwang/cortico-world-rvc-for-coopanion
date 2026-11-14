@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { Logger, WorldHost } from 'cortico/core/types.ts';
 import { RVC_DEFAULTS, configGroups } from '../src/config.ts';
 import { createSession, readSession, writeSession, type RefineSession } from '../src/session.ts';
-import { RvcWorld } from '../src/world.ts';
+import { RvcWorld, isMemoryError } from '../src/world.ts';
 
 const roots: string[] = [];
 const worlds: RvcWorld[] = [];
@@ -297,6 +297,18 @@ describe('母带 / 音高 / A/B 的数据面', () => {
     // 打开时补出 20 秒段落网格，但不会凭空写 masters。
     expect(state.session?.segments.length).toBe(1);
     expect(readSession(dataDir, old.id)?.masters).toBeUndefined();
+  });
+});
+
+describe('内存不足识别', () => {
+  it('认得 numpy / torch 的内存分配失败，普通报错不算', () => {
+    expect(isMemoryError(
+      '【单次推理】状态：失败\nnumpy.core._exceptions._ArrayMemoryError: Unable to allocate 30.8 MiB for an array with shape (1314, 8, 768) and data type float32',
+    )).toBe(true);
+    expect(isMemoryError('torch.OutOfMemoryError: CUDA out of memory.')).toBe(true);
+    expect(isMemoryError('MemoryError')).toBe(true);
+    expect(isMemoryError('读不到人声分轨：vocals.wav')).toBe(false);
+    expect(isMemoryError('RVC 推理超过 600 秒')).toBe(false);
   });
 });
 
