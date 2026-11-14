@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { abRange, abWrap, carryPosition } from '../src/webui/ab.ts';
+import { abRange, abSeek, abWrap, carryPosition } from '../src/webui/ab.ts';
 
 describe('carryPosition', () => {
   it('A/B 切换只搬播放位置，不从头播', () => {
@@ -43,5 +43,23 @@ describe('abWrap', () => {
 
   it('非法区间不动播放位置', () => {
     expect(abWrap(5, 10, 10)).toBe(5);
+  });
+});
+
+describe('abSeek：每帧只在越界时 seek', () => {
+  it('区间内返回 null，不写 currentTime', () => {
+    expect(abSeek(0, 0, 139.861)).toBeNull();
+    expect(abSeek(1.89, 0, 139.861)).toBeNull();
+    expect(abSeek(139.86, 0, 139.861)).toBeNull();
+  });
+
+  it('越过终点才跳回起点', () => {
+    expect(abSeek(139.861, 0, 139.861)).toBe(0);
+    expect(abSeek(18.2, 12, 18)).toBe(12);
+  });
+
+  it('没有有效选区时永远不 seek', () => {
+    expect(abSeek(42, 0, 0)).toBeNull();
+    expect(abSeek(42, 10, 10)).toBeNull();
   });
 });

@@ -7,7 +7,7 @@
  */
 import type { WebUiClientBundle, WebUiPanel, WebUiPanelContext, WebUi, Disposable } from 'cortico/web/shared/client-panel.ts';
 import { panelText } from './text.ts';
-import { abRange, abWrap, carryPosition } from './ab.ts';
+import { abRange, abSeek, carryPosition } from './ab.ts';
 import { coverAction, coverDirty, type CoverAction, type CoverParams } from './dirty.ts';
 import { segmentWindow } from './preview.ts';
 import type { PitchAnalysis } from '../pitch.ts';
@@ -1480,7 +1480,9 @@ const coverPanel: WebUiPanel = {
           return;
         }
         const range = abLoopRange();
-        if (range.end > range.start) el.currentTime = abWrap(el.currentTime, range.start, range.end);
+        // 只在越过终点时跳回起点；每帧无脑写 currentTime 会反复 seek，播起来像慢放。
+        const seek = abSeek(el.currentTime, range.start, range.end);
+        if (seek !== null) el.currentTime = seek;
         updateABLine();
         abTimer = requestAnimationFrame(tick);
       };

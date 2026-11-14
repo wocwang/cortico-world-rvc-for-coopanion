@@ -32,3 +32,14 @@ export function abWrap(position: number, start: number, end: number): number {
   if (!(end > start) || position < end) return position;
   return start;
 }
+
+/**
+ * 每帧算「要不要 seek」：只有真的越过终点才返回落点，否则返回 null。
+ *
+ * 不要每帧都写 `currentTime`——即使写的是同一个值，浏览器也会当成一次 seek，
+ * 反复重解码会让播放听起来变慢/一顿一顿。
+ */
+export function abSeek(position: number, start: number, end: number): number | null {
+  const next = abWrap(position, start, end);
+  return next === position ? null : next;
+}
