@@ -92,6 +92,17 @@ export function hasUvr5(uvrDir: string): boolean {
   }
 }
 
+/** 另存文件名：去掉路径分隔符、Windows 保留字符与控制符；空名字回退到 `fallback`。 */
+export function exportName(input: string, fallback: string): string {
+  const cleaned = input
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[.\s]+|[.\s]+$/g, '')
+    .slice(0, 80)
+    .trim();
+  return cleaned || fallback;
+}
+
 /**
  * 有没有 NVIDIA 显卡：`auto` 档要先知道装哪一档共享运行时（显卡档 4 GB，CPU 档 1 GB）。
  * 查不到就按 CPU 处理——反正装错了也只是慢，不会跑不起来。
@@ -1077,6 +1088,37 @@ export class RvcWorld implements World {
     return { ...this.refineState(), cleaned: result.removed.length, freed: result.freed };
   }
 
+  /** 面板「另存」：宿主只有打开型选择器，所以按用户选的目录 + 名字复制一份，不动会话本身。 */
+  private exportSession(args: unknown[]): Record<string, unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    const targetDir = typeof raw.dir === 'string' ? raw.dir.trim() : '';
+    if (!targetDir || !existsSync(targetDir) || !statSync(targetDir).isDirectory()) {
+      throw new RvcError('param', '保存目录不存在，重新选一个目录');
+    }
+    const which = raw.which === 'source' ? 'source' : 'output';
+    const last = session.outputs[session.outputs.length - 1];
+    const rel = which === 'source' ? session.source.file : last?.path;
+    if (!rel) throw new RvcError('param', which === 'source' ? '这个会话没有原声副本' : '这个会话还没有成品');
+    const source = join(dir, rel);
+    if (!existsSync(source)) throw new RvcError('param', `文件不在了：${rel}`);
+    const ext = extname(rel).toLowerCase() || '.wav';
+    const name = exportName(typeof raw.name === 'string' ? raw.name : '', `cover-${id}`)
+      .replace(/\.(wav|mp3|flac|ogg|m4a)$/i, '');
+    const target = join(targetDir, `${name}${ext}`);
+    try {
+      writeFileSync(target, readFileSync(source));
+    } catch (err) {
+      throw new RvcError('param', `写不进去：${err instanceof Error ? err.message : String(err)}`);
+    }
+    const bytes = statSync(target).size;
+    this.log?.info('另存 RVC 翻唱文件', { id, which, target });
+    return { path: target, name: `${name}${ext}`, bytes };
+  }
+
   /** 双阈值清理：只动 `sessions/`，正在用的会话永远跳过。 */
   private gcSessions(): { removed: string[]; freed: number } {
     const result = gcSessions(this.opts.dataDir, {
@@ -1135,6 +1177,7 @@ export class RvcWorld implements World {
       return this.previewSession(String(args[0] ?? ''), raw);
     }
     if (method === 'sessionDelete') return this.deleteSession(String(args[0] ?? ''));
+    if (method === 'sessionExport') return this.exportSession(args);
     if (method === 'cleanupSessions') return this.cleanupSessions();
     if (method === 'storage') return { items: this.storage() };
     if (method === 'uninstall') return this.uninstall(String(args[0] ?? ''));

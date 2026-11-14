@@ -27,3 +27,11 @@
 .rvc-pitch-row { display: flex; align-items: center; justify-content: space-between; gap: .6em; font-size: .85em; font-variant-numeric: tabular-nums; }
 .rvc-pitch-row span { opacity: .8; }
 .rvc-pitch-row button { flex: none; }
+.rvc-mix { margin: .2em 0 .6em; padding-top: .4em; border-top: 1px dashed var(--line, rgba(127, 127, 127, .25)); }
+.rvc-mix[hidden] { display: none; }
+.rvc-recent { border: 1px solid var(--line, rgba(127, 127, 127, .25)); border-radius: 6px; padding: .5em .6em; margin: .4em 0; }
+.rvc-recent-head { display: flex; gap: .6em; align-items: baseline; font-size: .9em; }
+.rvc-recent-head strong { flex: none; }
+.rvc-recent-head span { opacity: .7; font-variant-numeric: tabular-nums; }
+.rvc-recent .rvc-acts { margin-top: .3em; }
+.rvc-recent-form { margin: .3em 0 .6em; padding: .5em .6em; border-radius: 6px; background: var(--bg-2, rgba(127, 127, 127, .1)); }

@@ -8,6 +8,7 @@
 import type { WebUiClientBundle, WebUiPanel, WebUiPanelContext, WebUi, Disposable } from 'cortico/web/shared/client-panel.ts';
 import { panelText } from './text.ts';
 import { abRange, abWrap, carryPosition } from './ab.ts';
+import { coverAction, coverDirty, type CoverAction, type CoverParams } from './dirty.ts';
 import type { PitchAnalysis } from '../pitch.ts';
 import './style.css';
 
@@ -602,6 +603,7 @@ const coverPanel: WebUiPanel = {
     fileInput.accept = 'audio/*,.wav,.flac,.mp3,.ogg,.m4a';
     const voiceSelect = ui.select({ options: [] });
 
+    // 第一组：会重跑变声的参数。
     const pitch = ui.input({ type: 'number', value: '0' });
     pitch.min = '-24';
     pitch.max = '24';
@@ -614,37 +616,45 @@ const coverPanel: WebUiPanel = {
     protect.min = '0';
     protect.max = '0.5';
     protect.step = '0.01';
-    const vocalGain = ui.input({ type: 'number', value: '0' });
-    vocalGain.min = '-12';
-    vocalGain.max = '12';
-    vocalGain.step = '1';
-    const format = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
     const chunk = ui.select({
       value: 'chunk',
       options: [{ value: 'chunk', label: t.chunkSlice }, { value: 'full', label: t.chunkFull }],
     });
-
-    const knobs = ui.h('div', 'rvc-grid');
-    knobs.append(
+    const inferKnobs = ui.h('div', 'rvc-grid');
+    inferKnobs.append(
       ui.field(t.pitch, pitch),
       ui.field(t.indexRate, indexRate),
       ui.field(t.protect, protect),
-      ui.field(t.vocalGain, vocalGain),
-      ui.field(t.format, format),
       ui.field(t.chunkMode, chunk),
     );
 
-    const coverBtn = ui.button(t.cover, { variant: 'primary', size: 'sm', onClick: () => void run() });
+    // 第二组：只影响混音。首次出结果前隐藏，但仍参与「上次生效值」比对。
+    const vocalGainDb = slider(t.vocalGain, -12, 12, 1);
+    const instGainDb = slider(t.instGain, -12, 12, 1);
+    const fadeIn = slider(t.fadeIn, 0, 10, 0.5);
+    const fadeOut = slider(t.fadeOut, 0, 10, 0.5);
+    const mixFormat = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
+    const mixKnobs = ui.h('div', 'rvc-grid');
+    mixKnobs.append(vocalGainDb.field, instGainDb.field, fadeIn.field, fadeOut.field, ui.field(t.format, mixFormat));
+
+    const coverBtn = ui.button(t.cover, { variant: 'primary', size: 'sm', onClick: () => void onCoverClick() });
     const acts = ui.actions();
     acts.append(coverBtn);
+    const dirtyLine = ui.h('div', 'rvc-detail');
+    const mixBlock = ui.h('div', 'rvc-mix');
+    mixBlock.append(ui.h('div', 'rvc-detail', t.coverMixHint), mixKnobs);
+    mixBlock.hidden = true;
 
     sheet.append(
       ui.h('div', 'rvc-detail', t.coverStagesHint),
       ui.field(t.file, fileInput),
       ui.h('div', 'rvc-detail', t.fileHint),
       ui.field(t.voice, voiceSelect),
-      knobs,
+      ui.h('div', 'rvc-detail', t.coverInferHint),
+      inferKnobs,
       acts,
+      dirtyLine,
+      mixBlock,
     );
 
     const audio = ui.h('audio', 'rvc-audio');
@@ -658,6 +668,12 @@ const coverPanel: WebUiPanel = {
     let selectedId = '';
     let mixKey = '';
     let settledKey = '';
+    /** 上次生效的翻唱参数与它对应的会话：按钮文案与动作都按这两组的 dirty 决定。 */
+    let applied: CoverParams | null = null;
+    let appliedSessionId = '';
+    let pendingApplied: CoverParams | null = null;
+    /** 最近一次 refineState 的会话摘要；菜单「另存」要知道原声副本在不在。 */
+    let summaries: SessionSummary[] = [];
     /** 只让最后一次 refineState 请求落地，避免切会话时被慢响应弹回去。 */
     let refineSeq = 0;
     /** 波形包络与当前拖选（秒）。 */
@@ -689,33 +705,8 @@ const coverPanel: WebUiPanel = {
     const refineSheet = ui.section(t.refineTitle, t.refineHint);
     const sessionSelect = ui.select({
       options: [],
-      onChange: (value) => {
-        selectedId = value;
-        mixKey = '';
-        rangeParamsKey = '';
-        peaks = null;
-        peaksKey = '';
-        selStart = 0;
-        selEnd = 0;
-        pitchData = null;
-        pitchKey = '';
-        pitchList.textContent = '';
-        pitchLine.textContent = t.pitchHint;
-        abKey = '';
-        abLoaded = false;
-        stopAB();
-        updateRangeLine();
-        drawWave();
-        void loadRefine(value);
-      },
+      onChange: (value) => chooseSession(value),
     });
-    const vocalGainDb = slider(t.vocalGain, -12, 12, 1);
-    const instGainDb = slider(t.instGain, -12, 12, 1);
-    const fadeIn = slider(t.fadeIn, 0, 10, 0.5);
-    const fadeOut = slider(t.fadeOut, 0, 10, 0.5);
-    const mixFormat = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
-    const mixKnobs = ui.h('div', 'rvc-grid');
-    mixKnobs.append(vocalGainDb.field, instGainDb.field, fadeIn.field, fadeOut.field, ui.field(t.format, mixFormat));
 
     // 选段重跑：波形上拖出 [a,b)，只重渲这一段，区间外样本保持不变。
     const waveSheet = ui.section(t.rangeTitle, t.rangeHint);
@@ -765,16 +756,43 @@ const coverPanel: WebUiPanel = {
     const masterLine = ui.h('div', 'rvc-detail');
     masterSheet.append(ui.field(t.masterPreset, masterPreset), ui.field(t.format, masterFormat), masterActs, masterLine);
 
-    const remixBtn = ui.button(t.remix, { variant: 'primary', size: 'sm', onClick: () => void runRemix() });
+    // 「重新混音」已经并到上面的主按钮（按 dirty 决定只重混还是先重跑变声），这里只留会话与清理。
     const deleteBtn = ui.button(t.sessionDelete, { size: 'sm', onClick: () => void deleteCurrent() });
     const cleanupBtn = ui.button(t.sessionCleanup, { size: 'sm', onClick: () => void cleanup() });
     const refineActs = ui.actions();
-    refineActs.append(remixBtn, deleteBtn, cleanupBtn);
+    refineActs.append(deleteBtn, cleanupBtn);
 
     const refineDisk = ui.h('div', 'rvc-detail');
     const refineLine = ui.h('div', 'rvc-detail');
     const mixLine = ui.h('div', 'rvc-detail');
-    refineSheet.append(ui.field(t.session, sessionSelect), mixKnobs, refineActs, refineDisk, refineLine, mixLine);
+    refineSheet.append(ui.field(t.session, sessionSelect), refineActs, refineDisk, refineLine, mixLine);
+
+    // 顶部「最近翻唱」：原声/成品、体积、时间、时长、音色，以及继续编辑 / 另存 / 删除与保留策略。
+    const recentSheet = ui.foldSheet('rvc-cover-recent', { title: t.recentTitle, desc: t.recentHint });
+    const recentList = ui.h('div');
+    const daysInput = ui.input({ type: 'number', value: '7' });
+    daysInput.min = '0';
+    daysInput.max = '365';
+    daysInput.step = '1';
+    const gbInput = ui.input({ type: 'number', value: '8' });
+    gbInput.min = '0';
+    gbInput.max = '1000';
+    gbInput.step = '1';
+    const retentionSave = ui.button(t.retentionSave, {
+      size: 'sm', onClick: () => void saveRetention(),
+    });
+    const retentionLine = ui.h('div', 'rvc-detail');
+    const retentionRow = ui.h('div', 'rvc-grid');
+    retentionRow.append(ui.field(t.retentionDays, daysInput), ui.field(t.retentionGb, gbInput));
+    const retentionActs = ui.actions();
+    retentionActs.append(retentionSave);
+    recentSheet.body.append(
+      recentList,
+      ui.h('div', 'rvc-detail', t.retentionHint),
+      retentionRow,
+      retentionActs,
+      retentionLine,
+    );
 
     // 段落级参数：默认 20 秒网格，每段独立重做/静音/还原/切分/合并。
     const segmentSheet = ui.section(t.segmentTitle, t.segmentHint);
@@ -797,7 +815,7 @@ const coverPanel: WebUiPanel = {
     abAudioB.hidden = true;
     abSheet.append(abActs, abLine);
 
-    ctx.root.append(sheet, audio, resultLine, dl, refineSheet, waveSheet, masterSheet, segmentSheet, abSheet, abAudioA, abAudioB, msg);
+    ctx.root.append(recentSheet.el, sheet, audio, resultLine, dl, refineSheet, waveSheet, masterSheet, segmentSheet, abSheet, abAudioA, abAudioB, msg);
     ctx.own(disposable(() => {
       stopPreviewTimer();
       stopAB();
@@ -811,6 +829,12 @@ const coverPanel: WebUiPanel = {
       msg.classList.remove('bad');
       if (file) resultLine.textContent = `${file.name} · ${ui.fmt.bytes(file.size)}`;
     });
+
+    // 任一参数变动都重算「本次会做什么」；改回去就恢复原样，不靠手点。
+    for (const el of [pitch, indexRate, protect, vocalGainDb.input, instGainDb.input, fadeIn.input, fadeOut.input]) {
+      el.addEventListener('input', updateCoverButton);
+    }
+    for (const el of [chunk, voiceSelect, mixFormat]) el.addEventListener('change', updateCoverButton);
 
     /** 一条 0..N 的滑杆，右侧显示当前值。 */
     function slider(label: string, min: number, max: number, step: number): {
@@ -837,6 +861,238 @@ const coverPanel: WebUiPanel = {
       s.update();
     }
 
+    // ---- 翻唱按钮的语义与「最近翻唱」 -------------------------------------
+    let recentKey = '';
+    let exportForm: HTMLElement | null = null;
+
+    function currentParams(): CoverParams {
+      return {
+        pitch: Number(pitch.value),
+        indexRate: Number(indexRate.value),
+        protect: Number(protect.value),
+        chunk: chunk.value !== 'full',
+        voice: voiceSelect.value || state?.defaultVoice || '',
+        vocalGainDb: Number(vocalGainDb.input.value),
+        instGainDb: Number(instGainDb.input.value),
+        fadeInSec: Number(fadeIn.input.value),
+        fadeOutSec: Number(fadeOut.input.value),
+        format: mixFormat.value,
+      };
+    }
+
+    function lastFormatOf(session: RefineSession): string {
+      return session.outputs.length ? session.outputs[session.outputs.length - 1]!.format : 'wav';
+    }
+
+    function appliedFromSession(session: RefineSession): CoverParams {
+      const defaults = session.converted.defaults;
+      return {
+        pitch: defaults.pitch,
+        indexRate: defaults.indexRate,
+        protect: defaults.protect,
+        chunk: defaults.chunk,
+        voice: voiceSelect.value || state?.defaultVoice || session.engine.voice,
+        vocalGainDb: session.mix.vocalGainDb,
+        instGainDb: session.mix.instGainDb,
+        fadeInSec: session.mix.fadeInSec,
+        fadeOutSec: session.mix.fadeOutSec,
+        format: lastFormatOf(session),
+      };
+    }
+
+    function actionOf(): CoverAction {
+      if (!selectedId || !applied) return 'cover';
+      return coverAction(coverDirty(currentParams(), applied), true);
+    }
+
+    /** 主按钮在「开始翻唱 / 重新翻唱 / 重新混音 / 重新翻唱混音」之间切换，并说明本次会做什么。 */
+    function updateCoverButton(): void {
+      const action = actionOf();
+      coverBtn.textContent =
+        action === 'cover' ? t.cover
+          : action === 'remix' ? t.remix
+            : action === 'rerunMix' ? t.coverRerunMix
+              : t.coverRerun;
+      mixBlock.hidden = !selectedId;
+      const dirty = selectedId && applied
+        ? coverDirty(currentParams(), applied)
+        : { inference: false, mix: false };
+      dirtyLine.textContent = !selectedId ? ''
+        : dirty.inference && dirty.mix ? t.coverDirtyBoth
+          : dirty.inference ? t.coverDirtyInfer
+            : dirty.mix ? t.coverDirtyMix
+              : '';
+      const busy = state?.job?.phase === 'working';
+      coverBtn.disabled = busy || !state?.ready || (action === 'cover' && !state?.uvr5);
+    }
+
+    async function onCoverClick(): Promise<void> {
+      const action = actionOf();
+      if (action === 'remix') return runRemix();
+      if (action === 'rerun' || action === 'rerunMix') return rerunCover();
+      return run();
+    }
+
+    function chooseSession(id: string): void {
+      selectedId = id;
+      sessionSelect.value = id;
+      mixKey = '';
+      rangeParamsKey = '';
+      peaks = null;
+      peaksKey = '';
+      selStart = 0;
+      selEnd = 0;
+      pitchData = null;
+      pitchKey = '';
+      pitchList.textContent = '';
+      pitchLine.textContent = t.pitchHint;
+      abKey = '';
+      abLoaded = false;
+      stopAB();
+      updateRangeLine();
+      drawWave();
+      // 顶部参数等 refineState 回来再按会话回填（置空强制走一次回填）。
+      appliedSessionId = '';
+      void loadRefine(id);
+      sheet.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    /** 会话里的「歌名」：优先用原声副本的文件名，老会话退回 id。 */
+    function songName(s: SessionSummary): string {
+      const base = s.source?.file ?? '';
+      return base ? base.replace(/\.[^.]+$/, '') : s.id;
+    }
+
+    function renderRecent(r: RefineState): void {
+      const key = JSON.stringify(r.sessions.map((s) => [
+        s.id, s.updatedAt, s.bytes, s.voice, s.source, s.outputFiles,
+      ]));
+      if (key === recentKey) return;
+      recentKey = key;
+      exportForm = null;
+      recentList.textContent = '';
+      if (!r.sessions.length) {
+        recentList.append(ui.h('div', 'rvc-detail', t.recentEmpty));
+        return;
+      }
+      for (const s of r.sessions) {
+        const row = ui.h('div', 'rvc-recent');
+        const head = ui.h('div', 'rvc-recent-head');
+        head.append(
+          ui.h('strong', '', s.voice ? t.voiceLabel(s.voice) : t.unknown),
+          ui.h('span', '', t.recentMeta(
+            new Date(s.updatedAt).toLocaleString(),
+            ui.fmt.duration(s.durationSec * 1000),
+            '',
+          )),
+        );
+        const source = ui.h('div', 'rvc-detail', s.source
+          ? t.recentSource(s.source.file, ui.fmt.bytes(s.source.bytes))
+          : t.recentNoSource);
+        const last = s.outputFiles[s.outputFiles.length - 1];
+        const output = ui.h('div', 'rvc-detail', last
+          ? t.recentOutput(last.path.replace(/^out\//, ''), ui.fmt.bytes(last.bytes))
+          : t.recentNoOutput);
+        const acts = ui.actions();
+        acts.append(
+          ui.button(t.recentResume, { size: 'sm', onClick: () => chooseSession(s.id) }),
+          ui.button(t.recentExport, { size: 'sm', onClick: () => toggleExport(row, s) }),
+          ui.button(t.sessionDelete, { size: 'sm', onClick: () => void deleteById(s.id) }),
+        );
+        if (s.id === selectedId) {
+          head.prepend(ui.pill(t.using, 'on'));
+        }
+        row.append(head, source, output, acts);
+        recentList.append(row);
+      }
+    }
+
+    /** 另存：宿主只有打开型选择器，所以先选目录，再用这里的文件名复制一份。 */
+    function toggleExport(row: HTMLElement, s: SessionSummary): void {
+      if (exportForm) {
+        exportForm.remove();
+        exportForm = null;
+      }
+      const form = ui.h('div', 'rvc-recent-form');
+      const name = ui.input({ value: `cover-${songName(s)}` });
+      const which = ui.select({
+        value: 'output',
+        options: [
+          { value: 'output', label: t.exportOutput },
+          ...(s.source ? [{ value: 'source', label: t.exportSource }] : []),
+        ],
+      });
+      const line = ui.h('div', 'rvc-detail', s.source ? '' : t.exportNeedSource);
+      const grid = ui.h('div', 'rvc-grid');
+      grid.append(ui.field(t.exportName, name), ui.field(t.exportWhich, which));
+      const acts = ui.actions();
+      const save = ui.button(t.exportPick, {
+        variant: 'primary', size: 'sm', onClick: () => void doExport(s, name, which, line),
+      });
+      const cancel = ui.button(t.exportCancel, {
+        size: 'sm',
+        onClick: () => {
+          form.remove();
+          if (exportForm === form) exportForm = null;
+        },
+      });
+      acts.append(save, cancel);
+      form.append(grid, acts, line);
+      row.after(form);
+      exportForm = form;
+      if (which.value === 'output' && !s.outputFiles.length) {
+        line.textContent = t.exportNeedOutput;
+      }
+    }
+
+    async function doExport(
+      s: SessionSummary,
+      name: HTMLInputElement,
+      which: HTMLSelectElement,
+      line: HTMLElement,
+    ): Promise<void> {
+      line.textContent = '';
+      line.classList.remove('bad');
+      let dir: string | null = null;
+      try {
+        dir = await ctx.pickPath({ kind: 'directory', title: t.recentExport });
+      } catch (err) {
+        line.textContent = errText(err);
+        line.classList.add('bad');
+        return;
+      }
+      if (!dir) return;
+      try {
+        const r = await ctx.invoke<{ path: string; bytes: number }>('sessionExport', [s.id, {
+          dir, name: name.value, which: which.value,
+        }]);
+        ui.toast(t.exportDone(r.path, ui.fmt.bytes(r.bytes)));
+      } catch (err) {
+        line.textContent = errText(err);
+        line.classList.add('bad');
+      }
+    }
+
+    async function saveRetention(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      retentionLine.classList.remove('bad');
+      const days = Math.max(0, Math.floor(Number(daysInput.value) || 0));
+      const gb = Math.max(0, Number(gbInput.value) || 0);
+      try {
+        await ctx.setConfig('world:rvc:service', {
+          'worlds.rvc.sessionDays': days,
+          'worlds.rvc.sessionMaxGb': gb,
+        });
+        retentionLine.textContent = t.retentionSaved(days, gb);
+        // 配置已经热更新，重读一次让 days/maxGb 与配置页保持同源。
+        await loadRefine(selectedId);
+      } catch (err) {
+        retentionLine.textContent = errText(err);
+        retentionLine.classList.add('bad');
+      }
+    }
+
     function renderRefine(r: RefineState): void {
       fillSelect(ui, sessionSelect, r.sessions.map((s) => ({
         value: s.id,
@@ -845,8 +1101,26 @@ const coverPanel: WebUiPanel = {
           .join(' · '),
       })));
       const session = r.session;
+      summaries = r.sessions;
       selectedId = session?.id ?? '';
       sessionSelect.value = selectedId;
+      // 换会话时把顶部参数按会话回填（「继续编辑」也走这里），之后不再覆盖用户正在改的值。
+      if (session && session.id !== appliedSessionId) {
+        appliedSessionId = session.id;
+        const defaults = session.converted.defaults;
+        pitch.value = String(defaults.pitch);
+        indexRate.value = String(defaults.indexRate);
+        protect.value = String(defaults.protect);
+        chunk.value = defaults.chunk ? 'chunk' : 'full';
+        voiceSelect.value = session.engine.voice || '';
+        setSlider(vocalGainDb, session.mix.vocalGainDb);
+        setSlider(instGainDb, session.mix.instGainDb);
+        setSlider(fadeIn, session.mix.fadeInSec);
+        setSlider(fadeOut, session.mix.fadeOutSec);
+        mixFormat.value = lastFormatOf(session);
+        applied = appliedFromSession(session);
+        mixKey = `${session.id}:${JSON.stringify(session.mix)}`;
+      }
       if (session) {
         // 只在会话或混音参数真的变了时才回填滑杆，避免轮询把用户正在拖的值弹回去。
         const key = `${session.id}:${JSON.stringify(session.mix)}`;
@@ -897,10 +1171,14 @@ const coverPanel: WebUiPanel = {
       rangePitch.disabled = busy || !session || !state?.ready;
       rangeIndex.disabled = busy || !session || !state?.ready;
       rangeProtect.disabled = busy || !session || !state?.ready;
-      remixBtn.disabled = busy || !session || !state?.ready;
       rerunRangeBtn.disabled = busy || !session || !state?.ready;
       auditionBtn.disabled = busy || !session || !state?.ready;
       f0Btn.disabled = busy || !session || !state?.ready;
+      pitch.disabled = busy;
+      indexRate.disabled = busy;
+      protect.disabled = busy;
+      chunk.disabled = busy;
+      voiceSelect.disabled = busy;
       masterPreset.disabled = busy || !session;
       masterFormat.disabled = busy || !session;
       masterBtn.disabled = busy || !session || !state?.ready || !session.outputs.length;
@@ -917,6 +1195,9 @@ const coverPanel: WebUiPanel = {
       }
       renderAB(session, busy);
       refineDisk.textContent = t.refineDisk(r.days, r.maxGb);
+      // 保留策略与配置页同一份设置：轮询时刷新，正在输入的框不抢。
+      if (document.activeElement !== daysInput) daysInput.value = String(r.days);
+      if (document.activeElement !== gbInput) gbInput.value = String(r.maxGb);
       refineLine.textContent = session
         ? [
             session.engine.kind,
@@ -925,7 +1206,9 @@ const coverPanel: WebUiPanel = {
             t.rangeSegments(session.segments.filter((item) => item.kind === 'range').length),
           ].filter(Boolean).join(' · ')
         : t.noSession;
+      renderRecent(r);
       renderSegments(session, busy);
+      updateCoverButton();
     }
 
     /** 渲染 20 秒段落列表；每段带独立参数与重做/静音/还原/切分/合并。 */
@@ -1295,7 +1578,7 @@ const coverPanel: WebUiPanel = {
       state = s;
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
       fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
-      coverBtn.disabled = !s.ready || !s.uvr5 || s.job?.phase === 'working';
+      updateCoverButton();
       if (!s.ready && s.detail) msg.textContent = s.detail;
       else if (!s.uvr5) msg.textContent = t.coverNeedsUvr;
     }
@@ -1308,6 +1591,7 @@ const coverPanel: WebUiPanel = {
       if (!state?.uvr5) { msg.textContent = t.coverNeedsUvr; msg.classList.add('bad'); return; }
       settledKey = '';
       msg.textContent = t.covering;
+      pendingApplied = currentParams();
       coverBtn.disabled = true;
       try {
         const base64 = toBase64(new Uint8Array(await file.arrayBuffer()));
@@ -1317,14 +1601,42 @@ const coverPanel: WebUiPanel = {
           pitch: Number(pitch.value),
           indexRate: Number(indexRate.value),
           protect: Number(protect.value),
-          vocalGain: Number(vocalGain.value),
-          format: format.value,
+          vocalGain: Number(vocalGainDb.input.value),
+          format: mixFormat.value,
           chunk: chunk.value === 'chunk',
         }]);
       } catch (err) {
+        pendingApplied = null;
         msg.textContent = errText(err);
         msg.classList.add('bad');
-        coverBtn.disabled = !(state?.ready && state?.uvr5);
+        updateCoverButton();
+      }
+    }
+
+    /** 原地重新翻唱：复用会话里的分轨与原声副本，更新同一个会话目录。 */
+    async function rerunCover(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      const summary = summaries.find((s) => s.id === selectedId);
+      if (!summary?.source) {
+        // 老会话没有原声副本：只能让用户重新选原声，另起一次翻唱。
+        if (!file) { msg.textContent = t.rerunNeedSource; msg.classList.add('bad'); return; }
+        return run();
+      }
+      settledKey = '';
+      mixLine.textContent = '';
+      msg.textContent = t.covering;
+      pendingApplied = currentParams();
+      coverBtn.disabled = true;
+      try {
+        await ctx.invoke('coverRerun', [selectedId, pendingApplied]);
+      } catch (err) {
+        pendingApplied = null;
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+        updateCoverButton();
       }
     }
 
@@ -1336,7 +1648,8 @@ const coverPanel: WebUiPanel = {
       settledKey = '';
       mixLine.textContent = '';
       msg.textContent = t.remixing;
-      remixBtn.disabled = true;
+      pendingApplied = currentParams();
+      coverBtn.disabled = true;
       try {
         await ctx.invoke('remix', [selectedId, {
           vocalGainDb: Number(vocalGainDb.input.value),
@@ -1346,27 +1659,34 @@ const coverPanel: WebUiPanel = {
           format: mixFormat.value,
         }]);
       } catch (err) {
+        pendingApplied = null;
         msg.textContent = errText(err);
         msg.classList.add('bad');
-        remixBtn.disabled = !state?.ready;
+        updateCoverButton();
       }
     }
 
-    async function deleteCurrent(): Promise<void> {
-      if (!selectedId) return;
+    async function deleteById(id: string): Promise<void> {
+      if (!id) return;
       const ok = await ui.confirm({ title: t.sessionDelete, body: t.sessionDeleteConfirm, danger: true });
       if (!ok) return;
       msg.textContent = '';
       msg.classList.remove('bad');
       try {
-        const r = await ctx.invoke<RefineState>('sessionDelete', [selectedId]);
+        const r = await ctx.invoke<RefineState>('sessionDelete', [id]);
         refineSeq += 1;
         mixKey = '';
+        appliedSessionId = '';
+        if (selectedId === id) { selectedId = ''; applied = null; }
         renderRefine(r);
       } catch (err) {
         msg.textContent = errText(err);
         msg.classList.add('bad');
       }
+    }
+
+    async function deleteCurrent(): Promise<void> {
+      await deleteById(selectedId);
     }
 
     async function cleanup(): Promise<void> {
@@ -1709,6 +2029,7 @@ const coverPanel: WebUiPanel = {
       if (job.phase === 'error') {
         if (settledKey !== key) {
           settledKey = key;
+          pendingApplied = null;
           msg.textContent = job.error || (job.kind === 'range' ? '选段重跑失败' : job.kind === 'remix' ? '重新混音失败' : job.kind === 'master' ? t.masterFailed : '翻唱失败');
           msg.classList.add('bad');
         }
@@ -1716,6 +2037,12 @@ const coverPanel: WebUiPanel = {
       }
       if (!s.resultReady || settledKey === key) return;
       settledKey = key;
+      // 任务真的跑完了才算「生效」：改了又改回去的判定从这里重新起步。
+      if (pendingApplied && (job.kind === 'cover' || job.kind === 'remix')) {
+        applied = pendingApplied;
+        pendingApplied = null;
+        updateCoverButton();
+      }
       const r = await ctx.invoke<JobResult>('takeResult');
       if (r.error || !r.base64) {
         msg.textContent = r.error ?? '没有拿到音频';
@@ -1779,7 +2106,7 @@ const coverPanel: WebUiPanel = {
         return;
       }
       dl.href = url;
-      dl.download = `cover.${format.value}`;
+      dl.download = `cover.${mixFormat.value}`;
       dl.hidden = false;
       const done = s.lastCover;
       if (done) {

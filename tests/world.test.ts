@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -297,6 +297,47 @@ describe('母带 / 音高 / A/B 的数据面', () => {
     // 打开时补出 20 秒段落网格，但不会凭空写 masters。
     expect(state.session?.segments.length).toBe(1);
     expect(readSession(dataDir, old.id)?.masters).toBeUndefined();
+  });
+});
+
+describe('另存会话文件', () => {
+  it('把成品或原声复制到用户选的目录，文件名会清掉非法字符', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const { id, dir } = seedSession(dataDir, { outputs: ['out/mix-1.wav'] });
+    const rec = readSession(dataDir, id)!;
+    rec.source = { ...rec.source, file: 'source.mp3', bytes: 4096 };
+    writeSession(dataDir, id, rec);
+    writeFileSync(join(dir, 'source.mp3'), Buffer.alloc(4096, 0x44));
+    const target = mkdtempSync(join(tmpdir(), 'rvc-export-'));
+    roots.push(target);
+
+    const out = (await invoke('sessionExport', [id, {
+      dir: target, name: 'cover/歌\\曲:*', which: 'output',
+    }])) as { path: string; name: string; bytes: number };
+    expect(out.name).toBe('cover 歌 曲.wav');
+    expect(out.bytes).toBe(2048);
+    expect(readFileSync(out.path).length).toBe(2048);
+
+    const src = (await invoke('sessionExport', [id, {
+      dir: target, name: 'cover-song.wav', which: 'source',
+    }])) as { name: string; bytes: number };
+    expect(src.name).toBe('cover-song.mp3');
+    expect(src.bytes).toBe(4096);
+  });
+
+  it('目录不存在、没有原声、没有成品都明确报错', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const target = mkdtempSync(join(tmpdir(), 'rvc-export-'));
+    roots.push(target);
+    const full = seedSession(dataDir, { outputs: ['out/mix-1.wav'] });
+    await expect(invoke('sessionExport', [full.id, { dir: join(dataDir, 'nope') }]))
+      .rejects.toThrow('保存目录不存在');
+    await expect(invoke('sessionExport', [full.id, { dir: target, which: 'source' }]))
+      .rejects.toThrow('没有原声副本');
+    const empty = seedSession(dataDir);
+    await expect(invoke('sessionExport', [empty.id, { dir: target }]))
+      .rejects.toThrow('还没有成品');
+    await expect(invoke('sessionExport', ['nope', { dir: target }])).rejects.toThrow('找不到会话');
   });
 });
 
