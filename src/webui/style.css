@@ -35,3 +35,17 @@
 .rvc-recent-head span { opacity: .7; font-variant-numeric: tabular-nums; }
 .rvc-recent .rvc-acts { margin-top: .3em; }
 .rvc-recent-form { margin: .3em 0 .6em; padding: .5em .6em; border-radius: 6px; background: var(--bg-2, rgba(127, 127, 127, .1)); }
+/* 音频输入：原生控件透明铺满，外观自己画；点击与键盘焦点仍然落在原生 file 控件上。 */
+.rvc-file { position: relative; display: flex; flex-wrap: wrap; align-items: baseline; gap: .2em .5em; width: 100%; box-sizing: border-box; padding: .45em .6em; border: 1px solid var(--line, rgba(127, 127, 127, .35)); border-radius: 6px; background: var(--bg-2, rgba(127, 127, 127, .08)); cursor: pointer; }
+.rvc-file:focus-within { outline: 2px solid var(--accent, #4a9eff); outline-offset: 1px; }
+.rvc-file input[type="file"] { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; padding: 0; opacity: 0; cursor: pointer; }
+.rvc-file-badge { flex: none; padding: .05em .5em; border-radius: 999px; font-size: .8em; background: var(--bg-2, rgba(127, 127, 127, .2)); }
+.rvc-file-name { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-weight: 600; overflow-wrap: anywhere; }
+.rvc-file-meta { font-size: .82em; opacity: .8; }
+.rvc-file[data-state="session"] { border-color: var(--ok, #2e8b57); }
+.rvc-file[data-state="session"] .rvc-file-badge { color: var(--ok, #2e8b57); }
+.rvc-file[data-state="picked"] { border-color: var(--accent, #4a9eff); }
+.rvc-file[data-state="picked"] .rvc-file-badge { color: var(--accent, #4a9eff); }
+.rvc-file[data-state="empty"] { border-style: dashed; border-color: var(--warn, #b8860b); }
+.rvc-file[data-state="empty"] .rvc-file-badge,
+.rvc-file[data-state="empty"] .rvc-file-name { color: var(--warn, #b8860b); }

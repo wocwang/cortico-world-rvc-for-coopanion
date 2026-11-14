@@ -602,6 +602,13 @@ const coverPanel: WebUiPanel = {
     const fileInput = ui.input({});
     fileInput.type = 'file';
     fileInput.accept = 'audio/*,.wav,.flac,.mp3,.ogg,.m4a';
+    // 浏览器不允许改原生 file 控件的值，所以让它透明铺满整个外壳，
+    // 自己画「已选文件」的样子；点哪儿都还是原生选择框，键盘也能聚焦。
+    const fileShell = ui.h('div', 'rvc-file');
+    const fileBadge = ui.h('span', 'rvc-file-badge');
+    const fileName = ui.h('span', 'rvc-file-name');
+    const fileMeta = ui.h('span', 'rvc-file-meta');
+    fileShell.append(fileInput, fileBadge, fileName, fileMeta);
     const keepSource = ui.h('input') as HTMLInputElement;
     keepSource.type = 'checkbox';
     keepSource.checked = true;
@@ -652,7 +659,7 @@ const coverPanel: WebUiPanel = {
 
     sheet.append(
       ui.h('div', 'rvc-detail', t.coverStagesHint),
-      ui.field(t.file, fileInput),
+      ui.field(t.file, fileShell),
       ui.h('div', 'rvc-detail', t.fileHint),
       sourceLine,
       ui.field(t.keepSource, keepSource),
@@ -832,6 +839,8 @@ const coverPanel: WebUiPanel = {
       if (abUrlB) URL.revokeObjectURL(abUrlB);
     }));
 
+    bindSource();
+
     fileInput.addEventListener('change', () => {
       file = fileInput.files?.[0] ?? null;
       msg.textContent = '';
@@ -918,16 +927,36 @@ const coverPanel: WebUiPanel = {
       return coverAction(coverDirty(currentParams(), applied), true);
     }
 
-    /** 音频输入下方的「当前音源」：新选的文件优先，其次会话原声，最后提示未选。 */
+    /** 音频输入与下方「当前音源」：新选的文件优先，其次会话原声，最后提示未选。 */
     function bindSource(): void {
+      let mode: 'session' | 'picked' | 'empty' = 'empty';
+      let badge = t.fileBadgeNone;
+      let name = t.filePick;
+      let meta = t.fileEmptyNote;
       if (file) {
+        mode = 'picked';
+        badge = t.fileBadgeNew;
+        name = file.name;
+        meta = `${ui.fmt.bytes(file.size)} · ${t.filePickedNote}`;
         sourceLine.textContent = t.sourcePicked(file.name, ui.fmt.bytes(file.size));
-        return;
+      } else {
+        const summary = selectedId ? summaries.find((s) => s.id === selectedId) : undefined;
+        if (summary?.source) {
+          mode = 'session';
+          badge = t.fileBadgeSession;
+          name = summary.source.file;
+          meta = `${ui.fmt.bytes(summary.source.bytes)} · ${ui.fmt.duration(summary.durationSec * 1000)} · ${t.fileReuseNote}`;
+          sourceLine.textContent = t.sourceFromSession(summary.source.file, ui.fmt.bytes(summary.source.bytes));
+        } else {
+          sourceLine.textContent = selectedId ? t.sourceMissing : '';
+        }
       }
-      const summary = selectedId ? summaries.find((s) => s.id === selectedId) : undefined;
-      sourceLine.textContent = summary?.source
-        ? t.sourceFromSession(summary.source.file, ui.fmt.bytes(summary.source.bytes))
-        : selectedId ? t.sourceMissing : '';
+      fileShell.dataset.state = mode;
+      fileBadge.textContent = badge;
+      fileName.textContent = name;
+      fileName.title = name;
+      fileMeta.textContent = meta;
+      fileInput.setAttribute('aria-label', mode === 'empty' ? t.filePick : `${t.file}：${badge} ${name}`);
     }
 
     /** 主按钮在「开始翻唱 / 重新翻唱 / 重新混音 / 重新翻唱混音」之间切换，并说明本次会做什么。 */
@@ -1174,8 +1203,9 @@ const coverPanel: WebUiPanel = {
       })));
       const session = r.session;
       summaries = r.sessions;
-      bindSource();
       selectedId = session?.id ?? '';
+      // 先定 selectedId 再刷音源，避免轮询时控件还停在上一个会话。
+      bindSource();
       sessionSelect.value = selectedId;
       // 换会话时把顶部参数按会话回填（「继续编辑」也走这里），之后不再覆盖用户正在改的值。
       if (session && session.id !== appliedSessionId) {
