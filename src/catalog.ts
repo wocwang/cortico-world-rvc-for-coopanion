@@ -111,3 +111,21 @@ export const UVR_FILES: readonly PinnedFile[] = [
   },
 ];
 export const UVR_BYTES = UVR_FILES.reduce((n, f) => n + f.bytes, 0);
+
+/**
+ * 高质量分离档：Mel-Band RoFormer（KimberleyJSN，MIT），约 871 MB。
+ * 只在配置里显式选「高质量」时才下载；同样国内 hf-mirror 优先，官方 HF 兜底。
+ */
+export const MELBAND_FILE = 'MelBandRoformer.ckpt';
+export const MELBAND_FILES: readonly PinnedFile[] = [
+  {
+    path: MELBAND_FILE,
+    bytes: 913106900,
+    sha256: '87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e',
+    sources: [
+      `${HF_MIRROR}/KimberleyJSN/melbandroformer/resolve/main/${MELBAND_FILE}`,
+      `${HF}/KimberleyJSN/melbandroformer/resolve/main/${MELBAND_FILE}`,
+    ],
+  },
+];
+export const MELBAND_BYTES = MELBAND_FILES.reduce((n, f) => n + f.bytes, 0);

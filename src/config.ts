@@ -27,6 +27,11 @@ export interface RvcConfigSection {
    * 照常保存，不拒绝也不自动删除。
    */
   libraryMaxGb: number;
+  /**
+   * 高质量人声分离（Mel-Band RoFormer）。默认关；开启后第一次使用才下载约 871 MB 权重。
+   * CUDA 不可用 / 显存不足 / 权重缺失时自动回退默认档，不阻塞翻唱。
+   */
+  highSeparator: boolean;
   /** 推理档；改档后重建派生 venv 并重启引擎生效。 */
   tier: RvcTier;
   /**
@@ -81,6 +86,7 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   sessionDays: 7,
   sessionMaxGb: 8,
   libraryMaxGb: 2,
+  highSeparator: false,
   tier: 'auto',
   codeDir: '',
   assetsDir: '',
@@ -112,6 +118,7 @@ const TEXT = {
     sessionDays: { title: '会话保留天数', description: '超过这么多天的翻唱会话会被清理；0 表示不按时间清理（仍受容量上限约束）。' },
     sessionMaxGb: { title: '会话容量上限（GB）', description: 'sessions 总占用超过这个值时，从最久未用的会话开始删；0 表示不限。只影响 sessions，不动 out。' },
     libraryMaxGb: { title: '翻唱库容量上限（GB）', description: '翻唱库总占用超过这个值时，面板只提示「容量已超」，仍照常保存，不拒绝也不自动删除；0 表示不限。' },
+    highSeparator: { title: '高质量人声分离', description: '改用 Mel-Band RoFormer（MIT，约 871 MB）。首次开启时才下载；实测 2 分 20 秒的歌约 25 秒（比默认档更快），峰值显存约 2.1 GB；需要 CUDA 且剩余显存 ≥ 3 GB，否则自动回退默认档并提示。' },
     tier: { title: '推理档', description: '自动：检测到 NVIDIA 显卡就用显卡档，否则 CPU 档。显卡档的派生 venv 基于 CUDA 运行时，变声快很多（约 0.6–0.8 GB 显存）；CPU 档约 1–2 GB 内存。改档后在面板点「重启引擎」生效，切档会自动重建 venv。' },
     tierAuto: '自动',
     tierCuda: '显卡（NVIDIA）',
@@ -139,6 +146,7 @@ const TEXT = {
     sessionDays: { title: 'Session retention (days)', description: 'Cover sessions older than this are cleaned up; 0 disables the age rule (the size cap still applies).' },
     sessionMaxGb: { title: 'Session size cap (GB)', description: 'When sessions exceed this size, the least recently used ones are removed first; 0 means no cap. Only sessions is touched, never out.' },
     libraryMaxGb: { title: 'Cover library size cap (GB)', description: 'When the cover library exceeds this size, the panel only shows an "over capacity" hint and still saves. Nothing is rejected or deleted; 0 means no cap.' },
+    highSeparator: { title: 'High-quality separation', description: 'Uses Mel-Band RoFormer (MIT, about 871 MB). Downloaded only when first enabled; measured about 25 s for a 2:20 song (faster than the default tier) with a 2.1 GB VRAM peak. Needs CUDA with at least 3 GB free, otherwise the cover falls back to the default tier with a note.' },
     tier: { title: 'Inference tier', description: 'Auto uses the GPU tier when an NVIDIA GPU is detected, otherwise CPU. The GPU tier builds the derived venv on the CUDA runtime and is much faster (about 0.6–0.8 GB VRAM); the CPU tier uses about 1–2 GB RAM. After changing this, click Restart engine — switching tiers rebuilds the venv automatically.' },
     tierAuto: 'Auto',
     tierCuda: 'GPU (NVIDIA)',
@@ -192,6 +200,7 @@ export function configGroups(language: Language): ConfigGroup[] {
           [`${K}.sessionDays`]: { type: 'number', title: t.sessionDays.title, description: t.sessionDays.description, minimum: 0, maximum: 365, multipleOf: 1, 'x-hot': true },
           [`${K}.sessionMaxGb`]: { type: 'number', title: t.sessionMaxGb.title, description: t.sessionMaxGb.description, minimum: 0, maximum: 1000, multipleOf: 1, 'x-hot': true },
           [`${K}.libraryMaxGb`]: { type: 'number', title: t.libraryMaxGb.title, description: t.libraryMaxGb.description, minimum: 0, maximum: 1000, multipleOf: 1, 'x-hot': true },
+          [`${K}.highSeparator`]: { type: 'boolean', title: t.highSeparator.title, description: t.highSeparator.description, 'x-hot': true },
           [`${K}.codeDir`]: { type: 'string', title: t.codeDir.title, description: t.codeDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.assetsDir`]: { type: 'string', title: t.assetsDir.title, description: t.assetsDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.pythonPath`]: { type: 'string', title: t.pythonPath.title, description: t.pythonPath.description, 'x-path': { kind: 'file', extensions: ['.exe'] }, 'x-hot': true },

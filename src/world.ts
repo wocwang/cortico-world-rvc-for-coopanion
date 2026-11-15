@@ -9,16 +9,16 @@
  * 默认清唱，只有用户明确要翻唱 / 带伴奏才用翻唱版。
  */
 import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { dirname, extname, join } from 'node:path';
+import { execFile, execFileSync } from 'node:child_process';
+import { basename, dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
 import type { Logger, ToolDef, ToolOutcome, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { configGroups, DEFAULT_PORT, RVC_DEFAULTS, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
-import { UVR_MODEL_FILE } from './catalog.ts';
+import { MELBAND_FILES, UVR_MODEL_FILE } from './catalog.ts';
 import { RvcEngine, RvcError, type ConvertDone, type EngineState } from './engine.ts';
-import { RvcInstaller } from './install.ts';
+import { FileSetJob, hasFile, RvcInstaller } from './install.ts';
 import { readConvertJob, startConvertServer, type ConvertDeps, type ConvertJob, type ConvertServerHandle } from './server.ts';
 import { RvcVenv } from './venv.ts';
 import { RuntimeInstall, installedTiers } from './runtime.ts';
@@ -157,6 +157,8 @@ export class RvcWorld implements World {
   private assetsDir = '';
   private voicesDir = '';
   private uvrDir = '';
+  /** 高质量分离权重（Mel-Band RoFormer）下载任务；默认档不需要它。 */
+  private melbandJob: FileSetJob | null = null;
   private pythonPath = '';
   private runtimeDir = '';
   /** 共享运行时（gpt-sovits 的运行时包）——没有就自己下一份，三个插件共用。 */
@@ -172,6 +174,9 @@ export class RvcWorld implements World {
     stages?: { separate?: number; convert?: number; mix?: number }; peakScale?: number;
     /** 这次翻唱留下的会话 id；没留分轨时为空。 */
     sessionId?: string;
+    /** 实际用的分离档；`separatorNote` 是回退默认档的原因。 */
+    separator?: 'mel_band' | 'mdx';
+    separatorNote?: string;
   } | null = null;
   /** 最近一次「重新混音」的结果，面板渲染用。 */
   private lastMix: { at: number; ms: number; bytes: number; savedPath: string | null; format: string; peakScale?: number } | null = null;
@@ -288,6 +293,7 @@ export class RvcWorld implements World {
     this.runtimesRoot = paths.runtimesRoot;
     this.runtime = new RuntimeInstall({ root: paths.runtimesRoot, tier: this.wantedTier(), log: this.log ?? undefined });
     this.installer = new RvcInstaller(paths.assetsDir, paths.voicesDir, paths.uvrDir);
+    this.melbandJob = new FileSetJob(paths.uvrDir, MELBAND_FILES);
     this.venv = new RvcVenv({
       pythonPath: paths.pythonPath,
       basePython: paths.runtimeDir ? join(paths.runtimeDir, 'runtime', 'python.exe') : '',
@@ -538,7 +544,22 @@ export class RvcWorld implements World {
     const raw = (args[2] && typeof args[2] === 'object' ? args[2] : {}) as Record<string, unknown>;
     const engine = this.engine;
     if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
-    if (!base64) throw new RvcError('param', '缺少音频内容');
+    // 面板改成宿主文件框传路径：整首歌几十 MB，base64 进 invoke 会撞请求体上限（413）。
+    const sourcePath = typeof raw.path === 'string' ? raw.path.trim() : '';
+    let data: Buffer;
+    let name = fileName;
+    if (sourcePath) {
+      try {
+        if (!statSync(sourcePath).isFile()) throw new Error('不是文件');
+        data = readFileSync(sourcePath);
+        name = basename(sourcePath);
+      } catch (err) {
+        throw new RvcError('param', `读取音频失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      if (!base64) throw new RvcError('param', '缺少音频内容');
+      data = Buffer.from(base64, 'base64');
+    }
     if (!hasUvr5(this.uvrDir)) {
       throw new RvcError('param', '人声分离模型未安装；请先在服务页点「一键安装」（约 64 MB）');
     }
@@ -549,7 +570,7 @@ export class RvcWorld implements World {
     }
     let job: ConvertJob;
     try {
-      job = readConvertJob({ fields, file: { filename: fileName || 'song.wav', data: Buffer.from(base64, 'base64') } }, { uvr5: true });
+      job = readConvertJob({ fields, file: { filename: name || 'song.wav', data } }, { uvr5: true });
     } catch (err) {
       throw new RvcError('param', err instanceof Error ? err.message : String(err));
     }
@@ -578,6 +599,21 @@ export class RvcWorld implements World {
     if (session) this.activeSession = session.id;
     let sessionWritten = false;
     try {
+      const wantHigh = this.opts.cfg.highSeparator === true;
+      const melbandFile = MELBAND_FILES[0]!;
+      let highReady = hasFile(this.uvrDir, melbandFile);
+      let sepNote = '';
+      // 选了高质量才下载权重；等待期间前台仍能看进度（state.melband）。失败就回退默认档。
+      if (wantHigh && !highReady && this.melbandJob) {
+        await this.melbandJob.install();
+        highReady = hasFile(this.uvrDir, melbandFile);
+        if (!highReady) {
+          // 只回原因，前端按界面语言拼提示。
+          sepNote = this.melbandJob.status().detail || 'download failed';
+        }
+      }
+      const sepModel = wantHigh && highReady ? 'high' : 'fast';
+      if (wantHigh && !highReady && !sepNote) sepNote = '高质量分离权重还没下载，这次用默认档。';
       const done = await engine.cover({
         input,
         output,
@@ -590,6 +626,8 @@ export class RvcWorld implements World {
         chunk: job.chunk,
         sessionDir: session?.dir,
         withBgm,
+        sepModel,
+        melbandModel: highReady ? join(this.uvrDir, melbandFile.path) : '',
       });
       const audio = readFileSync(output);
       const outDir = join(this.opts.dataDir, 'out');
@@ -658,6 +696,8 @@ export class RvcWorld implements World {
         voice: job.voice || engine.state().model || '', format: outFormat,
         stages: done.stages, peakScale: done.peakScale,
         sessionId: session?.id,
+        separator: done.separator ?? 'mdx',
+        separatorNote: done.separatorNote ?? sepNote,
       };
       return { $binary: { mime: outFormat === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
     } finally {
@@ -1306,6 +1346,24 @@ export class RvcWorld implements World {
     };
   }
 
+  /** 打开库所在文件夹（Windows 资源管理器；不新增 HTTP 路由）。 */
+  private libraryOpen(): { dir: string } {
+    mkdirSync(this.libraryDir, { recursive: true });
+    execFile('explorer.exe', [this.libraryDir], { windowsHide: true }, () => { /* 用户自己关窗口 */ });
+    return { dir: this.libraryDir };
+  }
+
+  /** 开始下载高质量分离权重（面板切到高质量时调用）；进度走 state.melband。 */
+  private downloadSeparator(): Record<string, unknown> {
+    void this.melbandJob?.install();
+    return this.status();
+  }
+
+  private cancelSeparator(): Record<string, unknown> {
+    this.melbandJob?.cancel();
+    return this.status();
+  }
+
   private libraryDelete(id: string): Record<string, unknown> {
     try {
       deleteLibraryEntry(this.libraryDir, id);
@@ -1455,6 +1513,9 @@ export class RvcWorld implements World {
     if (method === 'sessionFile') return this.sessionFile(args);
     if (method === 'librarySave') return this.librarySave(args);
     if (method === 'libraryState') return this.libraryState();
+    if (method === 'libraryOpen') return this.libraryOpen();
+    if (method === 'downloadSeparator') return this.downloadSeparator();
+    if (method === 'cancelSeparator') return this.cancelSeparator();
     if (method === 'libraryFile') return this.libraryFile(String(args[0] ?? ''));
     if (method === 'libraryDelete') return this.libraryDelete(String(args[0] ?? ''));
     if (method === 'cleanupSessions') return this.cleanupSessions();
@@ -1600,6 +1661,8 @@ export class RvcWorld implements World {
       runtimeDir: this.runtimeDir,
       uvr5: hasUvr5(this.uvrDir),
       uvr: this.installer?.uvr.status() ?? { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' },
+      melband: this.melbandJob?.status() ?? { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' },
+      highSeparator: this.opts.cfg.highSeparator === true,
       venv: this.venv?.state() ?? { phase: 'absent', detail: 'World 未启动' },
       install: this.installer?.state() ?? { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' },
       voiceCount: voices.length,

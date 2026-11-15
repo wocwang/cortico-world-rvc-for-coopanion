@@ -215,6 +215,22 @@ describe('World 面板数据面', () => {
     expect((await invoke('state') as State).lastCover).toBeNull();
   });
 
+  it('翻唱可直接传本机路径，不再把整首歌塞进 base64', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const song = join(dataDir, 'song.wav');
+    writeFileSync(song, Buffer.alloc(64));
+    // 到「分离模型未安装」说明路径已经读到了，而不是「缺少音频内容」。
+    expect(await jobError(invoke, 'cover', ['song.wav', '', { path: song }])).toContain('人声分离模型未安装');
+    expect(await jobError(invoke, 'cover', ['song.wav', '', { path: join(dataDir, 'nope.wav') }])).toContain('读取音频失败');
+  });
+
+  it('状态里带高质量分离开关与权重下载进度', async () => {
+    const { invoke } = await makeWorld();
+    const state = (await invoke('state')) as State & { highSeparator?: boolean; melband?: { phase: string } };
+    expect(state.highSeparator).toBe(false);
+    expect(state.melband?.phase).toBe('absent');
+  });
+
   it('原地重新翻唱先查会话与分轨，不需要重新上传原声', async () => {
     const { invoke, dataDir } = await makeWorld();
     expect(await jobError(invoke, 'coverRerun', ['nope'])).toContain('找不到会话');

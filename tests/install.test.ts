@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { PinnedFile } from '../src/catalog.ts';
+import { MELBAND_FILES, UVR_FILES } from '../src/catalog.ts';
 import { FileSetJob } from '../src/install.ts';
 
 const roots: string[] = [];
@@ -141,5 +142,14 @@ describe('文件下载安装', () => {
     expect(job.status().phase).toBe('error');
     expect(job.status().detail).toContain('download.bin 下载失败'.replace('download.bin', 'blob.bin'));
     expect(statSync(join(dir, 'blob.bin.partial')).size).toBe(4);
+  });
+
+  it('分离权重国内镜像优先，境外源只当兜底', () => {
+    for (const file of [...UVR_FILES, ...MELBAND_FILES]) {
+      expect(file.sources[0]).toContain('hf-mirror.com');
+      expect(file.sources.slice(1).some((url) => url.includes('huggingface.co'))).toBe(true);
+      expect(file.bytes).toBeGreaterThan(0);
+      expect(file.sha256).toMatch(/^[0-9a-f]{64}$/);
+    }
   });
 });

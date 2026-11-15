@@ -54,3 +54,6 @@
 .rvc-file[data-state="empty"] { border-style: dashed; border-color: var(--warn, #b8860b); }
 .rvc-file[data-state="empty"] .rvc-file-badge,
 .rvc-file[data-state="empty"] .rvc-file-name { color: var(--warn, #b8860b); }
+
+.rvc-sortbar { display: flex; flex-wrap: wrap; gap: .4em; align-items: center; }
+.rvc-sortbar button[data-on="1"] { border-color: var(--accent, #4a9eff); color: var(--accent, #4a9eff); font-weight: 600; }

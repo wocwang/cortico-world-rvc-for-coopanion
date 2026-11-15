@@ -37,6 +37,10 @@ interface CoverDone extends ConvertDone {
   stages?: { separate?: number; convert?: number; mix?: number };
   peakScale?: number;
   sessionId?: string;
+  /** 这次实际用的分离档：`mel_band` 为高质量，`mdx` 为默认。 */
+  separator?: 'mel_band' | 'mdx';
+  /** 高质量档没跑成（下载/显存/加载失败）时回退默认档的原因。 */
+  separatorNote?: string;
 }
 interface MixDone {
   at: number;
@@ -187,6 +191,10 @@ interface PanelState {
   detail: string;
   tail: string[];
   uvr5: boolean;
+  /** 高质量分离权重（Mel-Band RoFormer）的下载状态；默认档不需要。 */
+  melband: JobState;
+  /** 配置里是否选了高质量分离档。 */
+  highSeparator: boolean;
   venv: JobState;
   uvr: JobState;
   install: JobState;
@@ -246,6 +254,16 @@ function toBase64(buf: Uint8Array): string {
 
 const toneOf = (phase: string): Tone =>
   phase === 'ready' ? 'on' : phase === 'working' || phase === 'starting' ? 'warn' : phase === 'error' ? 'bad' : 'off';
+
+/** Fisher–Yates：翻唱库的「随机」只洗一次，轮询刷新不重排。 */
+function shuffled<T>(items: T[]): T[] {
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j]!, out[i]!];
+  }
+  return out;
+}
 
 /** 相位 → 通用文案键；未知值按「未安装」显示。 */
 type PhaseKey = 'ready' | 'starting' | 'stopped' | 'error' | 'absent' | 'working';
@@ -637,21 +655,27 @@ const coverPanel: WebUiPanel = {
     const t = panelText(ctx.language);
     const msg = ui.msgline();
     let state: PanelState | null = null;
-    let file: File | null = null;
+    let pickedPath: string | null = null;
+    let pickedName = '';
     let url: string | null = null;
     ctx.own(disposable(() => { if (url) URL.revokeObjectURL(url); }));
 
     const sheet = ui.section(t.coverTitle, t.coverHint);
-    const fileInput = ui.input({});
-    fileInput.type = 'file';
-    fileInput.accept = 'audio/*,.wav,.flac,.mp3,.ogg,.m4a';
-    // 浏览器不允许改原生 file 控件的值，所以让它透明铺满整个外壳，
-    // 自己画「已选文件」的样子；点哪儿都还是原生选择框，键盘也能聚焦。
+    // 整首歌几十 MB，走浏览器上传会撞到 World 的请求体上限（HTTP 413）。
+    // 这里直接让宿主弹本机文件框，只把路径交给后端读取。
     const fileShell = ui.h('div', 'rvc-file');
+    fileShell.tabIndex = 0;
     const fileBadge = ui.h('span', 'rvc-file-badge');
     const fileName = ui.h('span', 'rvc-file-name');
     const fileMeta = ui.h('span', 'rvc-file-meta');
-    fileShell.append(fileInput, fileBadge, fileName, fileMeta);
+    fileShell.append(fileBadge, fileName, fileMeta);
+    fileShell.addEventListener('click', () => void chooseNative());
+    fileShell.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        void chooseNative();
+      }
+    });
     const keepSource = ui.h('input') as HTMLInputElement;
     keepSource.type = 'checkbox';
     keepSource.checked = true;
@@ -693,6 +717,14 @@ const coverPanel: WebUiPanel = {
       value: 'bgm',
       options: [{ value: 'bgm', label: t.bgmWith }, { value: 'clean', label: t.bgmWithout }],
     });
+    // 分离档：默认 Inst_HQ_3；选高质量才下 Mel-Band 权重，失败自动回退。
+    const sepTier = ui.select({
+      value: 'fast',
+      options: [{ value: 'fast', label: t.sepFast }, { value: 'high', label: t.sepHigh }],
+      onChange: (value) => void setSepTier(value),
+    });
+    const sepLine = ui.h('div', 'rvc-detail');
+    sepLine.hidden = true;
     const mixKnobs = ui.h('div', 'rvc-grid');
     mixKnobs.append(vocalGainDb.field, instGainDb.field, fadeIn.field, fadeOut.field, ui.field(t.format, mixFormat));
 
@@ -714,6 +746,9 @@ const coverPanel: WebUiPanel = {
       ui.field(t.voice, voiceSelect),
       ui.field(t.bgmMode, bgmMode),
       ui.h('div', 'rvc-detail', t.bgmHint),
+      ui.field(t.sepModel, sepTier),
+      ui.h('div', 'rvc-detail', t.sepHint),
+      sepLine,
       ui.h('div', 'rvc-detail', t.coverInferHint),
       inferKnobs,
       acts,
@@ -744,6 +779,8 @@ const coverPanel: WebUiPanel = {
     let outputLoadKey = '';
     let outputSeq = 0;
     let outputsSessionId = '';
+    /** 只有刚跑完一次成品才自动选最新一条；切会话/换原声一律不自动亮播放条。 */
+    let autoPickOutput = false;
     let currentSession: RefineSession | null = null;
     /** 只让最后一次 refineState 请求落地，避免切会话时被慢响应弹回去。 */
     let refineSeq = 0;
@@ -891,11 +928,66 @@ const coverPanel: WebUiPanel = {
     libraryCapInput.step = '1';
     const libraryCapSave = ui.button(t.libraryMaxSave, { size: 'sm', onClick: () => void saveLibraryCap() });
     const libraryRefreshBtn = ui.button(t.libraryRefresh, { size: 'sm', onClick: () => void loadLibrary(true) });
+    const libraryOpenBtn = ui.button(t.libraryOpenFolder, {
+      size: 'sm',
+      onClick: () => {
+        void (async () => {
+          try {
+            const r = await ctx.invoke<{ dir: string }>('libraryOpen');
+            libraryLine.textContent = t.libraryOpenDone(r.dir);
+          } catch (err) {
+            libraryLine.textContent = errText(err);
+            libraryLine.classList.add('bad');
+          }
+        })();
+      },
+    });
     const libraryCapRow = ui.h('div', 'rvc-grid');
     libraryCapRow.append(ui.field(t.libraryMaxGb, libraryCapInput));
     const libraryActs = ui.actions();
-    libraryActs.append(libraryCapSave, libraryRefreshBtn);
-    librarySheet.body.append(librarySummary, libraryCapRow, libraryActs, libraryLine, libraryList);
+    libraryActs.append(libraryCapSave, libraryRefreshBtn, libraryOpenBtn);
+
+    // 排序：最近 / 名字 / 随机；分类筛选：全部 / 清唱 / 翻唱；每页 5 首。
+    const libSortBar = ui.h('div', 'rvc-sortbar');
+    const libFilterSel = ui.select({
+      value: 'all',
+      options: [
+        { value: 'all', label: t.libraryFilterAll },
+        { value: 'clean', label: t.libraryFilterClean },
+        { value: 'cover', label: t.libraryFilterCover },
+      ],
+    });
+    const sortBtn = (label: string, sort: 'recent' | 'name' | 'random'): HTMLButtonElement => {
+      const btn = ui.button(label, { size: 'sm', onClick: () => setLibrarySort(sort) });
+      btn.dataset.sort = sort;
+      libSortBar.append(btn);
+      return btn;
+    };
+    sortBtn(t.librarySortRecent, 'recent');
+    sortBtn(t.librarySortName, 'name');
+    sortBtn(t.librarySortRandom, 'random');
+    const libFilterRow = ui.h('div', 'rvc-grid');
+    libFilterRow.append(ui.field(t.libraryFilter, libFilterSel));
+    const libPageRow = ui.actions();
+    const libPrev = ui.button(t.libraryPrev, { size: 'sm', onClick: () => { libPage = Math.max(0, libPage - 1); renderLibrary(libState, true); } });
+    const libPageLine = ui.h('span', 'rvc-detail');
+    const libNext = ui.button(t.libraryNext, { size: 'sm', onClick: () => { libPage += 1; renderLibrary(libState, true); } });
+    libPageRow.append(libPrev, libPageLine, libNext);
+    libFilterSel.addEventListener('change', () => {
+      libFilter = libFilterSel.value as 'all' | 'clean' | 'cover';
+      libPage = 0;
+      renderLibrary(libState, true);
+    });
+    librarySheet.body.append(
+      librarySummary,
+      libraryCapRow,
+      libraryActs,
+      libSortBar,
+      libFilterRow,
+      libraryLine,
+      libraryList,
+      libPageRow,
+    );
     const libraryAudio = document.createElement('audio');
     libraryAudio.hidden = true;
     libraryAudio.addEventListener('ended', () => {
@@ -937,14 +1029,29 @@ const coverPanel: WebUiPanel = {
 
     bindSource();
 
-    fileInput.addEventListener('change', () => {
-      file = fileInput.files?.[0] ?? null;
-      msg.textContent = '';
-      msg.classList.remove('bad');
-      if (file) resultLine.textContent = `${file.name} · ${ui.fmt.bytes(file.size)}`;
-      bindSource();
-      updateCoverButton();
-    });
+    /** 宿主原生文件框：只拿路径，不把整首歌塞进 invoke 请求体。 */
+    async function chooseNative(): Promise<void> {
+      try {
+        const path = await ctx.pickPath({ kind: 'file', title: t.filePick });
+        if (!path) return;
+        pickedPath = path;
+        pickedName = path.split(/[\\/]/).pop() || path;
+        // 换原声等于重新加载一个工程：旧成品不该继续挂在播放条上。
+        autoPickOutput = false;
+        pickedOutput = '';
+        outputLoadKey = '';
+        outputSeq += 1;
+        clearOutputPlayer();
+        outputSelect.value = '';
+        msg.textContent = '';
+        msg.classList.remove('bad');
+        bindSource();
+        updateCoverButton();
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      }
+    }
 
     // 任一参数变动都重算「本次会做什么」；改回去就恢复原样，不靠手点。
     for (const el of [pitch, indexRate, protect, vocalGainDb.input, instGainDb.input, fadeIn.input, fadeOut.input]) {
@@ -987,6 +1094,10 @@ const coverPanel: WebUiPanel = {
     let libSeq = 0;
     let libPlaying = '';
     let libUrl: string | null = null;
+    let libSort: 'recent' | 'name' | 'random' = 'recent';
+    let libFilter: 'all' | 'clean' | 'cover' = 'all';
+    let libPage = 0;
+    let libShuffle: string[] = [];
 
     function currentParams(): CoverParams {
       return {
@@ -1028,7 +1139,7 @@ const coverPanel: WebUiPanel = {
 
     function actionOf(): CoverAction {
       // 新选的文件优先：那是另一首歌，点按钮会新建一次翻唱，不走原地重跑。
-      if (file) return 'cover';
+      if (pickedPath) return 'cover';
       if (!selectedId || !applied) return 'cover';
       return coverAction(coverDirty(currentParams(), applied), true);
     }
@@ -1039,12 +1150,12 @@ const coverPanel: WebUiPanel = {
       let badge = t.fileBadgeNone;
       let name = t.filePick;
       let meta = t.fileEmptyNote;
-      if (file) {
+      if (pickedPath) {
         mode = 'picked';
         badge = t.fileBadgeNew;
-        name = file.name;
-        meta = `${ui.fmt.bytes(file.size)} · ${t.filePickedNote}`;
-        sourceLine.textContent = t.sourcePicked(file.name, ui.fmt.bytes(file.size));
+        name = pickedName;
+        meta = t.filePathNote;
+        sourceLine.textContent = t.sourcePicked(pickedName, t.filePathNote);
       } else {
         const summary = selectedId ? summaries.find((s) => s.id === selectedId) : undefined;
         if (summary?.source) {
@@ -1062,7 +1173,7 @@ const coverPanel: WebUiPanel = {
       fileName.textContent = name;
       fileName.title = name;
       fileMeta.textContent = meta;
-      fileInput.setAttribute('aria-label', mode === 'empty' ? t.filePick : `${t.file}：${badge} ${name}`);
+      fileShell.setAttribute('aria-label', mode === 'empty' ? t.filePick : `${t.file}：${badge} ${name}`);
     }
 
     // ---- 结果编辑的成品选择 ------------------------------------------------
@@ -1119,6 +1230,10 @@ const coverPanel: WebUiPanel = {
       outputLoadKey = '';
       abKey = '';
       stopPreview();
+      if (!key) {
+        clearOutputPlayer();
+        return;
+      }
       void loadOutput(key);
       if (currentSession) renderAB(currentSession, state?.job?.phase === 'working');
     }
@@ -1131,15 +1246,20 @@ const coverPanel: WebUiPanel = {
         pickedOutput = '';
         outputLoadKey = '';
         outputSeq += 1;
+        autoPickOutput = false;
         clearOutputPlayer();
       }
       outputFiles = files;
       if (!files.some((f) => f.path === pickedOutput)) {
-        pickedOutput = files.length ? files[files.length - 1]!.path : '';
+        // 切工程时只清空，不自动挑一条；只有刚跑完成品时才落到最新一条。
+        pickedOutput = autoPickOutput && files.length ? files[files.length - 1]!.path : '';
+        if (!pickedOutput) clearOutputPlayer();
         outputLoadKey = '';
       }
-      fillSelect(ui, outputSelect, files.map((f) => ({ value: f.path, label: outputLabel(f) })));
-      if (pickedOutput) outputSelect.value = pickedOutput;
+      autoPickOutput = false;
+      const options = files.length ? [{ value: '', label: t.outputPick }, ...files.map((f) => ({ value: f.path, label: outputLabel(f) }))] : [];
+      fillSelect(ui, outputSelect, options);
+      outputSelect.value = pickedOutput;
       outputSelect.disabled = busy || !files.length;
       outputRow.hidden = !files.length;
       outputLine.hidden = !r.session;
@@ -1186,14 +1306,18 @@ const coverPanel: WebUiPanel = {
       selectedId = id;
       sessionSelect.value = id;
       // 切工程时丢掉上一次选的新文件，音频输入改显示这个会话的原声（没有就提示未选）。
-      file = null;
-      fileInput.value = '';
+      pickedPath = null;
+      pickedName = '';
       bindSource();
       // 成品选择也回到这个会话的最近一条。
       outputsSessionId = '';
       pickedOutput = '';
       outputLoadKey = '';
       outputSeq += 1;
+      // 选中老工程时不自动把某条成品塞进播放器；等用户在「成品」里选。
+      autoPickOutput = false;
+      clearOutputPlayer();
+      outputSelect.value = '';
       mixKey = '';
       rangeParamsKey = '';
       peaks = null;
@@ -1428,6 +1552,13 @@ const coverPanel: WebUiPanel = {
       return entry.kind === 'clean' ? t.libraryKindClean : t.libraryKindCover;
     }
 
+    function setLibrarySort(sort: 'recent' | 'name' | 'random'): void {
+      libSort = sort;
+      libPage = 0;
+      if (sort === 'random') libShuffle = shuffled((libState?.entries ?? []).map((entry) => entry.id));
+      renderLibrary(libState, true);
+    }
+
     function renderLibrary(data: LibraryState | null, force = false): void {
       libState = data;
       if (!data) return;
@@ -1446,13 +1577,33 @@ const coverPanel: WebUiPanel = {
       if (document.activeElement !== libraryCapInput) {
         libraryCapInput.value = String(Math.round(data.maxBytes / (1024 * 1024 * 1024)));
       }
+      for (const btn of libSortBar.querySelectorAll('button')) {
+        btn.dataset.on = btn.dataset.sort === libSort ? '1' : '0';
+      }
       libraryList.textContent = '';
-      if (!data.entries.length) {
-        libraryList.append(ui.h('div', 'rvc-detail', t.libraryEmpty));
+      const filtered = data.entries.filter((entry) => libFilter === 'all' || entry.kind === libFilter);
+      let sorted: LibraryEntryView[];
+      if (libSort === 'name') {
+        sorted = [...filtered].sort((a, b) =>
+          a.title.localeCompare(b.title, 'zh') || Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      } else if (libSort === 'random') {
+        if (!libShuffle.length) libShuffle = shuffled(data.entries.map((entry) => entry.id));
+        const rank = new Map(libShuffle.map((id, at) => [id, at]));
+        sorted = [...filtered].sort((a, b) => (rank.get(a.id) ?? 1e9) - (rank.get(b.id) ?? 1e9));
+      } else {
+        sorted = [...filtered].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      }
+      const pages = Math.max(1, Math.ceil(sorted.length / 5));
+      libPage = Math.min(libPage, pages - 1);
+      const pageItems = sorted.slice(libPage * 5, libPage * 5 + 5);
+      libPageLine.textContent = t.libraryPage(libPage + 1, pages, sorted.length);
+      libPrev.disabled = libPage <= 0;
+      libNext.disabled = libPage >= pages - 1;
+      if (!pageItems.length) {
+        libraryList.append(ui.h('div', 'rvc-detail', data.entries.length ? t.libraryEmptyFilter : t.libraryEmpty));
         return;
       }
-      const sorted = [...data.entries].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
-      for (const entry of sorted) {
+      for (const entry of pageItems) {
         const row = ui.h('div', 'rvc-library-row');
         const head = ui.h('div', 'rvc-library-head');
         head.append(
@@ -2169,14 +2320,48 @@ const coverPanel: WebUiPanel = {
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
       fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
       updateCoverButton();
+      sepTier.value = s.highSeparator ? 'high' : 'fast';
+      const mb = s.melband;
+      if (mb?.phase === 'working') {
+        const percent = mb.total ? Math.min(99, Math.floor(((mb.done ?? 0) / mb.total) * 100)) : 0;
+        sepLine.hidden = false;
+        sepLine.textContent = t.sepDownloading(percent);
+      } else if (mb?.phase === 'error' && s.highSeparator) {
+        sepLine.hidden = false;
+        sepLine.textContent = t.sepDownloadFailed(mb.detail || '');
+      } else {
+        sepLine.hidden = true;
+        sepLine.textContent = '';
+      }
       if (!s.ready && s.detail) msg.textContent = s.detail;
       else if (!s.uvr5) msg.textContent = t.coverNeedsUvr;
+    }
+
+    /** 切分离档：写配置；选高质量时顺手开始下权重（已装好会立即返回）。 */
+    async function setSepTier(value: string): Promise<void> {
+      const high = value === 'high';
+      try {
+        await ctx.setConfig('world:rvc:service', { 'worlds.rvc.highSeparator': high });
+        if (state) state.highSeparator = high;
+        if (high) {
+          sepLine.hidden = false;
+          sepLine.textContent = t.sepDownloading(0);
+          await ctx.invoke<unknown>('downloadSeparator');
+        } else {
+          sepLine.hidden = true;
+          sepLine.textContent = '';
+        }
+      } catch (err) {
+        sepTier.value = high ? 'fast' : 'high';
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      }
     }
 
     async function run(): Promise<void> {
       msg.textContent = '';
       msg.classList.remove('bad');
-      if (!file) { msg.textContent = t.pickFileFirst; msg.classList.add('bad'); return; }
+      if (!pickedPath) { msg.textContent = t.pickFileFirst; msg.classList.add('bad'); return; }
       if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
       if (!state?.uvr5) { msg.textContent = t.coverNeedsUvr; msg.classList.add('bad'); return; }
       settledKey = '';
@@ -2184,9 +2369,9 @@ const coverPanel: WebUiPanel = {
       pendingApplied = currentParams();
       coverBtn.disabled = true;
       try {
-        const base64 = toBase64(new Uint8Array(await file.arrayBuffer()));
-        // 后台跑：分离 + 变声 + 混音都在 World 里，页面可以随时切走。
-        await ctx.invoke('cover', [file.name, base64, {
+        // 只传路径：整首歌可能几十 MB，base64 进 invoke 会触发 413。
+        await ctx.invoke('cover', [pickedName, '', {
+          path: pickedPath,
           voice: voiceSelect.value,
           pitch: Number(pitch.value),
           indexRate: Number(indexRate.value),
@@ -2214,7 +2399,7 @@ const coverPanel: WebUiPanel = {
       const summary = summaries.find((s) => s.id === selectedId);
       if (!summary?.source) {
         // 老会话没有原声副本：只能让用户重新选原声，另起一次翻唱。
-        if (!file) { msg.textContent = t.rerunNeedSource; msg.classList.add('bad'); return; }
+        if (!pickedPath) { msg.textContent = t.rerunNeedSource; msg.classList.add('bad'); return; }
         return run();
       }
       settledKey = '';
@@ -2701,6 +2886,7 @@ const coverPanel: WebUiPanel = {
       if (!s.resultReady || settledKey === key) return;
       settledKey = key;
       // 这次任务多半新增了一条成品：让选择器回到最新一条，播放器/下载随选择器重载。
+      autoPickOutput = true;
       pickedOutput = '';
       outputLoadKey = '';
       // 任务真的跑完了才算「生效」：改了又改回去的判定从这里重新起步。
@@ -2785,13 +2971,15 @@ const coverPanel: WebUiPanel = {
           : '';
         resultLine.textContent = [
           t.coverDone(ui.fmt.duration(done.ms), ui.fmt.bytes(done.bytes), stages),
+          done.separator === 'mel_band' ? t.sepUsedHigh : '',
+          done.separatorNote ? t.sepFallback(done.separatorNote) : '',
           done.peakScale !== undefined && done.peakScale < 1 ? t.peakScaled : '',
           done.savedPath ? t.saved(done.savedPath) : '',
         ].filter(Boolean).join(' · ');
         if (done.sessionId) selectedId = done.sessionId;
         // 这次上传已经进（或按勾选没进）会话；清掉文件输入，音频处改显示当前工程的原声。
-        file = null;
-        fileInput.value = '';
+        pickedPath = null;
+        pickedName = '';
         bindSource();
       }
     }

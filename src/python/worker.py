@@ -296,6 +296,11 @@ def main() -> int:
     os.makedirs(assets, exist_ok=True)
 
     sys.path[:] = [p for p in sys.path if not (p and _is_foreign_tools(p, root))]
+    # 包内代码（melband）与 worker.py 同目录。共享运行时可能以隔离模式启动，
+    # 脚本目录不一定在 sys.path 上；显式补一次，别让高质量分离白白回退。
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
     # 人声分离的移植代码在包内 `vendor/uvr`（与 `vendor/rvc` 同级），只读。
     uvr_dir = os.path.join(os.path.dirname(root), "uvr")
     if os.path.isdir(uvr_dir):
@@ -438,7 +443,7 @@ def main() -> int:
                 wav2(wav_file, out, output_format)
 
     uvr_model = (os.environ.get("RVC_UVR_MODEL") or "").strip()
-    separation = {"model": None}
+    separation = {"model": None, "high": None, "highPath": ""}
     # 长音频切片：整段一次性喂给 HuBERT，显卡紧张时会 CUDA OOM（实测 2 分钟人声 + gpt-sovits 共存）。
     CHUNK_SECONDS = 20.0
     OVERLAP_SECONDS = 0.3
@@ -548,6 +553,19 @@ def main() -> int:
         separation["model"] = MdxSeparator(uvr_model)
         print("[rvc] 人声分离模型已载入 %s（%s）" % (uvr_model, getattr(separation["model"], "provider", "CPU")), file=sys.stderr)
         return separation["model"]
+
+    def get_high_separator(model_path):
+        """高质量档：Mel-Band RoFormer（CUDAGPU）；失败由调用方回退默认档。"""
+        if separation["high"] is not None and separation["highPath"] == model_path:
+            return separation["high"]
+        if not model_path or not os.path.isfile(model_path):
+            raise RuntimeError("高质量分离权重未下载：%s" % (model_path or "(未配置路径)"))
+        from melband import MelBandSeparator
+
+        separation["high"] = MelBandSeparator(model_path)
+        separation["highPath"] = model_path
+        print("[rvc] 高质量分离模型已载入 %s（%s）" % (model_path, separation["high"].provider), file=sys.stderr)
+        return separation["high"]
 
     def load_song(path: str):
         """整首歌解码成 44.1 kHz 立体声 float32（分离模型固定用这个采样率）。
@@ -690,11 +708,23 @@ def main() -> int:
         if not source or not os.path.isfile(source):
             emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到输入音频：%s" % source})
             return
-        try:
-            sep = get_separator()
-        except LookupError as error:
-            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": str(error)})
-            return
+        note = ""
+        tier = (req.get("sepModel") or "fast").strip().lower()
+        sep = None
+        used_high = False
+        if tier == "high":
+            try:
+                sep = get_high_separator((req.get("melbandModel") or "").strip())
+                used_high = True
+            except Exception as error:
+                note = str(error)[:200]
+                print("[rvc] 高质量分离不可用，已回退默认档：%s" % note, file=sys.stderr)
+        if sep is None:
+            try:
+                sep = get_separator()
+            except LookupError as error:
+                emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": str(error)})
+                return
         try:
             mix = load_song(source)
         except Exception as error:
@@ -704,10 +734,43 @@ def main() -> int:
         began = time.time()
         try:
             vocals, instrumental = sep.separate(mix)
-        except Exception:
-            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "分离失败：%s" % traceback.format_exc()[-1500:]})
-            return
+        except Exception as error:
+            if used_high:
+                # 显存不够 / 推理失败：先放掉高频档模型，换回默认档，不让整首翻唱失败。
+                note = str(error)[:200]
+                print("[rvc] 高质量分离失败，已回退默认档：%s" % note, file=sys.stderr)
+                separation["high"] = None
+                separation["highPath"] = ""
+                sep = None
+                try:
+                    import torch
+
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                try:
+                    sep = get_separator()
+                    vocals, instrumental = sep.separate(mix)
+                    used_high = False
+                except Exception:
+                    emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "分离失败：%s" % traceback.format_exc()[-1500:]})
+                    return
+            else:
+                emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "分离失败：%s" % traceback.format_exc()[-1500:]})
+                return
         separate_ms = int((time.time() - began) * 1000)
+        if used_high:
+            # 分离完成后立刻把 Mel-Band 放掉：后面 RVC 变声要显存，常驻 1 GB 会把
+            # CUDA Graph / 长音频变声挤到 OOM；下次用再载入（实测约 5 秒）。
+            separation["high"] = None
+            separation["highPath"] = ""
+            sep = None
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         stem_dir = (req.get("sessionDir") or "").strip()
         if stem_dir:
@@ -815,6 +878,8 @@ def main() -> int:
             "rmsRatio": round(ratio, 4),
             "withBgm": with_bgm,
             "durationSec": round(n / 44100.0, 3),
+            "separator": "mel_band" if used_high else "mdx",
+            "separatorNote": note,
         })
 
     def reconvert(req: dict) -> None:

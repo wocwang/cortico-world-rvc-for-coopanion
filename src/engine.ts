@@ -92,6 +92,10 @@ export interface CoverRequest {
   sessionDir?: string;
   /** 是否带 BGM；false 时只写清唱（单声道 WAV）。默认 true。 */
   withBgm?: boolean;
+  /** 分离档位：high 用 Mel-Band RoFormer，缺权重/显存不足时 worker 回退 fast。 */
+  sepModel?: 'fast' | 'high';
+  /** 高质量权重路径（sepModel=high 时用）。 */
+  melbandModel?: string;
 }
 
 /** 复用已分离的人声分轨重跑整首变声，原地替换 conv.wav。 */
@@ -167,6 +171,10 @@ export interface ConvertDone {
   durationSec?: number;
   /** 这次成品是否带 BGM。 */
   withBgm?: boolean;
+  /** 实际用的分离模型：mel_band（高质量）或 mdx（默认）。 */
+  separator?: 'mel_band' | 'mdx';
+  /** 高质量回退等说明；为空表示没有降级。 */
+  separatorNote?: string;
   /** 清唱输出的声道数（1）。 */
   channels?: number;
   /** 区间重跑：实际拼回的样本区间与预期长度。 */
@@ -395,6 +403,7 @@ export class RvcEngine {
       pitch: req.pitch, indexRate: req.indexRate, protect: req.protect,
       format: req.format, vocalGain: req.vocalGain ?? 0, chunk: req.chunk === false ? 0 : 1,
       sessionDir: req.sessionDir ?? '', withBgm: req.withBgm === false ? 0 : 1,
+      sepModel: req.sepModel ?? 'fast', melbandModel: req.melbandModel ?? '',
     }, COVER_TIMEOUT_MS);
   }
 
@@ -634,6 +643,8 @@ export class RvcEngine {
           rmsRatio: typeof msg.rmsRatio === 'number' ? msg.rmsRatio : undefined,
           durationSec: typeof msg.durationSec === 'number' ? msg.durationSec : undefined,
           withBgm: typeof msg.withBgm === 'boolean' ? msg.withBgm : undefined,
+          separator: msg.separator === 'mel_band' || msg.separator === 'mdx' ? msg.separator : undefined,
+          separatorNote: typeof msg.separatorNote === 'string' && msg.separatorNote ? msg.separatorNote : undefined,
           channels: typeof msg.channels === 'number' ? msg.channels : undefined,
           spliced: msg.spliced && typeof msg.spliced === 'object' ? msg.spliced as ConvertDone['spliced'] : undefined,
           peakFactor: typeof msg.peakFactor === 'number' ? msg.peakFactor : undefined,
