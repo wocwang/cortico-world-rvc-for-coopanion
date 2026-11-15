@@ -1,19 +1,22 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Logger, ToolOutcome, WorldHost } from 'cortico/core/types.ts';
 import { RVC_DEFAULTS, configGroups } from '../src/config.ts';
+import { MELBAND_FILES, UVR_MODEL_FILE } from '../src/catalog.ts';
 import { createSession, readSession, writeSession, type RefineSession } from '../src/session.ts';
 import { saveToLibrary } from '../src/library.ts';
 import type { SongPlayer } from '../src/player.ts';
 import type { WavInfo } from '../src/wav.ts';
 import { RvcWorld, isMemoryError } from '../src/world.ts';
+import type { BiliClient, BiliPick, SearchHit } from '../src/bili.ts';
 
 const roots: string[] = [];
 const worlds: RvcWorld[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const world of worlds.splice(0)) await world.stop();
   for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -27,6 +30,7 @@ const log: Logger = {
 async function makeWorld(
   overrides: Partial<typeof RVC_DEFAULTS> = {},
   createSongPlayer?: (log: Logger) => SongPlayer,
+  bili?: BiliClient,
 ): Promise<{ world: RvcWorld; invoke: (method: string, args?: unknown[]) => Promise<unknown>; dataDir: string }> {
   const dataDir = mkdtempSync(join(tmpdir(), 'rvc-world-'));
   roots.push(dataDir);
@@ -37,6 +41,11 @@ async function makeWorld(
     libraryDir: join(dataDir, 'library'),
     runtimesRoot: () => join(dataDir, 'runtimes'),
     ...(createSongPlayer ? { createSongPlayer } : {}),
+    // 没注入就用一个「拒网」替身：单测永远不碰真实 B 站接口。
+    bili: bili ?? {
+      search: async () => { throw new Error('测试未注入 B 站客户端'); },
+      fetch: async () => { throw new Error('测试未注入 B 站客户端'); },
+    },
   });
   worlds.push(world);
   await world.start({ log } as unknown as WorldHost);
@@ -75,6 +84,12 @@ function seedLibrary(dataDir: string, songs: Array<{ title: string; kind: 'clean
     writeFileSync(path, Buffer.alloc(128 + at));
     saveToLibrary({ root: join(dataDir, 'library'), kind: song.kind, title: song.title, sourcePath: path });
   });
+}
+
+/** 让分离模型「在位」，B 站一键翻唱的前置检查才会通过。 */
+function installUvr(dataDir: string): void {
+  mkdirSync(join(dataDir, 'uvr5'), { recursive: true });
+  writeFileSync(join(dataDir, 'uvr5', 'UVR-MDX-NET-Inst_HQ_3.onnx'), Buffer.alloc(1024));
 }
 
 /** 造一个「看起来像」的 .pth：zip 头 + 1 MB。 */
@@ -163,6 +178,29 @@ describe('World 面板数据面', () => {
     expect((await invoke('state') as State).uvr5).toBe(false);
     const after = (await invoke('storage')) as { items: Array<{ id: string; bytes: number }> };
     expect(after.items.find((i) => i.id === 'uvr5')?.bytes).toBe(0);
+  });
+
+  it('卸载高质量分离只删 Mel-Band，默认模型还在', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const uvr5 = join(dataDir, 'uvr5');
+    mkdirSync(uvr5, { recursive: true });
+    writeFileSync(join(uvr5, UVR_MODEL_FILE), Buffer.alloc(64));
+    const high = join(uvr5, MELBAND_FILES[0]!.path);
+    writeFileSync(high, Buffer.alloc(64));
+    writeFileSync(`${high}.partial`, Buffer.alloc(8));
+
+    await invoke('removeSeparator', []);
+    expect(existsSync(high)).toBe(false);
+    expect(existsSync(`${high}.partial`)).toBe(false);
+    expect(existsSync(join(uvr5, UVR_MODEL_FILE))).toBe(true);
+  });
+
+  it('打开翻唱库找不到资源管理器时明确报错，不静默成功', async () => {
+    const nope = join(tmpdir(), `no-explorer-${Date.now()}`);
+    vi.stubEnv('SystemRoot', nope);
+    vi.stubEnv('WINDIR', nope);
+    const { invoke } = await makeWorld();
+    await expect(invoke('libraryOpen', [])).rejects.toThrow('找不到资源管理器');
   });
 
   it('导入 .pth 后出现在列表里，并成为默认音色', async () => {
@@ -606,13 +644,14 @@ describe('rvc_sing 桌宠点歌', () => {
     expect(player.files[0]).toContain('清唱cover');
   });
 
-  it('只有翻唱版时不偷放；明确要翻唱才播', async () => {
+  it('只有翻唱版时，清唱请求走自动生成（不偷放翻唱）；明确要翻唱才播', async () => {
     const player = fakePlayer();
     const { world, dataDir } = await makeWorld({}, () => player);
     seedLibrary(dataDir, [{ title: '稻香', kind: 'cover' }]);
     const clean = await call(world, { song: '稻香' });
-    expect(clean.failed).toBeUndefined();
-    expect(clean.text).toContain('only as cover');
+    // 不再把翻唱版当清唱偷放；测试环境没有 B 站客户端，明确回失败。
+    expect(clean.failed).toBe(true);
+    expect(clean.text).toContain('not in the library');
     expect(player.files).toHaveLength(0);
 
     const cover = await call(world, { song: '稻香', kind: 'cover' });
@@ -638,6 +677,70 @@ describe('rvc_sing 桌宠点歌', () => {
     const out = await call(world, { song: '七里香', kind: 'cover' });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('ffmpeg 不可用');
+  });
+});
+
+describe('B 站一键翻唱', () => {
+  const biliHit = (bvid: string, title: string): SearchHit => ({
+    bvid, title, author: 'UP主', durationSec: 200, play: 1000,
+  });
+
+  it('biliSearch 低置信时回候选，不下载', async () => {
+    let fetched = 0;
+    const bili: BiliClient = {
+      search: async () => [biliHit('BV0000000001', '起风了 官方现场版'), biliHit('BV0000000002', '起风了 官方MV')],
+      fetch: async () => { fetched += 1; throw new Error('不该下载'); },
+    };
+    const { invoke, dataDir } = await makeWorld({}, undefined, bili);
+    installUvr(dataDir);
+    const pick = (await invoke('biliSearch', ['起风了'])) as BiliPick;
+    expect(pick.confident).toBe(false);
+    expect(pick.reason).toBe('ambiguous');
+    expect(pick.candidates.map((item) => item.bvid)).toEqual(['BV0000000001', 'BV0000000002']);
+    expect(fetched).toBe(0);
+  });
+
+  it('桌宠点歌库未命中 + 低置信：回候选，不下载也不播放', async () => {
+    const player = fakePlayer();
+    let fetched = 0;
+    const bili: BiliClient = {
+      search: async () => [biliHit('BV0000000001', '起风了 官方现场版'), biliHit('BV0000000002', '起风了 官方MV')],
+      fetch: async () => { fetched += 1; throw new Error('不该下载'); },
+    };
+    const { world, dataDir } = await makeWorld({}, () => player, bili);
+    installUvr(dataDir);
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    const out = await tool.handler({ song: '起风了' }, {} as never) as ToolOutcome;
+    expect(out.text).toContain('could not pick');
+    expect(out.text).toContain('起风了 官方现场版');
+    expect(fetched).toBe(0);
+    expect(player.files).toHaveLength(0);
+  });
+
+  it('桌宠点歌库未命中 + 分离模型未装：明确说明先安装', async () => {
+    const player = fakePlayer();
+    const { world } = await makeWorld({}, () => player, {
+      search: async () => [biliHit('BV0000000001', '起风了 官方MV')],
+      fetch: async () => { throw new Error('不该下载'); },
+    });
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    const out = await tool.handler({ song: '起风了' }, {} as never) as ToolOutcome;
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('separation model');
+    expect(player.files).toHaveLength(0);
+  });
+
+  it('低置信时也不把候选当歌单播；库里已有的歌仍直接播', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({}, () => player, {
+      search: async () => { throw new Error('不该搜索'); },
+      fetch: async () => { throw new Error('不该下载'); },
+    });
+    seedLibrary(dataDir, [{ title: '起风了', kind: 'clean' }]);
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    const out = await tool.handler({ song: '《起风了》' }, {} as never) as ToolOutcome;
+    expect(out.text).toContain('Playing');
+    expect(player.files[0]).toContain('清唱cover');
   });
 });
 

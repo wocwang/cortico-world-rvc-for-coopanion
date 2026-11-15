@@ -9,7 +9,7 @@
  * 默认清唱，只有用户明确要翻唱 / 带伴奏才用翻唱版。
  */
 import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { basename, dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
@@ -32,10 +32,11 @@ import {
 import { panelText } from './webui/text.ts';
 import {
   backfillDurations, defaultLibraryDir, deleteLibraryEntry, libraryStats, readLibrary, resolveLibraryFile,
-  saveToLibrary, writeLibrary, type LibraryKind,
+  safeSongName, saveToLibrary, writeLibrary, type LibraryKind,
 } from './library.ts';
 import { AudifySink, BackgroundSongPlayer, type SongPlayer } from './player.ts';
 import { pickSong } from './sing.ts';
+import { defaultBiliClient, isBvid, pickCandidates, type BiliClient, type BiliPick, type SearchHit } from './bili.ts';
 import { RVC_TOOL_DECLS } from './tools.ts';
 import { clock } from './wav.ts';
 
@@ -53,6 +54,8 @@ export interface RvcWorldOptions {
   libraryDir?: string;
   /** 建本机播放器；单测里注入假播放器用，不传就用随包 audify 的真播放器。 */
   createSongPlayer?: (log: Logger) => SongPlayer;
+  /** B 站搜索 / 下载；单测里注入替身，不联网。 */
+  bili?: BiliClient;
 }
 
 /** 在 `<runtimesRoot>/gpt-sovits/<版本>/<档>/runtime/python.exe` 里挑一个可用运行时。
@@ -177,6 +180,10 @@ export class RvcWorld implements World {
     /** 实际用的分离档；`separatorNote` 是回退默认档的原因。 */
     separator?: 'mel_band' | 'mdx';
     separatorNote?: string;
+    /** 勾了「完成后保存到翻唱库」并成功时的结果。 */
+    library?: { id: string; title: string; kind: LibraryKind; file: string; duplicate: boolean };
+    /** 勾了入库但失败的原因。 */
+    libraryError?: string;
   } | null = null;
   /** 最近一次「重新混音」的结果，面板渲染用。 */
   private lastMix: { at: number; ms: number; bytes: number; savedPath: string | null; format: string; peakScale?: number } | null = null;
@@ -195,10 +202,17 @@ export class RvcWorld implements World {
   private readonly libraryDir: string;
   /** 本机播放器：`rvc_sing` 把库里的歌写进它；原生模块用到才加载。 */
   private songPlayer: SongPlayer | null = null;
+  /** B 站搜索 / 下载（默认走真实接口，单测注入替身）。 */
+  private readonly bili: BiliClient;
+  /** 点歌代次：再次点歌会自增，旧任务完成后不再抢播放条。 */
+  private singGeneration = 0;
+  /** 自动一键翻唱是否在跑：再次点歌时据此停引擎、让旧任务尽快结束。 */
+  private autoSingBusy = false;
 
   constructor(opts: RvcWorldOptions) {
     this.opts = opts;
     this.libraryDir = opts.libraryDir ?? defaultLibraryDir(opts.dataDir);
+    this.bili = opts.bili ?? defaultBiliClient;
   }
 
   envPromptVars(): Record<string, string> | null {
@@ -315,6 +329,8 @@ export class RvcWorld implements World {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.singGeneration += 1;
+    this.autoSingBusy = false;
     this.cancelIdle();
     this.songPlayer?.close();
     this.songPlayer = null;
@@ -691,6 +707,37 @@ export class RvcWorld implements World {
         sessionWritten = true;
         this.gcSessions();
       }
+      // 「完成后保存到翻唱库」：勾了就训完直接入库，省得再去最近翻唱里点。
+      // 入库失败不影响这次成品，只把原因带回面板。
+      let library: { id: string; title: string; kind: LibraryKind; file: string; duplicate: boolean } | undefined;
+      let libraryError = '';
+      if (raw.toLibrary === true) {
+        const fallbackTitle = name.replace(/\.[a-z0-9]{1,5}$/i, '') || '未命名';
+        const title = typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : fallbackTitle;
+        try {
+          const result = saveToLibrary({
+            root: this.libraryDir,
+            kind: withBgm ? 'cover' : 'clean',
+            title,
+            sourcePath: savedPath,
+            sessionId: session?.id,
+            voice: job.voice || engine.state().model || '',
+            durationSec: done.durationSec ?? 0,
+            maxBytes: this.libraryMaxBytes(),
+          });
+          library = {
+            id: result.entry.id,
+            title: result.entry.title,
+            kind: withBgm ? 'cover' : 'clean',
+            file: result.entry.file,
+            duplicate: result.duplicate,
+          };
+          this.log?.info('翻唱完成直接入库', { id: session?.id, kind: library.kind, title: library.title, duplicate: result.duplicate });
+        } catch (err) {
+          libraryError = err instanceof Error ? err.message : String(err);
+          this.log?.warn('翻唱完成自动入库失败', { id: session?.id, err: libraryError });
+        }
+      }
       this.lastCover = {
         at, ms: done.ms, bytes: audio.length, savedPath,
         voice: job.voice || engine.state().model || '', format: outFormat,
@@ -698,8 +745,14 @@ export class RvcWorld implements World {
         sessionId: session?.id,
         separator: done.separator ?? 'mdx',
         separatorNote: done.separatorNote ?? sepNote,
+        ...(library ? { library } : {}),
+        ...(libraryError ? { libraryError } : {}),
       };
-      return { $binary: { mime: outFormat === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+      return {
+        $binary: { mime: outFormat === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') },
+        ...(library ? { library } : {}),
+        ...(libraryError ? { libraryError } : {}),
+      };
     } finally {
       // 没写成功就清掉空会话，别在 sessions 里留垃圾。
       if (session && !sessionWritten) {
@@ -710,6 +763,83 @@ export class RvcWorld implements World {
       rmSync(output, { force: true });
       this.armIdle();
     }
+  }
+
+  /** 面板「B 站搜索」：只搜不下载。低置信时把候选原样交给用户选，别硬跑几分钟。 */
+  private async biliSearch(args: unknown[]): Promise<BiliPick> {
+    const query = typeof args[0] === 'string' ? args[0].trim() : '';
+    if (!query) throw new RvcError('param', '先填歌名');
+    if (!this.biliReady()) throw new RvcError('param', '人声分离模型还没装，先去「服务」页点「一键安装」。');
+    let hits: SearchHit[];
+    try {
+      hits = await this.bili.search(query, 20);
+    } catch (err) {
+      throw new RvcError('param', `B 站搜索失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+    return pickCandidates(hits, query, 6);
+  }
+
+  /** 自动一键翻唱的前提：分离模型在位（引擎可以在后面等）。 */
+  private biliReady(): boolean {
+    return hasUvr5(this.uvrDir);
+  }
+
+  /**
+   * 面板「B 站一键生成翻唱」：按候选顺序下载，成功后走现有按路径翻唱。
+   * 勾了「完成后保存到翻唱库」就顺带入库。
+   */
+  private async biliCoverFromPanel(args: unknown[]): Promise<unknown> {
+    const query = typeof args[0] === 'string' ? args[0].trim() : '';
+    const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
+    if (!query) throw new RvcError('param', '先填歌名');
+    if (!this.biliReady()) throw new RvcError('param', '人声分离模型还没装，先去「服务」页点「一键安装」。');
+
+    let candidates = parseBiliCandidates(raw.candidates);
+    if (!candidates.length) {
+      const decision = await this.biliSearch([query]);
+      if (!decision.confident) {
+        throw new RvcError('param', `没找到足够确定的版本：${decision.reason}。请从候选里手动选一首。`);
+      }
+      candidates = decision.candidates;
+    }
+
+    const download = await this.downloadBiliCandidates(candidates, query);
+    if (!download.source) {
+      throw new RvcError('param', `B 站音频下载失败：${download.failures.slice(-1)[0] ?? '没有可用候选'}`);
+    }
+    try {
+      const name = `${safeSongName(download.title)}.m4a`;
+      return await this.coverFromPanel([name, '', {
+        ...raw,
+        path: download.source,
+        title: download.title,
+        toLibrary: raw.toLibrary === true,
+      }]);
+    } finally {
+      rmSync(download.source, { force: true });
+    }
+  }
+
+  /** 按候选顺序下载：一条失效/412 就换下一条；返回临时文件与展示名。 */
+  private async downloadBiliCandidates(
+    candidates: SearchHit[],
+    query: string,
+  ): Promise<{ source: string; title: string; failures: string[] }> {
+    const tmpDir = join(this.opts.dataDir, 'tmp');
+    mkdirSync(tmpDir, { recursive: true });
+    const failures: string[] = [];
+    for (const candidate of candidates.slice(0, 5)) {
+      if (!isBvid(candidate.bvid)) continue;
+      const dest = join(tmpDir, `bili-${randomUUID()}.m4a`);
+      try {
+        const audio = await this.bili.fetch(candidate.bvid, dest, MAX_BILI_BYTES);
+        return { source: dest, title: query || audio.title || candidate.title, failures };
+      } catch (err) {
+        failures.push(`${candidate.title || candidate.bvid}: ${err instanceof Error ? err.message : String(err)}`);
+        rmSync(dest, { force: true });
+      }
+    }
+    return { source: '', title: query, failures };
   }
 
   /**
@@ -1346,11 +1476,45 @@ export class RvcWorld implements World {
     };
   }
 
-  /** 打开库所在文件夹（Windows 资源管理器；不新增 HTTP 路由）。 */
-  private libraryOpen(): { dir: string } {
+  /**
+   * 打开库所在文件夹（Windows 资源管理器；不新增 HTTP 路由）。
+   *
+   * 之前用 `execFile('explorer.exe', …)` 且把回调里的错误吞了：宿主进程的 PATH 被裁过或
+   * 资源管理器启动失败时，面板只会显示「已打开」，实际什么都不发生。这里改用
+   * `%SystemRoot%\explorer.exe` 的绝对路径，并把 spawn 失败抛回面板。
+   */
+  private libraryOpen(): Promise<{ dir: string }> {
     mkdirSync(this.libraryDir, { recursive: true });
-    execFile('explorer.exe', [this.libraryDir], { windowsHide: true }, () => { /* 用户自己关窗口 */ });
-    return { dir: this.libraryDir };
+    const dir = this.libraryDir;
+    if (process.platform !== 'win32') {
+      const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+      return new Promise((resolve, reject) => {
+        execFile(opener, [dir], (err) => {
+          if (err) reject(new RvcError('param', `打开文件夹失败：${err.message}`));
+          else resolve({ dir });
+        });
+      });
+    }
+    const explorer = join(process.env.SystemRoot ?? process.env.WINDIR ?? 'C:\\Windows', 'explorer.exe');
+    if (!existsSync(explorer)) throw new RvcError('param', `找不到资源管理器：${explorer}`);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const child = spawn(explorer, [dir], { detached: true, stdio: 'ignore', windowsHide: false });
+      child.once('error', (err) => {
+        if (!settled) {
+          settled = true;
+          reject(new RvcError('param', `打开资源管理器失败：${err.message}`));
+        } else {
+          this.log?.warn('打开翻唱库后资源管理器报错', { err: err.message });
+        }
+      });
+      child.once('spawn', () => {
+        settled = true;
+        child.unref();
+        this.log?.info('打开翻唱库', { dir });
+        resolve({ dir });
+      });
+    });
   }
 
   /** 开始下载高质量分离权重（面板切到高质量时调用）；进度走 state.melband。 */
@@ -1364,6 +1528,20 @@ export class RvcWorld implements World {
     return this.status();
   }
 
+  /** 卸载高质量分离权重（只删 Mel-Band，不动默认 Inst_HQ_3）。 */
+  private removeSeparator(): Record<string, unknown> {
+    if (this.melbandJob?.status().phase === 'working') {
+      throw new RvcError('param', '正在下载高质量分离权重，先点「取消」再卸载');
+    }
+    for (const file of MELBAND_FILES) {
+      for (const target of [join(this.uvrDir, file.path), join(this.uvrDir, `${file.path}.partial`)]) {
+        if (existsSync(target)) rmSync(target, { force: true });
+      }
+    }
+    this.log?.info('卸载高质量分离权重', { dir: this.uvrDir });
+    return this.status();
+  }
+
   private libraryDelete(id: string): Record<string, unknown> {
     try {
       deleteLibraryEntry(this.libraryDir, id);
@@ -1373,31 +1551,149 @@ export class RvcWorld implements World {
     }
   }
 
-  /** 桌宠点歌：按歌名或随机挑库里的歌，默认清唱；第一块 PCM 进声卡后回执。 */
+  /** 桌宠点歌：库优先；库里没有就按歌名跑一次 B 站一键翻唱（默认清唱），入库后直接播放。 */
   private async rvcSing(args: Record<string, unknown>): Promise<ToolOutcome> {
     const song = typeof args.song === 'string' ? args.song.trim() : '';
     const kind: LibraryKind = args.kind === 'cover' ? 'cover' : 'clean';
     const player = this.songPlayer;
-    // 再点歌先停上一首；这一首找不到也不让旧歌继续放。
+    // 再点歌先停上一首与上一次自动翻唱；旧任务的结果不再抢播放条。
+    this.singGeneration += 1;
+    const generation = this.singGeneration;
     player?.stop();
-    const pick = pickSong(this.libraryDir, { song, kind });
-    if ('issue' in pick) return { text: pick.issue.message };
+    if (this.autoSingBusy) await this.interruptAutoSing();
     if (!player) return { text: 'Nothing played: the local player is not ready.', failed: true };
-    const full = join(this.libraryDir, pick.entry.file);
-    if (!existsSync(full)) {
-      return { text: `Found "${pick.entry.title}" in the library, but its file is missing. Save it again from the RVC panel.`, failed: true };
+
+    const pick = pickSong(this.libraryDir, { song, kind });
+    if (!('issue' in pick)) {
+      const full = join(this.libraryDir, pick.entry.file);
+      if (!existsSync(full)) {
+        return { text: `Found "${pick.entry.title}" in the library, but its file is missing. Save it again from the RVC panel.`, failed: true };
+      }
+      try {
+        const { durationSec } = await player.playFile(full);
+        this.log?.info('桌宠点歌', { title: pick.entry.title, kind, file: pick.entry.file, seconds: durationSec });
+        const label = kind === 'clean' ? 'clean vocal, no backing track' : 'cover, with backing track';
+        return { text: `Playing "${pick.entry.title}" (${label}), ${clock(durationSec)}.` };
+      } catch (err) {
+        return {
+          text: `Found "${pick.entry.title}", but could not play it on this computer: ${err instanceof Error ? err.message : String(err)}.`,
+          failed: true,
+        };
+      }
     }
+
+    // 库里没有：没给歌名就只能说明；给了歌名就走「B 站搜索 → 下载 → 翻唱 → 入库 → 播放」。
+    if (!song) return { text: pick.issue.message };
+    if (this.job?.phase === 'working') {
+      return { text: 'The RVC panel is busy with another conversion. Wait for it to finish, or stop it, then ask again.' };
+    }
+    if (!this.biliReady()) {
+      return { text: `"${song}" is not in the library, and the vocal-separation model is not installed, so I cannot make it automatically. Ask the person to open the RVC panel and click "install" on the Service page.`, failed: true };
+    }
+    const query = song.replace(/[《》「」『』]/g, '').trim();
+    let hits: SearchHit[];
     try {
-      const { durationSec } = await player.playFile(full);
-      this.log?.info('桌宠点歌', { title: pick.entry.title, kind, file: pick.entry.file, seconds: durationSec });
-      const label = kind === 'clean' ? 'clean vocal, no backing track' : 'cover, with backing track';
-      return { text: `Playing "${pick.entry.title}" (${label}), ${clock(durationSec)}.` };
+      hits = await this.bili.search(query, 20);
     } catch (err) {
+      return { text: `"${query}" is not in the library, and the Bilibili search failed: ${err instanceof Error ? err.message : String(err)}. Try again later.`, failed: true };
+    }
+    if (generation !== this.singGeneration) return { text: 'Cancelled: another song was requested.' };
+    const decision = pickCandidates(hits, query, 6);
+    if (!decision.candidates.length) {
+      return { text: `"${query}" is not saved, and Bilibili returned no results. Try another song name later.` };
+    }
+    if (!decision.confident) {
       return {
-        text: `Found "${pick.entry.title}", but could not play it on this computer: ${err instanceof Error ? err.message : String(err)}.`,
+        text: `"${query}" is not saved, and I could not pick a reliable Bilibili version (${decision.reason}). Ask the person which one to use:\n${candidateLines(decision.candidates)}`,
+      };
+    }
+    const engine = this.engine;
+    if (!engine) return { text: 'The RVC engine is not available.', failed: true };
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) {
+        return { text: `"${query}" is not in the library, and the RVC engine is not ready yet (${engine.state().detail ?? 'starting'}). Try again in a moment.`, failed: true };
+      }
+    }
+    // 先把音频下下来：下载失败要当场回原因，别让用户等几分钟后才发现没下成。
+    const download = await this.downloadBiliCandidates(decision.candidates, query);
+    if (!download.source) {
+      return {
+        text: `"${query}" is not saved, and the Bilibili audio download failed: ${download.failures.slice(-1)[0] ?? 'no usable candidate'}. Try again later.`,
         failed: true,
       };
     }
+    if (generation !== this.singGeneration) {
+      rmSync(download.source, { force: true });
+      return { text: 'Cancelled: another song was requested.' };
+    }
+    const label = kind === 'clean' ? 'clean-vocal (no backing track)' : 'cover (with backing track)';
+    this.startAutoSing(generation, query, kind, download.source, player);
+    return {
+      text: `"${query}" is not saved yet. Bilibili match: "${download.title}". Started making a ${label} version; it usually takes 2-5 minutes and will play automatically when done. Say another song to cancel.`,
+    };
+  }
+
+  /** 再次点歌时打断上一次自动翻唱：停掉 worker，别让新歌排在几分钟的推理后面。 */
+  private async interruptAutoSing(): Promise<void> {
+    this.autoSingBusy = false;
+    const engine = this.engine;
+    if (!engine) return;
+    try { await engine.stop(); } catch { /* 已经停了 */ }
+    if (this.stopped) return;
+    // 下一条请求需要能自动拉起引擎；这里主动重启，避免第一次等待更久。
+    this.idleStopped = false;
+    this.bootEngine(false);
+  }
+
+  /** 后台跑一次自动翻唱：下载候选 → 现有翻唱链路 → 入库 → 播放。失败只记说明，不抛给模型。 */
+  private startAutoSing(
+    generation: number,
+    query: string,
+    kind: LibraryKind,
+    source: string,
+    player: SongPlayer,
+  ): void {
+    this.autoSingBusy = true;
+    const bgm = kind === 'cover';
+    const task = (async () => {
+      try {
+        const result = await this.coverFromPanel([`${safeSongName(query)}.m4a`, '', {
+          path: source,
+          voice: '',
+          pitch: 0,
+          indexRate: 0.3,
+          protect: 0.33,
+          vocalGain: 0,
+          format: 'wav',
+          chunk: true,
+          keepSource: true,
+          withBgm: bgm,
+          toLibrary: true,
+          title: query,
+        }]) as { library?: { file: string; title: string }; libraryError?: string };
+        if (generation !== this.singGeneration) return;
+        if (!result.library?.file) {
+          this.log?.warn('桌宠点歌：生成完成但未入库', { query, err: result.libraryError || 'unknown' });
+          return;
+        }
+        try {
+          const { durationSec } = await player.playFile(join(this.libraryDir, result.library.file));
+          this.log?.info('桌宠点歌：自动翻唱后播放', { title: result.library.title, seconds: durationSec });
+        } catch (err) {
+          this.log?.warn('桌宠点歌：自动翻唱后播放失败', { err: err instanceof Error ? err.message : String(err) });
+        }
+      } finally {
+        rmSync(source, { force: true });
+      }
+    })();
+    void task.catch((err: unknown) => {
+      if (generation === this.singGeneration) {
+        this.log?.warn('桌宠点歌：自动翻唱失败', { query, err: err instanceof Error ? err.message : String(err) });
+      }
+    }).finally(() => {
+      if (generation === this.singGeneration) this.autoSingBusy = false;
+    });
   }
 
   private deleteSession(id: string): Record<string, unknown> {
@@ -1488,6 +1784,11 @@ export class RvcWorld implements World {
       this.beginJob('cover', args, 'coverRerun');
       return this.status();
     }
+    if (method === 'biliCover') {
+      this.beginJob('cover', args, 'biliCover');
+      return this.status();
+    }
+    if (method === 'biliSearch') return this.biliSearch(args);
     if (method === 'rangeConvert') {
       this.beginJob('range', args);
       return this.status();
@@ -1516,6 +1817,7 @@ export class RvcWorld implements World {
     if (method === 'libraryOpen') return this.libraryOpen();
     if (method === 'downloadSeparator') return this.downloadSeparator();
     if (method === 'cancelSeparator') return this.cancelSeparator();
+    if (method === 'removeSeparator') return this.removeSeparator();
     if (method === 'libraryFile') return this.libraryFile(String(args[0] ?? ''));
     if (method === 'libraryDelete') return this.libraryDelete(String(args[0] ?? ''));
     if (method === 'cleanupSessions') return this.cleanupSessions();
@@ -1575,12 +1877,14 @@ export class RvcWorld implements World {
   private beginJob(
     kind: 'convert' | 'cover' | 'remix' | 'range' | 'master',
     args: unknown[],
-    action: 'convert' | 'cover' | 'coverRerun' | 'remix' | 'range' | 'master' | 'segmentRedo' | 'segmentRevert' = kind,
+    action: 'convert' | 'cover' | 'coverRerun' | 'biliCover' | 'remix' | 'range' | 'master' | 'segmentRedo' | 'segmentRevert' = kind,
   ): void {
     if (this.job?.phase === 'working') throw new RvcError('param', '已有任务在跑，等它结束再试');
+    if (this.autoSingBusy) throw new RvcError('param', '正在按歌名自动生成翻唱，等它结束或再点一首取消后再试');
     const at = Date.now();
     const detail = action === 'cover' ? '分离人声'
       : action === 'coverRerun' ? '重跑变声并混音'
+        : action === 'biliCover' ? '下载并生成翻唱'
       : action === 'range' ? '重跑选段'
         : action === 'segmentRedo' ? '重做段落'
           : action === 'segmentRevert' ? '还原段落'
@@ -1590,7 +1894,9 @@ export class RvcWorld implements World {
     this.jobResult = null;
     const task = action === 'cover'
       ? this.coverFromPanel(args)
-      : action === 'coverRerun'
+      : action === 'biliCover'
+        ? this.biliCoverFromPanel(args)
+        : action === 'coverRerun'
         ? this.rerunFromPanel(args)
         : action === 'range'
         ? this.rangeFromPanel(args)
@@ -1786,6 +2092,37 @@ export class RvcWorld implements World {
     const out = await this.convert(job);
     return { $binary: { mime: job.format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: out.audio.toString('base64') } };
   }
+}
+
+/** B 站音频上限：一首歌通常 3–8 MB，200 MB 足够挡住异常大的视频。 */
+const MAX_BILI_BYTES = 200 * 1024 * 1024;
+
+/** 给模型看候选：标题 / UP 主 / 时长，够它转述让用户选。 */
+function candidateLines(candidates: SearchHit[]): string {
+  if (!candidates.length) return '(no candidates)';
+  return candidates.slice(0, 6).map((hit, at) =>
+    `${at + 1}. ${hit.title} — ${hit.author || 'unknown'} · ${clock(hit.durationSec)}`).join('\n');
+}
+
+/** 面板回传的候选：只收合法 BV 号，其余忽略。 */
+function parseBiliCandidates(raw: unknown): SearchHit[] {
+  if (!Array.isArray(raw)) return [];
+  const out: SearchHit[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const row = item as Record<string, unknown>;
+    const bvid = typeof row.bvid === 'string' ? row.bvid.trim() : '';
+    if (!isBvid(bvid)) continue;
+    out.push({
+      bvid,
+      title: typeof row.title === 'string' ? row.title : '',
+      author: typeof row.author === 'string' ? row.author : '',
+      durationSec: Number(row.durationSec) || 0,
+      play: Number(row.play) || 0,
+      ...(typeof row.score === 'number' ? { score: row.score } : {}),
+    });
+  }
+  return out;
 }
 
 /** `20261027-193000`。 */

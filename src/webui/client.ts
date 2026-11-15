@@ -41,6 +41,23 @@ interface CoverDone extends ConvertDone {
   separator?: 'mel_band' | 'mdx';
   /** 高质量档没跑成（下载/显存/加载失败）时回退默认档的原因。 */
   separatorNote?: string;
+  /** 勾了「完成后保存到翻唱库」并成功时的结果。 */
+  library?: { id: string; title: string; kind: 'clean' | 'cover'; file: string; duplicate: boolean };
+  /** 勾了入库但失败的原因。 */
+  libraryError?: string;
+}
+interface BiliCandidate {
+  bvid: string;
+  title: string;
+  author: string;
+  durationSec: number;
+  play: number;
+  score?: number;
+}
+interface BiliPickResp {
+  confident: boolean;
+  reason: string;
+  candidates: BiliCandidate[];
 }
 interface MixDone {
   at: number;
@@ -329,13 +346,45 @@ const servicePanel: WebUiPanel = {
     const depsRow = row(sheet, ui, t.rowDeps);
     const weightsRow = row(sheet, ui, t.rowWeights);
     const uvrRow = row(sheet, ui, t.rowUvr);
+    const melbandRow = row(sheet, ui, t.rowMelband);
     const voiceRow = row(sheet, ui, t.rowVoice);
     const apiRow = row(sheet, ui, t.rowApi);
+
+    // 高质量分离档：和默认模型一样有下载 / 取消 / 卸载与进度。
+    let melArmed = false;
+    const melbandDownload = ui.button(t.sepDownload, { size: 'sm', onClick: () => void call('downloadSeparator') });
+    const melbandCancel = ui.button(t.cancel, { size: 'sm', onClick: () => void call('cancelSeparator') });
+    const melbandRemove = ui.button(t.melbandUninstall, {
+      size: 'sm',
+      onClick: () => {
+        void (async () => {
+          if (!melArmed) {
+            melArmed = true;
+            msg.textContent = t.storeConfirmHint;
+            msg.classList.remove('bad');
+            melbandRemove.textContent = t.storeConfirm;
+            return;
+          }
+          melArmed = false;
+          melbandRemove.textContent = t.melbandUninstall;
+          try {
+            render(await ctx.invoke<PanelState>('removeSeparator'));
+            msg.textContent = t.storeRemoved;
+          } catch (err) {
+            msg.textContent = errText(err);
+            msg.classList.add('bad');
+          }
+        })();
+      },
+    });
+    melbandRow.acts.append(melbandDownload, melbandCancel, melbandRemove);
+    const sepBar = ui.progress({ tone: 'warn' });
+    sepBar.el.hidden = true;
 
     const uvr5Warn = ui.msgline(t.uvr5Off, true);
     const bar = ui.progress({ tone: 'warn' });
     bar.el.hidden = true;
-    sheet.append(bar.el, uvr5Warn, ui.h('div', 'rvc-detail', t.voiceNotice));
+    sheet.append(sepBar.el, bar.el, uvr5Warn, ui.h('div', 'rvc-detail', t.sepHint), ui.h('div', 'rvc-detail', t.voiceNotice));
 
     const installBtn = ui.button(t.install, { variant: 'primary', size: 'sm', onClick: () => void call('install') });
     const cancelBtn = ui.button(t.cancel, { size: 'sm', onClick: () => void call('cancel') });
@@ -454,13 +503,36 @@ const servicePanel: WebUiPanel = {
       weightsRow.detail.textContent = s.install.detail ?? `${ui.fmt.bytes(s.install.done)} / ${ui.fmt.bytes(s.install.total)}`;
       bar.el.hidden = s.install.phase !== 'working';
       if (s.install.phase === 'working') bar.setValue(s.install.done ?? 0, s.install.total || 1);
-      // 分离模型
+      // 分离模型：默认 Inst_HQ_3 + 可选的高质量 Mel-Band；两个都在位时状态写「两个」。
+      const defaultReady = s.uvr.phase === 'ready';
+      const highReady = s.melband.phase === 'ready';
+      const bothReady = defaultReady && highReady;
       setPill(
         uvrRow.pill,
-        s.uvr.phase === 'working' ? `${t.working} ${s.uvr.total ? `${Math.round((s.uvr.done ?? 0) / s.uvr.total * 100)}%` : ''}` : t[phaseKey(s.uvr.phase)],
-        toneOf(s.uvr.phase),
+        bothReady
+          ? t.sepBoth
+          : s.uvr.phase === 'working' ? `${t.working} ${s.uvr.total ? `${Math.round((s.uvr.done ?? 0) / s.uvr.total * 100)}%` : ''}` : t[phaseKey(s.uvr.phase)],
+        bothReady ? 'on' : toneOf(s.uvr.phase),
       );
-      uvrRow.detail.textContent = s.uvr.detail ?? `${ui.fmt.bytes(s.uvr.done)} / ${ui.fmt.bytes(s.uvr.total)}`;
+      uvrRow.detail.textContent = bothReady
+        ? t.sepBothDetail
+        : s.uvr.detail ?? `${ui.fmt.bytes(s.uvr.done)} / ${ui.fmt.bytes(s.uvr.total)}`;
+      setPill(
+        melbandRow.pill,
+        s.melband.phase === 'working' ? `${t.working} ${s.melband.total ? `${Math.round((s.melband.done ?? 0) / s.melband.total * 100)}%` : ''}` : t[phaseKey(s.melband.phase)],
+        toneOf(s.melband.phase),
+      );
+      melbandRow.detail.textContent = s.melband.detail
+        ?? (highReady ? t.sepHighSize : `${ui.fmt.bytes(s.melband.done)} / ${ui.fmt.bytes(s.melband.total)}`);
+      melbandDownload.hidden = s.melband.phase === 'working' || highReady;
+      melbandCancel.hidden = s.melband.phase !== 'working';
+      melbandRemove.hidden = !highReady;
+      if (!highReady) {
+        melArmed = false;
+        melbandRemove.textContent = t.melbandUninstall;
+      }
+      sepBar.el.hidden = s.melband.phase !== 'working';
+      if (s.melband.phase === 'working') sepBar.setValue(s.melband.done ?? 0, s.melband.total || 1);
       const allReady = s.venv.phase === 'ready' && s.install.phase === 'ready';
       installBtn.textContent = allReady ? t.install : t.installSize(ui.fmt.bytes(s.install.total ?? 0));
       installBtn.disabled = busy || allReady;
@@ -679,8 +751,28 @@ const coverPanel: WebUiPanel = {
     const keepSource = ui.h('input') as HTMLInputElement;
     keepSource.type = 'checkbox';
     keepSource.checked = true;
+    // 训完直接入库，省得再去「最近翻唱」里点保存；默认勾上。
+    const toLibrary = ui.h('input') as HTMLInputElement;
+    toLibrary.type = 'checkbox';
+    toLibrary.checked = true;
     const sourceLine = ui.h('div', 'rvc-detail');
     const voiceSelect = ui.select({ options: [] });
+
+    // B 站一键生成：歌名 → 搜索 → 下载 → 走现有按路径翻唱。
+    const biliQuery = ui.input({ value: '' });
+    biliQuery.type = 'search';
+    biliQuery.placeholder = t.biliSongPlaceholder;
+    const biliKind = ui.select({
+      value: 'cover',
+      options: [{ value: 'cover', label: t.biliKindCover }, { value: 'clean', label: t.biliKindClean }],
+    });
+    const biliBtn = ui.button(t.biliGenerate, { variant: 'primary', size: 'sm', onClick: () => void runBili() });
+    const biliLine = ui.h('div', 'rvc-detail');
+    const biliCandidates = ui.h('div', 'rvc-library');
+    const biliRow = ui.h('div', 'rvc-grid');
+    biliRow.append(ui.field(t.biliSong, biliQuery), ui.field(t.biliKind, biliKind));
+    const biliActs = ui.actions();
+    biliActs.append(biliBtn);
 
     // 第一组：会重跑变声的参数。
     const pitch = ui.input({ type: 'number', value: '0' });
@@ -737,12 +829,19 @@ const coverPanel: WebUiPanel = {
     mixBlock.hidden = true;
 
     sheet.append(
+      ui.h('div', 'rvc-detail', t.biliHint),
+      biliRow,
+      biliActs,
+      biliLine,
+      biliCandidates,
       ui.h('div', 'rvc-detail', t.coverStagesHint),
       ui.field(t.file, fileShell),
       ui.h('div', 'rvc-detail', t.fileHint),
       sourceLine,
       ui.field(t.keepSource, keepSource),
       ui.h('div', 'rvc-detail', t.keepSourceHint),
+      ui.field(t.saveToLibrary, toLibrary),
+      ui.h('div', 'rvc-detail', t.saveToLibraryHint),
       ui.field(t.voice, voiceSelect),
       ui.field(t.bgmMode, bgmMode),
       ui.h('div', 'rvc-detail', t.bgmHint),
@@ -1293,6 +1392,94 @@ const coverPanel: WebUiPanel = {
                 : '';
       const busy = state?.job?.phase === 'working';
       coverBtn.disabled = busy || !state?.ready || (action === 'cover' && !state?.uvr5) || needSource;
+      biliBtn.disabled = busy || !state?.ready || !state?.uvr5;
+      biliQuery.disabled = busy;
+      biliKind.disabled = busy;
+    }
+
+    /** 低置信时列候选：用户点哪首就只跑哪首，不硬挑。 */
+    function renderBiliCandidates(pick: BiliPickResp): void {
+      biliCandidates.textContent = '';
+      for (const [index, cand] of pick.candidates.entries()) {
+        const row = ui.h('div', 'rvc-library-row');
+        const head = ui.h('div', 'rvc-library-head');
+        head.append(
+          ui.h('strong', '', cand.title),
+          ui.pill(cand.durationSec > 0 ? ui.fmt.duration(cand.durationSec * 1000) : '—', 'plain'),
+        );
+        const meta = ui.h('div', 'rvc-detail', t.biliCandidateMeta(
+          cand.author || '—',
+          Math.max(0, cand.play).toLocaleString(),
+        ));
+        const acts = ui.actions();
+        // 带上后面的候选：用户选的那条失效/412 时还能自动换下一条。
+        acts.append(ui.button(t.biliUse, { size: 'sm', onClick: () => void runBili(pick.candidates.slice(index)) }));
+        row.append(head, meta, acts);
+        biliCandidates.append(row);
+      }
+    }
+
+    /** 面板「B 站一键生成」：先搜；确定就直接生成，不确定就列候选。`chosen` 是用户点的候选。 */
+    async function runBili(chosen?: BiliCandidate[]): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      biliLine.classList.remove('bad');
+      const query = biliQuery.value.trim();
+      if (!query) { msg.textContent = t.biliNeedSong; msg.classList.add('bad'); return; }
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!state?.uvr5) { msg.textContent = t.coverNeedsUvr; msg.classList.add('bad'); return; }
+      biliCandidates.textContent = '';
+      let picked = chosen;
+      if (!picked) {
+        biliBtn.disabled = true;
+        biliLine.textContent = t.biliSearching;
+        try {
+          const r = await ctx.invoke<BiliPickResp>('biliSearch', [query]);
+          if (!r.candidates.length) {
+            biliLine.textContent = t.biliNoResult;
+            biliLine.classList.add('bad');
+            return;
+          }
+          if (!r.confident) {
+            biliLine.textContent = t.biliLowConfidence(r.reason);
+            biliLine.classList.add('bad');
+            renderBiliCandidates(r);
+            return;
+          }
+          picked = r.candidates;
+        } catch (err) {
+          biliLine.textContent = errText(err);
+          biliLine.classList.add('bad');
+          return;
+        }
+      }
+      const best = picked[0]!;
+      // 让面板上的 BGM 选择跟着这次的类型走，之后「重新混音」保持同一档。
+      bgmMode.value = biliKind.value === 'clean' ? 'clean' : 'bgm';
+      const params = currentParams();
+      settledKey = '';
+      msg.textContent = t.covering;
+      biliLine.textContent = t.biliGenerating(best.title);
+      try {
+        await ctx.invoke('biliCover', [query, {
+          withBgm: params.withBgm,
+          voice: params.voice,
+          pitch: params.pitch,
+          indexRate: params.indexRate,
+          protect: params.protect,
+          vocalGain: params.vocalGainDb,
+          format: params.format,
+          chunk: params.chunk,
+          keepSource: keepSource.checked,
+          toLibrary: toLibrary.checked,
+          candidates: picked.slice(0, 5),
+        }]);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+        biliLine.textContent = '';
+        biliBtn.disabled = false;
+      }
     }
 
     async function onCoverClick(): Promise<void> {
@@ -2380,6 +2567,7 @@ const coverPanel: WebUiPanel = {
           format: mixFormat.value,
           chunk: chunk.value === 'chunk',
           keepSource: keepSource.checked,
+          toLibrary: toLibrary.checked,
           withBgm: bgmMode.value !== 'clean',
         }]);
       } catch (err) {
@@ -2880,6 +3068,8 @@ const coverPanel: WebUiPanel = {
           pendingApplied = null;
           msg.textContent = job.error || (job.kind === 'range' ? '选段重跑失败' : job.kind === 'remix' ? '重新混音失败' : job.kind === 'master' ? t.masterFailed : '翻唱失败');
           msg.classList.add('bad');
+          biliLine.textContent = '';
+          biliBtn.disabled = false;
         }
         return;
       }
@@ -2899,6 +3089,8 @@ const coverPanel: WebUiPanel = {
       if (r.error || !r.base64) {
         msg.textContent = r.error ?? '没有拿到音频';
         msg.classList.add('bad');
+        biliLine.textContent = '';
+        biliBtn.disabled = false;
         return;
       }
       msg.textContent = '';
@@ -2960,6 +3152,7 @@ const coverPanel: WebUiPanel = {
       dl.href = url;
       dl.download = `cover.${mixFormat.value}`;
       dl.hidden = false;
+      biliLine.textContent = '';
       const done = s.lastCover;
       if (done) {
         const stages = done.stages
@@ -2974,6 +3167,10 @@ const coverPanel: WebUiPanel = {
           done.separator === 'mel_band' ? t.sepUsedHigh : '',
           done.separatorNote ? t.sepFallback(done.separatorNote) : '',
           done.peakScale !== undefined && done.peakScale < 1 ? t.peakScaled : '',
+          done.library ? (done.library.duplicate
+            ? t.libraryDuplicate(done.library.title)
+            : t.libraryAutoSaved(done.library.title)) : '',
+          done.libraryError ? t.libraryAutoFailed(done.libraryError) : '',
           done.savedPath ? t.saved(done.savedPath) : '',
         ].filter(Boolean).join(' · ');
         if (done.sessionId) selectedId = done.sessionId;
