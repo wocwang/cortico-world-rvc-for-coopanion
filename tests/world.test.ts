@@ -450,13 +450,14 @@ describe('翻唱库入库', () => {
     const { invoke, dataDir } = await makeWorld();
     const { id } = seedSession(dataDir, { outputs: ['out/clean-1.wav'], sourceName: '起风了.mp3' });
     const first = (await invoke('librarySave', [id, 'output', 0, 'clean', ''])) as {
-      entry: { title: string; kind: string; bytes: number; file: string };
+      entry: { id: string; title: string; kind: string; bytes: number; file: string; durationSec: number };
       duplicate: boolean;
     };
     expect(first.duplicate).toBe(false);
     expect(first.entry.title).toBe('起风了');
     expect(first.entry.kind).toBe('clean');
     expect(first.entry.bytes).toBe(2048);
+    expect(first.entry.durationSec).toBe(12.5);
     expect(readFileSync(join(dataDir, 'library', first.entry.file)).length).toBe(2048);
 
     // 面板传 -1 表示最近一条成品。
@@ -464,13 +465,24 @@ describe('翻唱库入库', () => {
     expect(again.duplicate).toBe(true);
 
     const state = (await invoke('libraryState')) as {
-      entries: Array<{ kind: string; title: string }>;
+      entries: Array<{ id: string; kind: string; title: string; durationSec: number }>;
       totalBytes: number;
       count: number;
     };
     expect(state.count).toBe(1);
     expect(state.totalBytes).toBe(2048);
     expect(state.entries.map((e) => `${e.kind}:${e.title}`)).toEqual(['clean:起风了']);
+    expect(state.entries[0]?.durationSec).toBe(12.5);
+
+    // 面板试听拿的是 $file，不是 base64；删除后占用归零。
+    const file = (await invoke('libraryFile', [first.entry.id])) as {
+      $file?: { mime: string; bytes: number; sha256: string };
+    };
+    expect(file.$file).toMatchObject({ mime: 'audio/wav', bytes: 2048 });
+    expect(file.$file?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    const after = (await invoke('libraryDelete', [first.entry.id])) as { count: number; totalBytes: number };
+    expect(after.count).toBe(0);
+    expect(after.totalBytes).toBe(0);
   });
 
   it('清唱只收 WAV；老会话没有原声歌名时用「未命名」兜底', async () => {
@@ -553,15 +565,24 @@ describe('rvc_sing 桌宠点歌', () => {
     expect(player.files[0]).toContain('翻唱cover');
   });
 
-  it('mp3 成品明确拒播，并说明怎么补', async () => {
+  it('mp3 成品交给播放器转码，不再直接拒播', async () => {
     const player = fakePlayer();
     const { world, dataDir } = await makeWorld({}, () => player);
     seedLibrary(dataDir, [{ title: '七里香', kind: 'cover', ext: '.mp3' }]);
     const out = await call(world, { song: '七里香', kind: 'cover' });
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('七里香');
+    expect(player.files[0]).toMatch(/\.mp3$/);
+  });
+
+  it('转码 / 出声失败时如实回失败与原因', async () => {
+    const player = fakePlayer();
+    player.playFile = () => Promise.reject(new Error('ffmpeg 不可用，无法把 .mp3 转成 WAV'));
+    const { world, dataDir } = await makeWorld({}, () => player);
+    seedLibrary(dataDir, [{ title: '七里香', kind: 'cover', ext: '.mp3' }]);
+    const out = await call(world, { song: '七里香', kind: 'cover' });
     expect(out.failed).toBe(true);
-    expect(out.text).toContain('.mp3');
-    expect(out.text).toContain('WAV');
-    expect(player.files).toHaveLength(0);
+    expect(out.text).toContain('ffmpeg 不可用');
   });
 });
 

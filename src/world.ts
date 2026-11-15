@@ -8,7 +8,7 @@
  * 工具 `rvc_sing` 给桌宠 / 对话页点歌：从翻唱库按歌名或随机挑一首，写进本机声卡后回执；
  * 默认清唱，只有用户明确要翻唱 / 带伴奏才用翻唱版。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,8 +31,8 @@ import {
 } from './refine.ts';
 import { panelText } from './webui/text.ts';
 import {
-  defaultLibraryDir, deleteLibraryEntry, libraryStats, readLibrary, resolveLibraryFile,
-  saveToLibrary, type LibraryKind,
+  backfillDurations, defaultLibraryDir, deleteLibraryEntry, libraryStats, readLibrary, resolveLibraryFile,
+  saveToLibrary, writeLibrary, type LibraryKind,
 } from './library.ts';
 import { AudifySink, BackgroundSongPlayer, type SongPlayer } from './player.ts';
 import { pickSong } from './sing.ts';
@@ -235,7 +235,7 @@ export class RvcWorld implements World {
       panels: [
         { id: 'service', title: t.serviceTitle, description: t.serviceHint, getMethods: ['state'] },
         { id: 'convert', title: t.convertTitle, description: t.convertHint, getMethods: ['state'] },
-        { id: 'cover', title: t.coverTitle, description: t.coverHint, getMethods: ['state'] },
+        { id: 'cover', title: t.coverTitle, description: t.coverHint, getMethods: ['state', 'refineState', 'libraryState'] },
         { id: 'voices', title: t.voicesTitle, description: t.voicesHint, getMethods: ['state', 'voices'] },
       ],
       invoke: async (panel, method, args) => this.invoke(panel, method, args),
@@ -1244,6 +1244,7 @@ export class RvcWorld implements World {
         sessionId: id,
         voice: session.engine.voice,
         mastered: media === 'master',
+        durationSec: session.source.durationSec,
       });
       this.log?.info('保存到 RVC 翻唱库', { id, kind: libraryKind, title, duplicate: result.duplicate });
       return { ...result };
@@ -1254,20 +1255,33 @@ export class RvcWorld implements World {
 
   private libraryState(): Record<string, unknown> {
     const index = readLibrary(this.libraryDir);
+    // 老索引没有时长：从 WAV 头补一次并写回，面板列表不用每次再算。
+    if (backfillDurations(this.libraryDir, index)) writeLibrary(this.libraryDir, index);
     return {
       ...libraryStats(this.libraryDir, index),
       entries: index.entries.map(({ sourceHash: _hash, ...item }) => item),
     };
   }
 
-  private libraryFile(id: string): Record<string, unknown> {
+  /** 试听：把库里的文件交给浏览器流式读取（`$file`），不用 base64 塞整首；sha256 边读边算。 */
+  private async libraryFile(id: string): Promise<Record<string, unknown>> {
     const entry = resolveLibraryFile(this.libraryDir, id);
-    const bytes = readFileSync(entry.fullPath);
     const ext = extname(entry.fullPath).toLowerCase() || '.wav';
+    const bytes = statSync(entry.fullPath).size;
+    const sha256 = await new Promise<string>((resolve, reject) => {
+      const hash = createHash('sha256');
+      createReadStream(entry.fullPath)
+        .on('data', (chunk) => { hash.update(chunk); })
+        .on('end', () => resolve(hash.digest('hex')))
+        .on('error', reject);
+    });
     return {
-      ...entry,
-      mime: AUDIO_MIME[ext] ?? 'application/octet-stream',
-      base64: bytes.toString('base64'),
+      $file: {
+        mime: AUDIO_MIME[ext] ?? 'application/octet-stream',
+        path: entry.fullPath,
+        bytes,
+        sha256,
+      },
     };
   }
 
@@ -1300,13 +1314,6 @@ export class RvcWorld implements World {
     const full = join(this.libraryDir, pick.entry.file);
     if (!existsSync(full)) {
       return { text: `Found "${pick.entry.title}" in the library, but its file is missing. Save it again from the RVC panel.`, failed: true };
-    }
-    const ext = extname(full).toLowerCase();
-    if (ext !== '.wav') {
-      return {
-        text: `"${pick.entry.title}" is saved as ${ext || 'an unknown format'}; the pet can only play WAV from the library. Re-mix it as WAV and save it again.`,
-        failed: true,
-      };
     }
     try {
       const { durationSec } = await player.playFile(full);

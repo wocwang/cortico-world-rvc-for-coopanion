@@ -6,10 +6,13 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import {
+  closeSync,
   copyFileSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -17,6 +20,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
+import { parseWav } from './wav.ts';
 
 export type LibraryKind = 'clean' | 'cover';
 
@@ -61,6 +65,8 @@ export interface SaveLibraryOptions {
   sessionId?: string;
   voice?: string;
   mastered?: boolean;
+  /** 成品时长（秒）；面板列表要显示。 */
+  durationSec?: number;
   maxBytes?: number;
 }
 
@@ -197,6 +203,33 @@ export function writeLibrary(root: string, index: LibraryIndex): void {
   }
 }
 
+/** 给缺时长的 WAV 条目补时长（老索引、手工放进来的文件）；返回是否有改动。 */
+export function backfillDurations(root: string, index: LibraryIndex): boolean {
+  let changed = false;
+  for (const entry of index.entries) {
+    if (entry.durationSec > 0 || entry.format !== 'wav') continue;
+    const full = join(root, entry.file);
+    let fd: number | null = null;
+    try {
+      fd = openSync(full, 'r');
+      const head = Buffer.alloc(64 * 1024);
+      const got = readSync(fd, head, 0, head.length, 0);
+      const info = parseWav(head.subarray(0, got));
+      if (info && info.durationSec > 0) {
+        entry.durationSec = Math.round(info.durationSec * 1000) / 1000;
+        changed = true;
+      }
+    } catch {
+      // 文件不在或读不了就跳过，列表仍按「—」显示。
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* 已关闭 */ }
+      }
+    }
+  }
+  return changed;
+}
+
 export function libraryStats(root: string, index?: LibraryIndex): LibraryStats {
   const data = index ?? readLibrary(root);
   return {
@@ -256,7 +289,7 @@ export function saveToLibrary(opts: SaveLibraryOptions): SaveLibraryResult {
     title,
     file: rel,
     bytes: st.size,
-    durationSec: 0,
+    durationSec: Math.max(0, opts.durationSec ?? 0),
     format: ext.slice(1).toLowerCase() || 'wav',
     createdAt: new Date().toISOString(),
     ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),

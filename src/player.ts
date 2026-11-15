@@ -4,8 +4,11 @@
  * 工具 `rvc_sing` 只等第一块 PCM 进输出流就回执，不阻塞整首；再点歌先 `stop()`，
  * 关流丢掉队列里没播的部分。WAV 只收 PCM16（单声道或立体声），其它格式明确拒播。
  */
-import { closeSync, openSync, readSync, statSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { closeSync, mkdtempSync, openSync, readSync, rmSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { extname, join } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
 import { parseWav, type WavInfo } from './wav.ts';
 
@@ -53,10 +56,42 @@ export interface AudioSink {
 export interface SongPlayer {
   /** 停下当前歌曲（关流、丢弃队列）。 */
   stop(): void;
-  /** 从头播放一个 WAV；第一块 PCM 写进输出流后返回。 */
+  /** 从头播放一个音频；第一块 PCM 写进输出流后返回。 */
   playFile(path: string): Promise<{ durationSec: number; info: WavInfo }>;
   /** 停播并关掉输出流。 */
   close(): void;
+}
+
+export interface PlayerOptions {
+  /** ffmpeg 可执行文件；默认走 PATH（worker 解 mp3 用的也是它）。 */
+  ffmpeg?: string;
+}
+
+/** 把浏览器能播、audify 播不了的格式转成临时 WAV；用完删目录。 */
+function convertToWav(input: string, output: string, ffmpeg: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      ffmpeg,
+      ['-nostdin', '-y', '-i', input, '-vn', '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', output],
+      { windowsHide: true, timeout: 120_000 },
+      (err, _stdout, stderr) => {
+        if (!err) {
+          resolve();
+          return;
+        }
+        const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+        const tail = String(stderr || err.message).trim().split(/\r?\n/).slice(-1)[0] ?? '';
+        reject(new Error(missing
+          ? `ffmpeg 不可用，无法把 ${extname(input) || '这个格式'} 转成 WAV`
+          : `ffmpeg 转换失败：${tail}`));
+      },
+    );
+  });
+}
+
+function removeTemp(dir: string | null): void {
+  if (!dir) return;
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* 还在播或已删 */ }
 }
 
 /** 单声道 / 立体声互转：输出声道多就复制，少就平均。 */
@@ -185,8 +220,14 @@ const sleep = (ms: number): Promise<void> => (ms > 0 ? new Promise((done) => set
 export class BackgroundSongPlayer implements SongPlayer {
   private generation = 0;
   private fd: number | null = null;
+  /** mp3 等转出来的临时 WAV 目录；停播或播完时删。 */
+  private tempDir: string | null = null;
 
-  constructor(private readonly sink: AudioSink, private readonly log: Logger) {}
+  constructor(
+    private readonly sink: AudioSink,
+    private readonly log: Logger,
+    private readonly opts: PlayerOptions = {},
+  ) {}
 
   stop(): void {
     this.generation += 1;
@@ -194,6 +235,9 @@ export class BackgroundSongPlayer implements SongPlayer {
       try { closeSync(this.fd); } catch { /* 已关闭 */ }
       this.fd = null;
     }
+    const temp = this.tempDir;
+    this.tempDir = null;
+    removeTemp(temp);
     this.sink.cut();
   }
 
@@ -205,8 +249,26 @@ export class BackgroundSongPlayer implements SongPlayer {
   async playFile(path: string): Promise<{ durationSec: number; info: WavInfo }> {
     this.stop();
     const generation = this.generation;
-    const size = statSync(path).size;
-    const fd = openSync(path, 'r');
+    // 库里的翻唱一般是 mp3：先用 ffmpeg 转成临时 WAV，播完/停播时删掉临时目录。
+    let playPath = path;
+    let tempDir: string | null = null;
+    if (extname(path).toLowerCase() !== '.wav') {
+      tempDir = mkdtempSync(join(tmpdir(), 'rvc-play-'));
+      playPath = join(tempDir, 'song.wav');
+      try {
+        await convertToWav(path, playPath, this.opts.ffmpeg ?? 'ffmpeg');
+      } catch (err) {
+        removeTemp(tempDir);
+        throw err;
+      }
+      if (generation !== this.generation) {
+        removeTemp(tempDir);
+        throw new Error('播放已取消');
+      }
+      this.tempDir = tempDir;
+    }
+    const size = statSync(playPath).size;
+    const fd = openSync(playPath, 'r');
     this.fd = fd;
     let info: WavInfo | null = null;
     try {
@@ -215,22 +277,26 @@ export class BackgroundSongPlayer implements SongPlayer {
       info = parseWav(head);
     } catch (err) {
       this.release(fd);
+      removeTemp(tempDir);
       throw err;
     }
     if (!info || info.dataStart > size) {
       this.release(fd);
+      removeTemp(tempDir);
       throw new Error('不是合法的 WAV 文件');
     }
     if (info.audioFormat !== 1 || info.bitsPerSample !== 16) {
       this.release(fd);
+      removeTemp(tempDir);
       throw new Error('只支持 16-bit PCM WAV');
     }
     if (info.channels !== 1 && info.channels !== 2) {
       this.release(fd);
+      removeTemp(tempDir);
       throw new Error(`只支持 1 / 2 声道，这个文件是 ${info.channels} 声道`);
     }
     const dataSize = Math.max(0, Math.min(info.dataSize, size - info.dataStart));
-    const loop = this.loop(generation, fd, { ...info, dataSize, durationSec: info.durationSec });
+    const loop = this.loop(generation, fd, { ...info, dataSize, durationSec: info.durationSec }, tempDir);
     // 第一块写进输出流（或文件是空的）后才回执，保证「说在放」时真的开始出声。
     const started = await loop.started;
     if (!started) throw new Error('播放已取消');
@@ -247,6 +313,7 @@ export class BackgroundSongPlayer implements SongPlayer {
     generation: number,
     fd: number,
     info: WavInfo,
+    tempDir: string | null = null,
   ): { started: Promise<boolean>; done: Promise<void> } {
     let markStarted: (ok: boolean) => void = () => undefined;
     const started = new Promise<boolean>((resolve) => { markStarted = resolve; });
@@ -287,6 +354,9 @@ export class BackgroundSongPlayer implements SongPlayer {
         if (first) markStarted(false);
       } finally {
         this.release(fd);
+        // 播完自然结束就删临时 WAV；stop() 抢先删过也没关系。
+        if (this.tempDir === tempDir) this.tempDir = null;
+        removeTemp(tempDir);
       }
     })();
     return { started, done };

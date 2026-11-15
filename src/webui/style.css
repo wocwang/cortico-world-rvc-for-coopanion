@@ -35,6 +35,11 @@
 .rvc-recent-head span { opacity: .7; font-variant-numeric: tabular-nums; }
 .rvc-recent .rvc-acts { margin-top: .3em; }
 .rvc-recent-form { margin: .3em 0 .6em; padding: .5em .6em; border-radius: 6px; background: var(--bg-2, rgba(127, 127, 127, .1)); }
+.rvc-library { display: flex; flex-direction: column; gap: .35em; }
+.rvc-library-row { border: 1px solid var(--line, rgba(127, 127, 127, .25)); border-radius: 6px; padding: .5em .6em; }
+.rvc-library-head { display: flex; gap: .6em; align-items: baseline; font-size: .9em; }
+.rvc-library-head strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rvc-library .rvc-acts { margin-top: .3em; }
 /* 音频输入：原生控件透明铺满，外观自己画；点击与键盘焦点仍然落在原生 file 控件上。 */
 .rvc-file { position: relative; display: flex; flex-wrap: wrap; align-items: baseline; gap: .2em .5em; width: 100%; box-sizing: border-box; padding: .45em .6em; border: 1px solid var(--line, rgba(127, 127, 127, .35)); border-radius: 6px; background: var(--bg-2, rgba(127, 127, 127, .08)); cursor: pointer; }
 .rvc-file:focus-within { outline: 2px solid var(--accent, #4a9eff); outline-offset: 1px; }

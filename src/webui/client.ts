@@ -134,6 +134,27 @@ interface SessionOutputFile {
   targetLufs?: number;
   mediaKind?: 'cover' | 'clean';
 }
+/** 翻唱库列表：条目来自 World 的 `libraryState`，试听走 `libraryFile` 的 `$file`。 */
+interface LibraryEntryView {
+  id: string;
+  kind: 'clean' | 'cover';
+  title: string;
+  file: string;
+  bytes: number;
+  durationSec: number;
+  format: string;
+  createdAt: string;
+  sessionId?: string;
+  voice?: string;
+  mastered?: boolean;
+}
+interface LibraryState {
+  root: string;
+  totalBytes: number;
+  maxBytes: number;
+  count: number;
+  entries: LibraryEntryView[];
+}
 /** 入库目标：会话成品（outputs）或母带（masters），index 为 -1 表示最近一条。 */
 interface LibraryTarget {
   media: 'output' | 'master';
@@ -834,8 +855,7 @@ const coverPanel: WebUiPanel = {
 
     // 顶部「最近翻唱」：原声/成品、体积、时间、时长、音色，以及继续编辑 / 另存 / 删除与保留策略。
     const recentSheet = ui.foldSheet('rvc-cover-recent', { title: t.recentTitle, desc: t.recentHint });
-    const recentList = ui.h('div');
-    const daysInput = ui.input({ type: 'number', value: '7' });
+    const recentList = ui.h('div');    const daysInput = ui.input({ type: 'number', value: '7' });
     daysInput.min = '0';
     daysInput.max = '365';
     daysInput.step = '1';
@@ -859,6 +879,23 @@ const coverPanel: WebUiPanel = {
       retentionLine,
     );
 
+    // 翻唱库：独立于会话的成品副本；列表、试听、删除与总占用。
+    const librarySheet = ui.foldSheet('rvc-cover-library', { title: t.libraryPanelTitle, desc: t.libraryPanelHint });
+    const librarySummary = ui.h('div', 'rvc-detail');
+    const libraryLine = ui.h('div', 'rvc-detail');
+    const libraryList = ui.h('div', 'rvc-library');
+    const libraryRefreshBtn = ui.button(t.libraryRefresh, { size: 'sm', onClick: () => void loadLibrary(true) });
+    const libraryActs = ui.actions();
+    libraryActs.append(libraryRefreshBtn);
+    librarySheet.body.append(librarySummary, libraryActs, libraryLine, libraryList);
+    const libraryAudio = document.createElement('audio');
+    libraryAudio.hidden = true;
+    libraryAudio.addEventListener('ended', () => {
+      libPlaying = '';
+      libraryLine.textContent = '';
+      renderLibrary(libState, true);
+    });
+
     // 段落级参数：默认 20 秒网格，每段独立重做/静音/还原/切分/合并。
     const segmentSheet = ui.section(t.segmentTitle, t.segmentHint);
     const segmentList = ui.h('div', 'rvc-segments');
@@ -880,10 +917,11 @@ const coverPanel: WebUiPanel = {
     abAudioB.hidden = true;
     abSheet.append(abActs, abLine);
 
-    ctx.root.append(recentSheet.el, sheet, audio, resultLine, dl, refineSheet, waveSheet, masterSheet, segmentSheet, abSheet, abAudioA, abAudioB, msg);
+    ctx.root.append(recentSheet.el, librarySheet.el, sheet, audio, resultLine, dl, refineSheet, waveSheet, masterSheet, segmentSheet, abSheet, abAudioA, abAudioB, libraryAudio, msg);
     ctx.own(disposable(() => {
       stopPreview();
       stopAB();
+      stopLibraryPreview();
       if (previewCtx) void previewCtx.close();
       if (abUrlA) URL.revokeObjectURL(abUrlA);
       if (abUrlB) URL.revokeObjectURL(abUrlB);
@@ -935,6 +973,12 @@ const coverPanel: WebUiPanel = {
     let recentKey = '';
     let exportForm: HTMLElement | null = null;
     let libraryForm: HTMLElement | null = null;
+    /** 翻唱库列表与试听状态；试听复用同一个 audio，切歌先停上一首。 */
+    let libState: LibraryState | null = null;
+    let libKey = '';
+    let libSeq = 0;
+    let libPlaying = '';
+    let libUrl: string | null = null;
 
     function currentParams(): CoverParams {
       return {
@@ -1330,9 +1374,135 @@ const coverPanel: WebUiPanel = {
           : t.librarySaved(`${r.entry.title}_${kind.value === 'clean' ? '清唱' : '翻唱'}cover`, ui.fmt.bytes(r.entry.bytes));
         line.textContent = text;
         ui.toast(text);
+        void loadLibrary(true);
       } catch (err) {
         line.textContent = errText(err);
         line.classList.add('bad');
+      }
+    }
+
+    // ---- 翻唱库面板 ---------------------------------------------------------
+
+    function libKind(entry: LibraryEntryView): string {
+      return entry.kind === 'clean' ? t.libraryKindClean : t.libraryKindCover;
+    }
+
+    function renderLibrary(data: LibraryState | null, force = false): void {
+      libState = data;
+      if (!data) return;
+      const key = JSON.stringify(data.entries.map((entry) => [
+        entry.id, entry.title, entry.kind, entry.bytes, entry.durationSec, entry.createdAt,
+      ]));
+      if (!force && key === libKey) return;
+      libKey = key;
+      librarySummary.textContent = t.libraryUsage(
+        data.count,
+        ui.fmt.bytes(data.totalBytes),
+        ui.fmt.bytes(data.maxBytes),
+      );
+      libraryList.textContent = '';
+      if (!data.entries.length) {
+        libraryList.append(ui.h('div', 'rvc-detail', t.libraryEmpty));
+        return;
+      }
+      const sorted = [...data.entries].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      for (const entry of sorted) {
+        const row = ui.h('div', 'rvc-library-row');
+        const head = ui.h('div', 'rvc-library-head');
+        head.append(
+          ui.h('strong', '', entry.title),
+          ui.pill(entry.kind === 'clean' ? t.libraryKindClean : t.libraryKindCover, entry.kind === 'clean' ? 'on' : 'plain'),
+        );
+        const duration = entry.durationSec > 0 ? ui.fmt.duration(entry.durationSec * 1000) : '—';
+        const meta = ui.h('div', 'rvc-detail', t.libraryMeta(
+          libKind(entry),
+          duration,
+          `${ui.fmt.bytes(entry.bytes)} · ${entry.format.toUpperCase()}`,
+        ));
+        const source = ui.h('div', 'rvc-detail', entry.sessionId
+          ? t.librarySource(`${entry.sessionId.slice(0, 12)}…`)
+          : t.libraryNoSource);
+        const acts = ui.actions();
+        acts.append(
+          ui.button(libPlaying === entry.id ? t.libraryStopListen : t.libraryListen, {
+            size: 'sm', onClick: () => void previewLibrary(entry),
+          }),
+          ui.button(t.libraryDelete, { size: 'sm', onClick: () => void deleteLibrary(entry) }),
+        );
+        row.append(head, meta, source, acts);
+        libraryList.append(row);
+      }
+    }
+
+    function stopLibraryPreview(): void {
+      libraryAudio.pause();
+      libraryAudio.removeAttribute('src');
+      if (libUrl) {
+        URL.revokeObjectURL(libUrl);
+        libUrl = null;
+      }
+      libPlaying = '';
+      libraryLine.textContent = '';
+    }
+
+    async function loadLibrary(force = false): Promise<void> {
+      const seq = ++libSeq;
+      try {
+        const data = await ctx.invoke<LibraryState>('libraryState');
+        if (seq !== libSeq) return;
+        if (libPlaying && !data.entries.some((entry) => entry.id === libPlaying)) stopLibraryPreview();
+        renderLibrary(data, force);
+      } catch (err) {
+        if (seq === libSeq) {
+          libraryLine.textContent = errText(err);
+          libraryLine.classList.add('bad');
+        }
+      }
+    }
+
+    async function previewLibrary(entry: LibraryEntryView): Promise<void> {
+      libraryLine.textContent = '';
+      libraryLine.classList.remove('bad');
+      if (libPlaying === entry.id) {
+        stopLibraryPreview();
+        renderLibrary(libState, true);
+        return;
+      }
+      try {
+        const blob = await ctx.invokeBinary('libraryFile', [entry.id]);
+        if (libUrl) URL.revokeObjectURL(libUrl);
+        libUrl = URL.createObjectURL(blob);
+        libraryAudio.src = libUrl;
+        libPlaying = entry.id;
+        libraryLine.textContent = t.libraryPlaying(entry.title);
+        renderLibrary(libState, true);
+        await libraryAudio.play();
+      } catch (err) {
+        libPlaying = '';
+        libraryLine.textContent = errText(err);
+        libraryLine.classList.add('bad');
+        renderLibrary(libState, true);
+      }
+    }
+
+    async function deleteLibrary(entry: LibraryEntryView): Promise<void> {
+      const ok = await ui.confirm({
+        title: t.libraryDelete,
+        body: t.libraryDeleteConfirm(entry.title),
+        danger: true,
+      });
+      if (!ok) return;
+      libraryLine.textContent = '';
+      libraryLine.classList.remove('bad');
+      try {
+        if (libPlaying === entry.id) stopLibraryPreview();
+        const data = await ctx.invoke<LibraryState>('libraryDelete', [entry.id]);
+        libKey = '';
+        renderLibrary(data);
+        libraryLine.textContent = t.libraryDeleted(entry.title);
+      } catch (err) {
+        libraryLine.textContent = errText(err);
+        libraryLine.classList.add('bad');
       }
     }
 
@@ -2570,7 +2740,7 @@ const coverPanel: WebUiPanel = {
         const [s, v] = await Promise.all([ctx.invoke<PanelState>('state'), ctx.invoke<VoicesResp>('voices')]);
         render(s, v.voices ?? []);
         await settle(s);
-        await loadRefine(selectedId);
+        await Promise.all([loadRefine(selectedId), loadLibrary()]);
       } catch (err) { if (!state) msg.textContent = errText(err); }
     };
     void refresh();

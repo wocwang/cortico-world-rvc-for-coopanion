@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -47,12 +48,22 @@ function wav(opts: WavOptions = {}): Buffer {
   return Buffer.concat([head, data]);
 }
 
-function file(bytes: Buffer): string {
+function file(bytes: Buffer, ext = '.wav'): string {
   const dir = mkdtempSync(join(tmpdir(), 'rvc-player-'));
   dirs.push(dir);
-  const path = join(dir, 'song.wav');
+  const path = join(dir, `song${ext}`);
   writeFileSync(path, bytes);
   return path;
+}
+
+/** 本机有没有 ffmpeg；没有就跳过真实转码用例（与 worker 解 mp3 用的是同一个）。 */
+function hasFfmpeg(): boolean {
+  try {
+    execFileSync('ffmpeg', ['-version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 class FakeSink implements AudioSink {
@@ -143,6 +154,31 @@ describe('背景播放', () => {
     const player = new BackgroundSongPlayer(new FakeSink(), log);
     await expect(player.playFile(file(Buffer.from('ID3 fake mp3')))).rejects.toThrow('WAV');
     await expect(player.playFile(file(wav({ format: 3 })))).rejects.toThrow('PCM');
+    player.close();
+  });
+
+  it('ffmpeg 不可用时明确说清，不悄悄静音', async () => {
+    const sink = new FakeSink();
+    const player = new BackgroundSongPlayer(sink, log, { ffmpeg: join(tmpdir(), 'no-such-ffmpeg.exe') });
+    await expect(player.playFile(file(Buffer.from('ID3 fake mp3'), '.mp3'))).rejects.toThrow('ffmpeg 不可用');
+    expect(sink.writes).toHaveLength(0);
+    player.close();
+  });
+
+  it.skipIf(!hasFfmpeg())('mp3 先用 ffmpeg 转临时 WAV 再播', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rvc-player-mp3-'));
+    dirs.push(dir);
+    const source = join(dir, 'source.wav');
+    writeFileSync(source, wav({ seconds: 0.3 }));
+    const mp3 = join(dir, 'song.mp3');
+    execFileSync('ffmpeg', ['-nostdin', '-y', '-i', source, '-c:a', 'libmp3lame', '-b:a', '128k', mp3], { stdio: 'ignore' });
+
+    const sink = new FakeSink();
+    const player = new BackgroundSongPlayer(sink, log);
+    const done = await player.playFile(mp3);
+    expect(done.durationSec).toBeGreaterThan(0.2);
+    expect(sink.writes.length).toBeGreaterThan(0);
+    expect(sink.writes[0]?.channels).toBe(2);
     player.close();
   });
 });
