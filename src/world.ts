@@ -29,6 +29,10 @@ import {
   rerunRange, rerunSession, revertSegment, type RangeOptions,
 } from './refine.ts';
 import { panelText } from './webui/text.ts';
+import {
+  defaultLibraryDir, deleteLibraryEntry, libraryStats, readLibrary, resolveLibraryFile,
+  saveToLibrary, type LibraryKind,
+} from './library.ts';
 
 const WORKER_SCRIPT = fileURLToPath(new URL('./python/worker.py', import.meta.url));
 
@@ -38,6 +42,8 @@ export interface RvcWorldOptions {
   packageDir: string;
   /** `<部署根>/runtimes`；自动找 gpt-sovits 运行时用。 */
   runtimesRoot: () => string;
+  /** 翻唱库根目录；默认 `<dataDir>/../../../../extensions/rvc-library`，测试可覆盖。 */
+  libraryDir?: string;
 }
 
 /** 在 `<runtimesRoot>/gpt-sovits/<版本>/<档>/runtime/python.exe` 里挑一个可用运行时。
@@ -171,9 +177,12 @@ export class RvcWorld implements World {
   } | null = null;
   /** 当前打开/最近创建的分轨会话；清理与删除时据此保护。 */
   private activeSession: string | null = null;
+  /** 翻唱库根目录（独立于会话，不随升级丢失）。 */
+  private readonly libraryDir: string;
 
   constructor(opts: RvcWorldOptions) {
     this.opts = opts;
+    this.libraryDir = opts.libraryDir ?? defaultLibraryDir(opts.dataDir);
   }
 
   envPromptVars(): Record<string, string> | null {
@@ -512,8 +521,10 @@ export class RvcWorld implements World {
     mkdirSync(tmpDir, { recursive: true });
     const id = randomUUID();
     const ext = extname(fileName).toLowerCase() || '.wav';
+    const withBgm = raw.withBgm !== false;
+    const outFormat: 'wav' | 'mp3' = withBgm ? job.format : 'wav';
     const input = join(tmpDir, `${id}${ext}`);
-    const output = join(tmpDir, `${id}.${job.format}`);
+    const output = join(tmpDir, `${id}.${outFormat}`);
     writeFileSync(input, job.file);
     this.cancelIdle();
     const at = Date.now();
@@ -529,19 +540,20 @@ export class RvcWorld implements World {
         pitch: job.pitch,
         indexRate: job.indexRate,
         protect: job.protect,
-        format: job.format,
+        format: outFormat,
         vocalGain,
         chunk: job.chunk,
         sessionDir: session?.dir,
+        withBgm,
       });
       const audio = readFileSync(output);
       const outDir = join(this.opts.dataDir, 'out');
       mkdirSync(outDir, { recursive: true });
-      const savedPath = join(outDir, `cover-${stamp()}.${job.format}`);
+      const savedPath = join(outDir, `${withBgm ? 'cover' : 'clean'}-${stamp()}.${outFormat}`);
       writeFileSync(savedPath, audio);
       if (session) {
         const now = new Date().toISOString();
-        const rel = `out/mix-1.${job.format}`;
+        const rel = withBgm ? `out/mix-1.${outFormat}` : 'out/clean-1.wav';
         writeFileSync(join(session.dir, rel), audio);
         // 原声副本：勾了「保存原声副本」才复制；之后「重新翻唱」直接用它，不必再让用户选文件。
         // 写不进去不影响这次翻唱，只是菜单里会显示「原声未保存」。
@@ -564,7 +576,9 @@ export class RvcWorld implements World {
           source: {
             durationSec: done.durationSec ?? 0,
             inputPeak: done.inputPeak ?? 0,
-            format: job.format,
+            // 原声副本保留原文件字节，格式按上传文件的扩展名记。
+            format: ext.replace(/^\./, '') || 'wav',
+            ...(fileName ? { name: fileName } : {}),
             ...(sourceFile ? { file: sourceFile, bytes: job.file.length } : {}),
           },
           stems: { vocals: 'stems/vocals.wav', inst: 'stems/inst.wav' },
@@ -586,8 +600,9 @@ export class RvcWorld implements World {
             fadeInSec: 0,
             fadeOutSec: 0,
             peakScale: done.peakScale ?? 1,
+            withBgm,
           },
-          outputs: [{ format: job.format, path: rel, at: now }],
+          outputs: [{ format: outFormat, path: rel, at: now, kind: withBgm ? 'cover' : 'clean' }],
         };
         writeSession(this.opts.dataDir, session.id, record);
         sessionWritten = true;
@@ -595,11 +610,11 @@ export class RvcWorld implements World {
       }
       this.lastCover = {
         at, ms: done.ms, bytes: audio.length, savedPath,
-        voice: job.voice || engine.state().model || '', format: job.format,
+        voice: job.voice || engine.state().model || '', format: outFormat,
         stages: done.stages, peakScale: done.peakScale,
         sessionId: session?.id,
       };
-      return { $binary: { mime: job.format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+      return { $binary: { mime: outFormat === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
     } finally {
       // 没写成功就清掉空会话，别在 sessions 里留垃圾。
       if (session && !sessionWritten) {
@@ -649,24 +664,27 @@ export class RvcWorld implements World {
       throw new RvcError('param', err instanceof Error ? err.message : String(err));
     }
     this.activeSession = id;
+    const withBgm = raw.withBgm === undefined ? result.session.mix.withBgm !== false : raw.withBgm !== false;
+    const outFormat = withBgm ? format : 'wav';
     const { audio, done, path } = await this.mixSession(id, result.session, {
       format,
       vocalGainDb: clampNumber(raw.vocalGainDb, -24, 24, result.session.mix.vocalGainDb),
       instGainDb: clampNumber(raw.instGainDb, -24, 24, result.session.mix.instGainDb),
       fadeInSec: clampNumber(raw.fadeInSec, 0, 30, result.session.mix.fadeInSec),
       fadeOutSec: clampNumber(raw.fadeOutSec, 0, 30, result.session.mix.fadeOutSec),
+      withBgm,
     }, true);
     this.lastCover = {
       at: Date.now(), ms: result.done.ms + done.ms, bytes: audio.length, savedPath: path,
-      voice: result.session.engine.voice, format,
+      voice: result.session.engine.voice, format: outFormat,
       stages: { convert: result.done.ms, mix: done.ms },
       peakScale: done.peakScale,
       sessionId: id,
     };
     this.log?.info('RVC 原地重新翻唱完成', {
-      id, pitch: result.session.converted.defaults.pitch, ms: result.done.ms, format,
+      id, pitch: result.session.converted.defaults.pitch, ms: result.done.ms, format: outFormat,
     });
-    return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+    return { $binary: { mime: outFormat === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
   }
 
   /** 面板「重新混音」：只读会话里的分轨与变声结果，重做混音后落盘，不跑模型。 */
@@ -684,6 +702,7 @@ export class RvcWorld implements World {
     const instGainDb = clampNumber(raw.instGainDb, -24, 24, 0);
     const fadeInSec = clampNumber(raw.fadeInSec, 0, 30, 0);
     const fadeOutSec = clampNumber(raw.fadeOutSec, 0, 30, 0);
+    const withBgm = raw.withBgm === undefined ? session.mix.withBgm !== false : raw.withBgm !== false;
 
     if (!engine.ready()) {
       await this.ensureReady();
@@ -691,14 +710,14 @@ export class RvcWorld implements World {
     }
 
     const { audio, done, path } = await this.mixSession(id, session, {
-      format, vocalGainDb, instGainDb, fadeInSec, fadeOutSec,
+      format, vocalGainDb, instGainDb, fadeInSec, fadeOutSec, withBgm,
     }, true);
     this.lastMix = {
       at: Date.now(), ms: done.ms, bytes: audio.length, savedPath: path,
-      format, peakScale: done.peakScale,
+      format: withBgm ? format : 'wav', peakScale: done.peakScale,
     };
-    this.log?.info('RVC 重新混音完成', { id, format, ms: done.ms });
-    return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+    this.log?.info('RVC 重新混音完成', { id, format: withBgm ? format : 'wav', ms: done.ms });
+    return { $binary: { mime: !withBgm || format === 'wav' ? 'audio/wav' : 'audio/mpeg', base64: audio.toString('base64') } };
   }
 
   /**
@@ -708,7 +727,10 @@ export class RvcWorld implements World {
   private async mixSession(
     id: string,
     session: RefineSession,
-    opts: { format: 'wav' | 'mp3'; vocalGainDb: number; instGainDb: number; fadeInSec: number; fadeOutSec: number },
+    opts: {
+      format: 'wav' | 'mp3'; vocalGainDb: number; instGainDb: number;
+      fadeInSec: number; fadeOutSec: number; withBgm: boolean;
+    },
     record: boolean,
   ): Promise<{ audio: Buffer; done: ConvertDone; path: string }> {
     const dir = sessionDir(this.opts.dataDir, id);
@@ -716,35 +738,54 @@ export class RvcWorld implements World {
     if (!dir || !engine) throw new RvcError('unavailable', '会话或引擎不可用');
     const vocals = join(dir, session.converted.path);
     const inst = join(dir, session.stems.inst);
-    if (!existsSync(vocals) || !existsSync(inst)) {
-      throw new RvcError('param', '会话缺少分轨文件，请重新翻唱一次');
+    if (!existsSync(vocals)) {
+      throw new RvcError('param', '会话缺少人声文件，请重新翻唱一次');
     }
+    if (opts.withBgm && !existsSync(inst)) {
+      throw new RvcError('param', '会话缺少伴奏文件，请重新翻唱一次');
+    }
+    const format = opts.withBgm ? opts.format : 'wav';
     let output: string;
     let rel: string | null = null;
     if (record) {
       // 编号取已有最大值 +1：成品数量被裁到 3 个后，仍不会覆盖同名文件。
+      const prefix = opts.withBgm ? 'mix' : 'clean';
       const next = session.outputs.reduce((max, item) => {
-        const match = /^out\/mix-(\d+)\./.exec(item.path);
+        const match = new RegExp(`^out/${prefix}-(\\d+)\\.`).exec(item.path);
         return match ? Math.max(max, Number(match[1])) : max;
       }, 0) + 1;
-      rel = `out/mix-${next}.${opts.format}`;
+      rel = `out/${prefix}-${next}.${format}`;
       output = join(dir, rel);
     } else {
-      output = join(dir, 'out', `preview.${opts.format}`);
+      output = join(dir, 'out', opts.withBgm ? `preview.${format}` : 'preview-clean.wav');
     }
     this.cancelIdle();
-    const done = await engine.remix({
-      vocals, inst, output, format: opts.format,
+    const done = opts.withBgm ? await engine.remix({
+      vocals, inst, output, format,
       vocalGain: opts.vocalGainDb, instGain: opts.instGainDb,
+      fadeIn: opts.fadeInSec, fadeOut: opts.fadeOutSec,
+      rmsRatio: session.mix.rmsRatio,
+      mutedRanges: mutedRanges(session.segments),
+    }) : await engine.vocalOnly({
+      vocals, output,
+      vocalGain: opts.vocalGainDb,
       fadeIn: opts.fadeInSec, fadeOut: opts.fadeOutSec,
       rmsRatio: session.mix.rmsRatio,
       mutedRanges: mutedRanges(session.segments),
     });
     const audio = readFileSync(output);
     if (record && rel) {
-      session.mix = { ...session.mix, ...opts, peakScale: done.peakScale ?? 1 };
+      session.mix = {
+        ...session.mix,
+        vocalGainDb: opts.vocalGainDb, instGainDb: opts.instGainDb,
+        fadeInSec: opts.fadeInSec, fadeOutSec: opts.fadeOutSec,
+        peakScale: done.peakScale ?? 1, withBgm: opts.withBgm,
+      };
       session.updatedAt = new Date().toISOString();
-      session.outputs.push({ format: opts.format, path: rel, at: session.updatedAt });
+      session.outputs.push({
+        format, path: rel, at: session.updatedAt,
+        kind: opts.withBgm ? 'cover' : 'clean',
+      });
       // 只留最近 3 个成品，避免反复试听把磁盘撑大。
       while (session.outputs.length > 3) {
         const old = session.outputs.shift();
@@ -786,18 +827,21 @@ export class RvcWorld implements World {
       ms: result.done.ms, peakFactor: result.done.peakFactor,
     });
     this.activeSession = id;
+    const withBgm = result.session.mix.withBgm !== false;
+    const outFormat = withBgm ? format : 'wav';
     const { audio, done, path } = await this.mixSession(id, result.session, {
       format,
       vocalGainDb: result.session.mix.vocalGainDb,
       instGainDb: result.session.mix.instGainDb,
       fadeInSec: result.session.mix.fadeInSec,
       fadeOutSec: result.session.mix.fadeOutSec,
+      withBgm,
     }, true);
     this.lastRange = {
       at: Date.now(), ms: result.done.ms + done.ms, bytes: audio.length, savedPath: path,
-      format, start: result.segment.start, end: result.segment.end, pitch: result.segment.params.pitch,
+      format: outFormat, start: result.segment.start, end: result.segment.end, pitch: result.segment.params.pitch,
     };
-    return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+    return { $binary: { mime: outFormat === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
   }
 
   /** 面板「试听这段」：按当前滑杆参数出一条临时成品，不写 outputs、不改会话。 */
@@ -812,14 +856,21 @@ export class RvcWorld implements World {
       if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
     }
     const format = raw.format === 'mp3' ? 'mp3' : 'wav';
+    const withBgm = raw.withBgm === undefined ? session.mix.withBgm !== false : raw.withBgm !== false;
     const { audio } = await this.mixSession(id, session, {
       format,
       vocalGainDb: clampNumber(raw.vocalGainDb, -24, 24, session.mix.vocalGainDb),
       instGainDb: clampNumber(raw.instGainDb, -24, 24, session.mix.instGainDb),
       fadeInSec: clampNumber(raw.fadeInSec, 0, 30, session.mix.fadeInSec),
       fadeOutSec: clampNumber(raw.fadeOutSec, 0, 30, session.mix.fadeOutSec),
+      withBgm,
     }, false);
-    return { $binary: { mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') } };
+    return {
+      $binary: {
+        mime: !withBgm || format === 'wav' ? 'audio/wav' : 'audio/mpeg',
+        base64: audio.toString('base64'),
+      },
+    };
   }
 
   /** 面板「导出音高」：对分离人声提一次 RMVPE，写 out/f0.csv，内容直接交给面板下载。 */
@@ -1030,6 +1081,7 @@ export class RvcWorld implements World {
       instGainDb: session.mix.instGainDb,
       fadeInSec: session.mix.fadeInSec,
       fadeOutSec: session.mix.fadeOutSec,
+      withBgm: session.mix.withBgm !== false,
     }, true);
     this.lastRange = {
       at: Date.now(), ms: modelMs + done.ms, bytes: audio.length, savedPath: path,
@@ -1093,6 +1145,7 @@ export class RvcWorld implements World {
     path: string;
     at: string;
     bytes: number;
+    mediaKind?: 'cover' | 'clean';
     targetLufs?: number;
   }> {
     const dir = sessionDir(this.opts.dataDir, id);
@@ -1104,14 +1157,89 @@ export class RvcWorld implements World {
     const files = [
       ...session.outputs.map((item, index) => ({
         kind: 'output' as const, index, format: item.format, path: item.path, at: item.at, bytes: size(item.path),
+        mediaKind: item.kind,
       })),
       ...(session.masters ?? []).map((item, index) => ({
         kind: 'master' as const, index, format: item.format, path: item.path, at: item.at,
-        bytes: size(item.path), targetLufs: item.targetLufs,
+        bytes: size(item.path), targetLufs: item.targetLufs, mediaKind: 'cover' as const,
       })),
     ];
     files.sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.path.localeCompare(b.path));
     return files;
+  }
+
+  /** 保存一份会话成品到翻唱库；面板把歌名/类型传进来，文件复制在后端完成。 */
+  private librarySave(args: unknown[]): Record<string, unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const media = args[1] === 'master' ? 'master' : 'output';
+    const index = Number(args[2]);
+    const libraryKind: LibraryKind = args[3] === 'clean' ? 'clean' : 'cover';
+    const titleArg = typeof args[4] === 'string' ? args[4].trim() : '';
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    const list = media === 'master' ? session.masters ?? [] : session.outputs;
+    // 面板传 -1 表示「最近一条」，老版本没传序号时也按最近一条兜底。
+    const item = Number.isInteger(index) && index >= 0 ? list[index] : list[list.length - 1];
+    if (!item) throw new RvcError('param', media === 'master' ? '这个会话还没有母带' : '这个会话还没有成品');
+    const source = join(dir, item.path);
+    if (!existsSync(source)) throw new RvcError('param', `文件不在了：${item.path}`);
+    const ext = extname(item.path).toLowerCase();
+    if (libraryKind === 'clean' && ext !== '.wav') {
+      throw new RvcError('param', '清唱入库需要 WAV 格式，请先生成清唱版');
+    }
+    const fallback = session.source.name ? session.source.name.replace(/\.[a-z0-9]{1,5}$/i, '') : '未命名';
+    const title = titleArg || fallback;
+    try {
+      const result = saveToLibrary({
+        root: this.libraryDir,
+        kind: libraryKind,
+        title,
+        sourcePath: source,
+        sessionId: id,
+        voice: session.engine.voice,
+        mastered: media === 'master',
+      });
+      this.log?.info('保存到 RVC 翻唱库', { id, kind: libraryKind, title, duplicate: result.duplicate });
+      return { ...result };
+    } catch (err) {
+      throw new RvcError('param', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private libraryState(): Record<string, unknown> {
+    const index = readLibrary(this.libraryDir);
+    return {
+      ...libraryStats(this.libraryDir, index),
+      entries: index.entries.map(({ sourceHash: _hash, ...item }) => item),
+    };
+  }
+
+  private libraryFile(id: string): Record<string, unknown> {
+    const entry = resolveLibraryFile(this.libraryDir, id);
+    const bytes = readFileSync(entry.fullPath);
+    const ext = extname(entry.fullPath).toLowerCase() || '.wav';
+    return {
+      ...entry,
+      mime: AUDIO_MIME[ext] ?? 'application/octet-stream',
+      base64: bytes.toString('base64'),
+    };
+  }
+
+  private libraryDelete(id: string): Record<string, unknown> {
+    try {
+      return this.libraryState0(deleteLibraryEntry(this.libraryDir, id));
+    } catch (err) {
+      throw new RvcError('param', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private libraryState0(stats: ReturnType<typeof libraryStats>): Record<string, unknown> {
+    const index = readLibrary(this.libraryDir);
+    return {
+      ...stats,
+      entries: index.entries.map(({ sourceHash: _hash, ...item }) => item),
+    };
   }
 
   private deleteSession(id: string): Record<string, unknown> {
@@ -1224,6 +1352,10 @@ export class RvcWorld implements World {
     }
     if (method === 'sessionDelete') return this.deleteSession(String(args[0] ?? ''));
     if (method === 'sessionFile') return this.sessionFile(args);
+    if (method === 'librarySave') return this.librarySave(args);
+    if (method === 'libraryState') return this.libraryState();
+    if (method === 'libraryFile') return this.libraryFile(String(args[0] ?? ''));
+    if (method === 'libraryDelete') return this.libraryDelete(String(args[0] ?? ''));
     if (method === 'cleanupSessions') return this.cleanupSessions();
     if (method === 'storage') return { items: this.storage() };
     if (method === 'uninstall') return this.uninstall(String(args[0] ?? ''));

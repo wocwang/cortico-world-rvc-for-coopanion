@@ -778,13 +778,26 @@ def main() -> int:
             rms_conv = float(np.sqrt(np.mean(conv ** 2)))
             ratio = 1.0 if rms_vocal < 1e-5 or rms_conv < 1e-5 else min(4.0, max(0.25, rms_vocal / rms_conv))
             gain = ratio * (10 ** (float(req.get("vocalGain") or 0) / 20.0))
-            out = instrumental + np.tile(conv, (2, 1)) * gain
-            peak = float(np.abs(out).max())
-            scale = 1.0
-            if peak > 0.99:
-                scale = 0.99 / peak
-                out *= scale
-            write_audio(req.get("output") or "", out.T, 44100, fmt)
+            with_bgm = bool(req.get("withBgm", True))
+            if with_bgm:
+                out = instrumental + np.tile(conv, (2, 1)) * gain
+                peak = float(np.abs(out).max())
+                scale = 1.0
+                if peak > 0.99:
+                    scale = 0.99 / peak
+                    out *= scale
+                write_audio(req.get("output") or "", out.T, 44100, fmt)
+            else:
+                # 清唱：只保留人声，但用与翻唱版相同的 rmsRatio / vocalGain 和峰值保护。
+                clean = conv * gain
+                peak = float(np.abs(clean).max())
+                scale = 1.0
+                if peak > 0.99:
+                    scale = 0.99 / peak
+                    clean *= scale
+                clean_path = req.get("output") or ""
+                os.makedirs(os.path.dirname(os.path.abspath(clean_path)), exist_ok=True)
+                sf.write(clean_path, clean.astype(np.float32), 44100, subtype="PCM_16")
         except Exception:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "混音失败：%s" % traceback.format_exc()[-800:]})
             return
@@ -800,6 +813,7 @@ def main() -> int:
             "inputPeak": round(input_peak, 4),
             "modelSampleRate": int(conv_sr),
             "rmsRatio": round(ratio, 4),
+            "withBgm": with_bgm,
             "durationSec": round(n / 44100.0, 3),
         })
 
@@ -1041,6 +1055,107 @@ def main() -> int:
             "ok": True,
             "ms": int((time.time() - began) * 1000),
             "sampleRate": 44100,
+            "peakScale": round(scale, 3),
+            "durationSec": round(duration, 3),
+        })
+
+    def vocal_only(req: dict) -> None:
+        """清唱：只渲染变声后的人声，按与翻唱版相同的 rmsRatio / vocalGain 对齐响度。
+
+        只读 `vocals/conv.wav`，不重新分离/变声；输出单声道 44.1 kHz PCM16 WAV，
+        桌宠播放器可以直接播。
+        """
+        import numpy as np
+        import soundfile as sf
+
+        req_id = req.get("id")
+        vocals = req.get("vocals") or ""
+        output = req.get("output") or ""
+        if not output:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "缺少输出路径"})
+            return
+        if not vocals or not os.path.isfile(vocals):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到人声：%s" % vocals})
+            return
+
+        began = time.time()
+        try:
+            ratio = float(req.get("rmsRatio") or 1.0)
+            if not np.isfinite(ratio) or ratio <= 0:
+                ratio = 1.0
+            vgain = ratio * (10 ** (float(req.get("vocalGain") or 0) / 20.0))
+            fade_in = max(0.0, float(req.get("fadeIn") or 0))
+            fade_out = max(0.0, float(req.get("fadeOut") or 0))
+            muted = []
+            for item in req.get("mutedRanges") or []:
+                if not isinstance(item, dict):
+                    continue
+                start = max(0.0, float(item.get("start") or 0))
+                end = float(item.get("end") or 0)
+                if end > start:
+                    muted.append((start, end))
+            block = 1 << 20
+
+            with sf.SoundFile(vocals) as fv:
+                if int(fv.samplerate) != 44100:
+                    raise ValueError("清唱只支持 44.1 kHz 的会话文件")
+                total = int(fv.frames)
+                if total <= 0:
+                    raise ValueError("人声是空文件")
+                duration = total / 44100.0
+
+                def blocks():
+                    fv.seek(0)
+                    pos = 0
+                    while pos < total:
+                        n = min(block, total - pos)
+                        data = fv.read(n, dtype="float32", always_2d=True)
+                        mono = data.mean(axis=1).astype(np.float64)
+                        if muted:
+                            t = (np.arange(pos, pos + n, dtype=np.float64) + 0.5) / 44100.0
+                            gate = np.ones(n, dtype=np.float64)
+                            for start, end in muted:
+                                gate[(t >= start) & (t < end)] = 0.0
+                            mono = mono * gate
+                        yield pos, mono
+                        pos += n
+
+                def weights(pos: int, n: int):
+                    t = (np.arange(pos, pos + n, dtype=np.float64) + 0.5) / 44100.0
+                    w = np.ones(n, dtype=np.float64)
+                    if fade_in > 0:
+                        w = np.minimum(w, np.clip(t / fade_in, 0.0, 1.0))
+                    if fade_out > 0:
+                        w = np.minimum(w, np.clip((duration - t) / fade_out, 0.0, 1.0))
+                    return w
+
+                def shaped(pos: int, mono):
+                    return mono * vgain * weights(pos, mono.shape[0])
+
+                peak = 0.0
+                for pos, mono in blocks():
+                    peak = max(peak, float(np.abs(shaped(pos, mono)).max()))
+                scale = 0.99 / peak if peak > 0.99 else 1.0
+
+                os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+                tmp = output + ".tmp.wav"
+                with sf.SoundFile(tmp, "w", samplerate=44100, channels=1, subtype="PCM_16") as sink:
+                    for pos, mono in blocks():
+                        sink.write(np.clip(shaped(pos, mono) * scale, -1.0, 1.0).astype(np.float32))
+                os.replace(tmp, output)
+        except ValueError as error:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": str(error)})
+            return
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "清唱渲染失败：%s" % traceback.format_exc()[-1200:]})
+            return
+        emit({
+            "type": "result",
+            "id": req_id,
+            "ok": True,
+            "ms": int((time.time() - began) * 1000),
+            "sampleRate": 44100,
+            "channels": 1,
             "peakScale": round(scale, 3),
             "durationSec": round(duration, 3),
         })
@@ -1444,6 +1559,7 @@ def main() -> int:
             "cover": cover,
             "reconvert": reconvert,
             "remix": remix,
+            "vocalOnly": vocal_only,
             "convertRange": convert_range,
             "peaks": peaks,
             "restoreRange": restore_range,

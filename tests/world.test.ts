@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -28,6 +28,7 @@ async function makeWorld(overrides: Partial<typeof RVC_DEFAULTS> = {}): Promise<
     cfg: { ...RVC_DEFAULTS, enabled: true, httpApi: false, voice: '', ...overrides },
     dataDir,
     packageDir: join(dataDir, 'pkg'),
+    libraryDir: join(dataDir, 'library'),
     runtimesRoot: () => join(dataDir, 'runtimes'),
   });
   worlds.push(world);
@@ -228,6 +229,8 @@ function seedSession(
     outputs?: string[];
     stems?: boolean;
     masters?: Array<{ path: string; at?: string; targetLufs?: number }>;
+    /** 原始上传文件名；不传就是升级前的老会话。 */
+    sourceName?: string;
   } = {},
 ): { id: string; dir: string } {
   const { id, dir } = createSession(dataDir);
@@ -238,7 +241,12 @@ function seedSession(
     createdAt: at,
     updatedAt: at,
     engine: { kind: 'rvc', voice: 'daifeiyu', modelSampleRate: 40000 },
-    source: { durationSec: 12.5, inputPeak: 0.8, format: 'wav' },
+    source: {
+      durationSec: 12.5,
+      inputPeak: 0.8,
+      format: 'wav',
+      ...(opts.sourceName ? { name: opts.sourceName } : {}),
+    },
     stems: { vocals: 'stems/vocals.wav', inst: 'stems/inst.wav' },
     converted: {
       path: 'vocals/conv.wav',
@@ -394,6 +402,45 @@ describe('另存会话文件', () => {
     const empty = seedSession(dataDir);
     await expect(invoke('sessionFile', [empty.id, 'output'])).rejects.toThrow('还没有成品');
     await expect(invoke('sessionFile', ['nope', 'output'])).rejects.toThrow('找不到会话');
+  });
+});
+
+describe('翻唱库入库', () => {
+  it('把会话成品复制进库，歌名默认取原声文件名；重复入库按已存在处理', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const { id } = seedSession(dataDir, { outputs: ['out/clean-1.wav'], sourceName: '起风了.mp3' });
+    const first = (await invoke('librarySave', [id, 'output', 0, 'clean', ''])) as {
+      entry: { title: string; kind: string; bytes: number; file: string };
+      duplicate: boolean;
+    };
+    expect(first.duplicate).toBe(false);
+    expect(first.entry.title).toBe('起风了');
+    expect(first.entry.kind).toBe('clean');
+    expect(first.entry.bytes).toBe(2048);
+    expect(readFileSync(join(dataDir, 'library', first.entry.file)).length).toBe(2048);
+
+    // 面板传 -1 表示最近一条成品。
+    const again = (await invoke('librarySave', [id, 'output', -1, 'clean', '起风了'])) as { duplicate: boolean };
+    expect(again.duplicate).toBe(true);
+
+    const state = (await invoke('libraryState')) as {
+      entries: Array<{ kind: string; title: string }>;
+      totalBytes: number;
+      count: number;
+    };
+    expect(state.count).toBe(1);
+    expect(state.totalBytes).toBe(2048);
+    expect(state.entries.map((e) => `${e.kind}:${e.title}`)).toEqual(['clean:起风了']);
+  });
+
+  it('清唱只收 WAV；老会话没有原声歌名时用「未命名」兜底', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const mp3 = seedSession(dataDir, { outputs: ['out/mix-1.mp3'] });
+    await expect(invoke('librarySave', [mp3.id, 'output', 0, 'clean', ''])).rejects.toThrow('需要 WAV');
+    const cover = (await invoke('librarySave', [mp3.id, 'output', 0, 'cover', ''])) as { entry: { title: string } };
+    expect(cover.entry.title).toBe('未命名');
+    await expect(invoke('librarySave', ['nope', 'output', 0, 'cover', ''])).rejects.toThrow('找不到会话');
+    await expect(invoke('librarySave', [mp3.id, 'output', 3, 'cover', ''])).rejects.toThrow('还没有成品');
   });
 });
 

@@ -90,6 +90,8 @@ export interface CoverRequest {
   chunk?: boolean;
   /** 翻唱会话目录；给了就把分轨与变声结果留在里面，不给则沿用旧行为（不落盘）。 */
   sessionDir?: string;
+  /** 是否带 BGM；false 时只写清唱（单声道 WAV）。默认 true。 */
+  withBgm?: boolean;
 }
 
 /** 复用已分离的人声分轨重跑整首变声，原地替换 conv.wav。 */
@@ -137,6 +139,17 @@ export interface RemixRequest {
   mutedRanges?: Array<{ start: number; end: number }>;
 }
 
+/** 只渲染清唱：读变声后人声，按 rmsRatio / vocalGain 对齐响度，输出单声道 WAV。 */
+export interface VocalOnlyRequest {
+  vocals: string;
+  output: string;
+  vocalGain: number;
+  fadeIn: number;
+  fadeOut: number;
+  rmsRatio: number;
+  mutedRanges?: Array<{ start: number; end: number }>;
+}
+
 export interface ConvertDone {
   ms: number;
   sampleRate: number;
@@ -152,6 +165,10 @@ export interface ConvertDone {
   rmsRatio?: number;
   /** 翻唱/重混：成品时长（秒）。 */
   durationSec?: number;
+  /** 这次成品是否带 BGM。 */
+  withBgm?: boolean;
+  /** 清唱输出的声道数（1）。 */
+  channels?: number;
   /** 区间重跑：实际拼回的样本区间与预期长度。 */
   spliced?: { start: number; end: number; expected: number };
   /** 区间重跑：峰值补偿倍率（只衰减不放大）。 */
@@ -377,7 +394,7 @@ export class RvcEngine {
       input: req.input, output: req.output, voice: req.voice ?? '',
       pitch: req.pitch, indexRate: req.indexRate, protect: req.protect,
       format: req.format, vocalGain: req.vocalGain ?? 0, chunk: req.chunk === false ? 0 : 1,
-      sessionDir: req.sessionDir ?? '',
+      sessionDir: req.sessionDir ?? '', withBgm: req.withBgm === false ? 0 : 1,
     }, COVER_TIMEOUT_MS);
   }
 
@@ -397,6 +414,15 @@ export class RvcEngine {
       vocalGain: req.vocalGain, instGain: req.instGain,
       fadeIn: req.fadeIn, fadeOut: req.fadeOut, rmsRatio: req.rmsRatio,
       mutedRanges: req.mutedRanges ?? [],
+    }, REMIX_TIMEOUT_MS);
+  }
+
+  /** 只渲染清唱：不重跑模型，输出单声道 WAV。 */
+  async vocalOnly(req: VocalOnlyRequest): Promise<ConvertDone> {
+    return this.run('vocalOnly', {
+      vocals: req.vocals, output: req.output,
+      vocalGain: req.vocalGain, fadeIn: req.fadeIn, fadeOut: req.fadeOut,
+      rmsRatio: req.rmsRatio, mutedRanges: req.mutedRanges ?? [],
     }, REMIX_TIMEOUT_MS);
   }
 
@@ -461,7 +487,7 @@ export class RvcEngine {
     return { ...done, loudness: done.loudness };
   }
 
-  private async run(op: 'convert' | 'separate' | 'cover' | 'reconvert' | 'remix' | 'convertRange' | 'restoreRange' | 'peaks' | 'f0' | 'master', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
+  private async run(op: 'convert' | 'separate' | 'cover' | 'reconvert' | 'remix' | 'vocalOnly' | 'convertRange' | 'restoreRange' | 'peaks' | 'f0' | 'master', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
     if (!this.ready()) throw new RvcError('unavailable', this.st.detail ?? 'RVC 引擎未就绪');
     const id = ++this.seq;
     const run = () => new Promise<ConvertDone>((resolve, reject) => {
@@ -607,6 +633,8 @@ export class RvcEngine {
           modelSampleRate: typeof msg.modelSampleRate === 'number' ? msg.modelSampleRate : undefined,
           rmsRatio: typeof msg.rmsRatio === 'number' ? msg.rmsRatio : undefined,
           durationSec: typeof msg.durationSec === 'number' ? msg.durationSec : undefined,
+          withBgm: typeof msg.withBgm === 'boolean' ? msg.withBgm : undefined,
+          channels: typeof msg.channels === 'number' ? msg.channels : undefined,
           spliced: msg.spliced && typeof msg.spliced === 'object' ? msg.spliced as ConvertDone['spliced'] : undefined,
           peakFactor: typeof msg.peakFactor === 'number' ? msg.peakFactor : undefined,
           backedUp: msg.backedUp === true,

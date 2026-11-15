@@ -22,12 +22,16 @@ export interface SessionMix {
   fadeInSec: number;
   fadeOutSec: number;
   peakScale: number;
+  /** 这次成品是否带伴奏；旧会话没有该字段，按有 BGM 处理。 */
+  withBgm?: boolean;
 }
 
 export interface SessionOutput {
   format: 'wav' | 'mp3';
   path: string;
   at: string;
+  /** 清唱（只有人声）或带 BGM 的翻唱；旧会话没有该字段，按翻唱处理。 */
+  kind?: 'cover' | 'clean';
 }
 
 /** 一次母带导出：只追加，绝不覆盖上一版混音。 */
@@ -103,9 +107,17 @@ export interface RefineSession {
   engine: { kind: string; voice: string; modelSampleRate: number };
   /**
    * `file` / `bytes` 是翻唱时留在会话目录里的原声副本（`source.<ext>`）；
-   * 老会话没有这两个字段，菜单显示「原声未保存」。
+   * `name` 是用户上传时的原始文件名（含扩展名），用于翻唱库命名；
+   * 老会话没有这些字段，菜单显示「原声未保存」或「未命名」。
    */
-  source: { durationSec: number; inputPeak: number; format: string; file?: string; bytes?: number };
+  source: {
+    durationSec: number;
+    inputPeak: number;
+    format: string;
+    name?: string;
+    file?: string;
+    bytes?: number;
+  };
   stems: { vocals: string; inst: string };
   converted: {
     path: string;
@@ -125,6 +137,8 @@ export interface RefineSession {
 export interface SessionSourceSummary {
   file: string;
   bytes: number;
+  /** 原始上传文件名；老会话没有。 */
+  name?: string;
 }
 
 /** 会话里一份成品文件的实际体积；菜单显示「翻唱文件」用。 */
@@ -133,6 +147,8 @@ export interface SessionFileSummary {
   path: string;
   bytes: number;
   at: string;
+  /** 清唱 / 翻唱；旧会话没有该字段。 */
+  kind?: 'cover' | 'clean';
 }
 
 export interface SessionSummary {
@@ -241,6 +257,7 @@ export function listSessions(dataDir: string): SessionSummary[] {
         path: item.path,
         at: item.at,
         bytes: fileBytes(join(root, id, item.path)),
+        kind: item.kind,
       })),
     });
   }
@@ -253,7 +270,7 @@ function sourceSummary(dir: string, session: RefineSession): SessionSourceSummar
   const file = session.source.file;
   if (!file) return null;
   const bytes = fileBytes(join(dir, file));
-  return bytes > 0 ? { file, bytes } : null;
+  return bytes > 0 ? { file, bytes, ...(session.source.name ? { name: session.source.name } : {}) } : null;
 }
 
 function fileBytes(path: string): number {
