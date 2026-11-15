@@ -90,18 +90,22 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
   29 个文件 / 约 0.26 MB；整包 tgz 约 218 kB（解包 700 kB，含面板 bundle 与分离代码）。
 - **权重不进包**：`hubert_base`（transformers 三件套）、`rmvpe.pt`、示例音色共约 692 MB，首次安装时下到
   `<插件数据目录>/assets` 与 `<插件数据目录>/voices`：先写 `.partial` 再校验 SHA-256 才改名，断点续传；
-  来源顺序为自有 ModelScope 仓库 → GitHub Release（示例音色）/ hf-mirror → huggingface（上游资产）。
+  来源顺序为自有 ModelScope 仓库（`resolve` 与 `repo` 两个端点）→ GitHub Release（示例音色）/
+  hf-mirror → huggingface（上游资产）。
   也可把现成的 `.pth` / `.index` 直接放进 `voices` 目录。
 - **人声分离**（翻唱用）：`UVR-MDX-NET-Inst_HQ_3.onnx`（UVR 项目训练，MIT，63.7 MB），下到 `<插件数据目录>/uvr5`；
   来源 hf-mirror 的两个镜像仓库，SHA-256 与 UVR 官方发布一致。推理代码是包内的 `vendor/uvr/mdx.py`
   （移植自 python-audio-separator 0.9.0，MIT，只留 MDX-Net ONNX 路径），跑在运行时自带的 `onnxruntime` 上，
   **不新增 pip 依赖**、不改共享运行时。
 - 解释器：从共享运行时派生的私有 venv（`--system-site-packages`），只补 `faiss-cpu`、`praat-parselmouth`；
+  pip 索引依次试阿里云 → 腾讯云 → 中科大 → 官方 PyPI，前一个失败才换下一个；
   **不复制、也不修改**共享运行时。共享运行时优先复用部署里 `runtimes/gpt-sovits/` 下的任意一档（谁装的都行），
   没有的话点面板「安装」会自己下一份（`auto` 检测到 NVIDIA 就下显卡档约 4 GB，否则 CPU 档约 1 GB，
   装到同一位置，和 gpt-sovits / 唱歌插件共用），所以不装 gpt-sovits 插件也能单用。
   下载按 64 MB 一片、最多 8 路并行（魔搭单连接会被限到约 0.3 MB/s，并行实测 5–7 MB/s），分片各自断点续传，
   拼好后校验大小与 SHA-256 才解压落位；磁盘余量不够会在下载前直接报出来。
+  显卡档 4.14 GB 只有魔搭放整包（GitHub 单附件 2 GiB 放不下），代码里配了魔搭的
+  `resolve` 与 `repo` 两个下载端点；**魔搭本身仍是单点**，要彻底异地备份得再传一份到别的仓库。
 - 长音频两种模式（面板逐次可选）：**切片**按 20 秒一片跑 RVC（每片带 0.3 秒重叠、交叉淡入淡出，
   按绝对时间轴裁/补到应有长度，长歌拼完不会人声比伴奏慢），省显存；**整段**一次进模型，更快更连贯但吃显存。
   `convert` 与 `cover` 都支持，接口对应 `chunk=1|0`（默认 1），worker 日志会打「切片 i/n」。
@@ -110,6 +114,22 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
   换低压轻薄本核显机大约慢一倍）。worker 只从 `assetsDir` 读权重，不写 `vendor`。
 - 翻唱整链（CPU 档实测）：12.31 秒的歌分离 8.8 s + 变声 7.7 s + 混音 0.04 s；分离固定跑 CPU 的
   onnxruntime，一首 4 分钟的歌分离约 2 分钟、变声约 2.5 分钟。混音时按原人声电平叠回伴奏，峰值超 0.99 整体压回。
+
+## ffmpeg
+
+**插件不自带、也不代装 ffmpeg**：mp3 的播放与部分解码要靠它，走系统 `PATH`（另外也会在派生
+venv 的 `Scripts` 与共享运行时的 `runtime` 目录里找）。
+
+- 安装（任选其一）：
+  - `winget install --id Gyan.FFmpeg -e`（装完重启 Coopanion，让新的 `PATH` 生效）；
+  - 从 <https://www.gyan.dev/ffmpeg/builds/> 或 <https://github.com/BtbN/FFmpeg-Builds/releases>
+    下压缩包，解压后把 `bin` 目录加进系统 `PATH`。
+- 验证：新开一个终端执行 `ffmpeg -version`，能打印版本即可。
+- 缺了会怎样：
+  - 翻唱库 / 桌宠点歌播 **mp3** 成品会提示「ffmpeg 不可用」（面板提示里指向本节），
+    不会静默无声；**WAV 成品不受影响**。
+  - worker 解码 mp3 音源时会先退回 torchaudio；两条路都不通时按「解码失败」报错。
+- 不影响：安装运行时、下载权重、RVC 推理本身（这些都不依赖 ffmpeg）。
 
 ## 示例音色
 

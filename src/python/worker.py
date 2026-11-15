@@ -242,6 +242,16 @@ def master_audio(audio, sample_rate, target_lufs, ceiling_db=-1.0):
     }
 
 
+def _last_line(text, limit: int = 300) -> str:
+    """只留上游状态文本的最后一行。
+
+    `vc_single` 失败时给的是「【单次推理】/ 状态: 失败 / …」这样的多行日志，
+    整段塞进面板既看不清重点，也会把无关的运行记录一起暴露出来。
+    """
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return (lines[-1] if lines else str(text or "推理失败"))[:limit]
+
+
 def _release_memory() -> None:
     """把本轮推理释放的堆还给系统。
 
@@ -461,6 +471,9 @@ def main() -> int:
         audio = load_audio(path, 16000)
         chunk = int(CHUNK_SECONDS * 16000)
         if not chunked or len(audio) <= chunk:
+            # vc_single 返回 (状态文本, (采样率, 波形))。直接透传会让调用方把状态文本
+            # 当成采样率（`int("【单次推理】…")` → ValueError），短于 20 秒必现；
+            # 变声（convert）与翻唱（cover）都走这里，改的时候两条路径一起看。
             status, result = vc.vc_single(0, path, pitch, "rmvpe", current["index"], index_rate, 0, 1.0, protect)
             if not result or result[0] is None or result[1] is None:
                 return status, None
@@ -642,7 +655,7 @@ def main() -> int:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
             return
         if not result or result[0] is None or result[1] is None:
-            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": str(result[0] if result else "没有可转换的音频")[-1500:]})
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": _last_line(result[0] if result else "没有可转换的音频")})
             return
         try:
             write_audio(req.get("output") or "", result[1], int(result[0]), fmt)
@@ -811,7 +824,7 @@ def main() -> int:
                 except OSError:
                     pass
         if not result or result[0] is None or result[1] is None:
-            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": str(result[0] if result else "没有可转换的音频")[-1500:]})
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": _last_line(result[0] if result else "没有可转换的音频")})
             return
         convert_ms = int((time.time() - convert_began) * 1000)
 
@@ -952,7 +965,7 @@ def main() -> int:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-1500:]})
             return
         if not result or result[0] is None or result[1] is None:
-            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": str(result[0] if result else "没有可转换的音频")[-1500:]})
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": _last_line(result[0] if result else "没有可转换的音频")})
             return
 
         conv_sr, conv = int(result[0]), np.asarray(result[1])
@@ -1352,7 +1365,7 @@ def main() -> int:
         finally:
             shutil.rmtree(warm, ignore_errors=True)
         if piece is None:
-            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": str(sample_rate)[-1500:]})
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": _last_line(sample_rate)})
             return
 
         model_sr, piece = int(sample_rate), np.asarray(piece)

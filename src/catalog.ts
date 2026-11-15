@@ -33,6 +33,8 @@ export interface PinnedFile {
 }
 
 const MS_OWN = 'https://www.modelscope.cn/models/wocwang/rvc-for-coopanion/resolve/master';
+/** 同一个魔搭仓库的下载接口（302 到 CDN）；`resolve` 链路改动时还能从这条走。 */
+const MS_API = 'https://www.modelscope.cn/api/v1/models/wocwang/rvc-for-coopanion/repo';
 const GH_OWN = 'https://github.com/wocwang/cortico-world-rvc-for-coopanion/releases/download/voice-20261028';
 const HF_MIRROR = 'https://hf-mirror.com';
 const HF = 'https://huggingface.co';
@@ -60,18 +62,29 @@ export const ASSET_FILES: readonly PinnedFile[] = [
   pinnedUpstream('rmvpe/rmvpe.pt', `${UPSTREAM_PATH}/rmvpe.pt`, 181184272, '6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193'),
 ];
 
-/** 自训音色，落到 `<dataDir>/voices`：自有魔搭仓库 → GitHub Release。索引落盘统一改名成同名 `.index`。 */
+/**
+ * 自训音色，落到 `<dataDir>/voices`：自有魔搭仓库（两个端点）→ GitHub Release。
+ * 魔搭是国内源，GitHub 只当兜底（国内通常不通）。索引落盘统一改名成同名 `.index`。
+ */
 const voiceFile = (path: string, bytes: number, sha256: string): PinnedFile => ({
   path,
   bytes,
   sha256,
-  sources: [`${MS_OWN}/voices/${path}`, `${GH_OWN}/${path}`],
+  sources: [
+    `${MS_OWN}/voices/${path}`,
+    `${MS_API}?Revision=master&FilePath=voices/${path}`,
+    `${GH_OWN}/${path}`,
+  ],
 });
 
 /** 官方 DaFeiYu（显示名「星落落大肥鱼」）的落盘 ID；与自训的 `daifeiyu`（小肥鱼）区分开。 */
 export const OFFICIAL_VOICE = 'xll';
 
-/** 官方模型只在上游 Hugging Face：先 hf-mirror，再原站（国内多半不通，只当兜底）。 */
+/**
+ * 官方模型只在上游 Hugging Face：先 hf-mirror，再原站（国内多半不通，只当兜底）。
+ * 2026-11-15 核查：HF 上只有 `YukiKaze1337/DaFeiYu_rvc_v2_40k` 这一份，没有可用的
+ * 第二个国内镜像；要加源同样得先上传副本。
+ */
 const OFFICIAL_VOICE_PATH = 'YukiKaze1337/DaFeiYu_rvc_v2_40k/resolve/main';
 const officialVoiceFile = (path: string, remote: string, bytes: number, sha256: string): PinnedFile => ({
   path,
@@ -115,6 +128,10 @@ export const UVR_BYTES = UVR_FILES.reduce((n, f) => n + f.bytes, 0);
 /**
  * 高质量分离档：Mel-Band RoFormer（KimberleyJSN，MIT），约 871 MB。
  * 只在配置里显式选「高质量」时才下载；同样国内 hf-mirror 优先，官方 HF 兜底。
+ *
+ * 2026-11-15 核查：hf-mirror 上没找到同一份文件的第二个国内副本（搜到的
+ * `pcunwa/Mel-Band-Roformer-Inst` 是伴奏模型，不是这份人声权重，SHA 也对不上）。
+ * 要再加一个国内源，需要先把 913 MB 传到自有魔搭 / HF 仓库；在那之前不编地址。
  */
 export const MELBAND_FILE = 'MelBandRoformer.ckpt';
 export const MELBAND_FILES: readonly PinnedFile[] = [

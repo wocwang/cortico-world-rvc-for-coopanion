@@ -82,7 +82,7 @@ function convertToWav(input: string, output: string, ffmpeg: string): Promise<vo
         const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
         const tail = String(stderr || err.message).trim().split(/\r?\n/).slice(-1)[0] ?? '';
         reject(new Error(missing
-          ? `ffmpeg 不可用，无法把 ${extname(input) || '这个格式'} 转成 WAV`
+          ? `ffmpeg 不可用，无法把 ${extname(input) || '这个格式'} 转成 WAV；请安装 ffmpeg 并加入 PATH（见 README「ffmpeg」）`
           : `ffmpeg 转换失败：${tail}`));
       },
     );

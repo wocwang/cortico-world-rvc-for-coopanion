@@ -21,11 +21,17 @@ export interface VenvState {
 /** T0 探针里验证过的两个包与版本；运行时自带的 torch/transformers 不再装。 */
 export const VENV_PACKAGES = ['faiss-cpu==1.15.1', 'praat-parselmouth==0.4.7'];
 /**
- * 依赖先走阿里云镜像（国内直连 PyPI 经常 SSL 中断；清华源对 pip 的 UA 返回 403，不能用），
- * 镜像失败再回官方 PyPI。网络参数收紧，免得默认重试把「安装中」卡住。
+ * pip 索引按顺序试：阿里云 → 腾讯云 → 中科大 → 官方 PyPI。
+ * 国内直连 PyPI 经常 SSL 中断；清华源对 pip 的 UA 返回 403，不用。
+ * 2026-11-15 实测：三家镜像的 faiss-cpu / praat-parselmouth 页面都返回 200。
+ * 网络参数收紧，免得默认重试把「安装中」卡住。
  */
-const PIP_MIRROR = 'https://mirrors.aliyun.com/pypi/simple/';
-const PIP_OFFICIAL = 'https://pypi.org/simple';
+const PIP_INDEXES: ReadonlyArray<{ name: string; url: string }> = [
+  { name: '阿里云镜像', url: 'https://mirrors.aliyun.com/pypi/simple/' },
+  { name: '腾讯云镜像', url: 'https://mirrors.cloud.tencent.com/pypi/simple/' },
+  { name: '中科大镜像', url: 'https://pypi.mirrors.ustc.edu.cn/simple/' },
+  { name: '官方 PyPI', url: 'https://pypi.org/simple' },
+];
 const PIP_NET_ARGS = ['--timeout', '30', '--retries', '2'];
 /** 失败时保留的日志行数。 */
 const TAIL_LINES = 12;
@@ -111,14 +117,7 @@ export class RvcVenv {
       const code = await this.exec(basePython, ['-m', 'venv', '--system-site-packages', this.venvRoot()], PIP_TIMEOUT_MS);
       if (code !== 0) { this.st = { phase: 'error', detail: `创建 venv 失败：${this.lastLine()}` }; return; }
     }
-    this.st = { phase: 'working', detail: '安装 faiss / parselmouth' };
-    const base = ['-I', '-X', 'utf8', '-u', '-m', 'pip', 'install', '--no-warn-script-location', ...PIP_NET_ARGS, ...VENV_PACKAGES];
-    let code = await this.exec(pythonPath, [...base, '-i', PIP_MIRROR], PIP_TIMEOUT_MS);
-    if (code !== 0) {
-      this.st = { phase: 'working', detail: '镜像没装上，换官方 PyPI 重试' };
-      this.opts.log?.warn('RVC 依赖镜像失败，改走官方 PyPI', { tail: this.tail.slice(-3) });
-      code = await this.exec(pythonPath, [...base, '-i', PIP_OFFICIAL], PIP_TIMEOUT_MS);
-    }
+    const code = await this.pipInstall(VENV_PACKAGES, '安装 faiss / parselmouth');
     if (code !== 0) { this.st = { phase: 'error', detail: `装依赖失败：${this.lastLine()}` }; return; }
     if (this.opts.gpu) await this.installGpuOrt();
     if (await this.probe()) this.st = { phase: 'ready', detail: null };
@@ -130,14 +129,22 @@ export class RvcVenv {
    * 所以版本钉死、失败不回滚，面板仍是 ready。
    */
   private async installGpuOrt(): Promise<void> {
-    this.st = { phase: 'working', detail: '安装显卡分离（onnxruntime-gpu）' };
-    const base = ['-I', '-X', 'utf8', '-u', '-m', 'pip', 'install', '--no-warn-script-location', ...PIP_NET_ARGS, 'onnxruntime-gpu==1.22.0'];
-    let code = await this.exec(this.opts.pythonPath, [...base, '-i', PIP_MIRROR], PIP_TIMEOUT_MS);
-    if (code !== 0) {
-      this.opts.log?.warn('onnxruntime-gpu 镜像失败，改走官方 PyPI', { tail: this.tail.slice(-3) });
-      code = await this.exec(this.opts.pythonPath, [...base, '-i', PIP_OFFICIAL], PIP_TIMEOUT_MS);
-    }
+    const code = await this.pipInstall(['onnxruntime-gpu==1.22.0'], '安装显卡分离（onnxruntime-gpu）');
     if (code !== 0) this.opts.log?.warn('onnxruntime-gpu 没装上，分离继续用 CPU', { tail: this.tail.slice(-3) });
+  }
+
+  /** 按 `PIP_INDEXES` 顺序装，前一个失败才试下一个；返回最后一次退出码。 */
+  private async pipInstall(packages: string[], step: string): Promise<number> {
+    const base = ['-I', '-X', 'utf8', '-u', '-m', 'pip', 'install', '--no-warn-script-location', ...PIP_NET_ARGS, ...packages];
+    let code = -1;
+    for (const index of PIP_INDEXES) {
+      this.st = { phase: 'working', detail: step };
+      code = await this.exec(this.opts.pythonPath, [...base, '-i', index.url], PIP_TIMEOUT_MS);
+      if (code === 0) return 0;
+      this.opts.log?.warn(`RVC 依赖从${index.name}安装失败`, { tail: this.tail.slice(-3) });
+      this.st = { phase: 'working', detail: `${index.name}没装上，换下一个源` };
+    }
+    return code;
   }
 
   /** venv 根：`<root>/Scripts/python.exe` 往上两级。 */

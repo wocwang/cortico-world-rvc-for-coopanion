@@ -21,6 +21,8 @@ export const RUNTIME_VERSION = 'e91506f-1';
 export const UPSTREAM_COMMIT = 'e91506f1fba265e1841617c3042a1573206a7351';
 
 const MS_OWN = 'https://www.modelscope.cn/models/Phantivia/gpt-sovits-for-coopanion/resolve/master';
+/** 同一个魔搭仓库的下载接口（302 到 CDN）；`resolve` 路由改动时还能从这条走。 */
+const MS_API = 'https://www.modelscope.cn/api/v1/models/Phantivia/gpt-sovits-for-coopanion/repo';
 const GH_OWN = `https://github.com/Phantivia/cortico-world-gpt-sovits-for-coopanion/releases/download/runtime-${RUNTIME_VERSION}`;
 const CUDA_FILE = `gpt-sovits-${RUNTIME_VERSION}-win-x64-cu128.zip`;
 const CPU_FILE = `gpt-sovits-${RUNTIME_VERSION}-win-x64-cpu.zip`;
@@ -36,14 +38,22 @@ export interface RuntimeAsset {
   segments?: number;
 }
 
-/** 显卡档只有魔搭放整包（GitHub 单附件 2 GiB 上限，那边是分片）；CPU 档两处都有。 */
+/**
+ * 显卡档只有魔搭放整包（GitHub 单附件 2 GiB 上限，4.14 GB 放不下），所以给魔搭的
+ * 两个端点：`resolve` 与 `repo` 下载接口（302 到 CDN，实测 206 与总长一致）。
+ * 这解决的是路由/接口单点，**provider 级单点仍在**；真要异地备份得把 zip 传到别的仓库。
+ * CPU 档两处都有。
+ */
 export const RUNTIME_ASSETS: Readonly<Record<'cuda' | 'cpu', RuntimeAsset>> = {
   cuda: {
     file: CUDA_FILE,
     bytes: 4140732064,
     sha256: '87c775a93f9b13195b83bc2901a6176f771e31076bc051acf07a5ccca1db7a78',
     extractBytes: 11300000000,
-    sources: [`${MS_OWN}/runtime/${CUDA_FILE}`],
+    sources: [
+      `${MS_OWN}/runtime/${CUDA_FILE}`,
+      `${MS_API}?Revision=master&FilePath=runtime/${CUDA_FILE}`,
+    ],
   },
   cpu: {
     file: CPU_FILE,
