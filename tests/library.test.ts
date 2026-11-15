@@ -75,13 +75,17 @@ describe('翻唱库', () => {
     expect(readLibrary(root).entries).toHaveLength(2);
   });
 
-  it('超过上限时拒绝保存，不偷偷删旧条目', () => {
+  it('超过上限照常保存，只在统计里标出已超', () => {
     const root = tempRoot();
     saveToLibrary({ root, kind: 'clean', title: 'A', sourcePath: source(100) });
-    expect(() => saveToLibrary({
+    const second = saveToLibrary({
       root, kind: 'cover', title: 'B', sourcePath: source(50), maxBytes: 120,
-    })).toThrow('上限');
-    expect(readLibrary(root).entries).toHaveLength(1);
+    });
+    expect(second.duplicate).toBe(false);
+    expect(readLibrary(root).entries).toHaveLength(2);
+    expect(second.stats.maxBytes).toBe(120);
+    expect(second.stats.totalBytes).toBeGreaterThan(second.stats.maxBytes);
+    expect(readLibrary(root).entries).toHaveLength(2);
   });
 
   it('索引损坏时按文件名重建', () => {

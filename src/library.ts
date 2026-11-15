@@ -76,7 +76,7 @@ export interface SaveLibraryResult {
   stats: LibraryStats;
 }
 
-/** 2 GB；库是副本，不能无限涨。 */
+/** 默认上限 2 GB（配置项未设时的兜底）；0 表示不限，超出只提示不拦截。 */
 export const LIBRARY_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
 /** 默认库根：`<dataDir>/../../../../extensions/rvc-library`。 */
@@ -132,7 +132,7 @@ function readIndexFile(root: string): LibraryIndex | null {
     return {
       version: 1,
       updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString(),
-      maxBytes: Number.isFinite(raw.maxBytes) && raw.maxBytes > 0 ? raw.maxBytes : LIBRARY_MAX_BYTES,
+      maxBytes: Number.isFinite(raw.maxBytes) && raw.maxBytes >= 0 ? raw.maxBytes : LIBRARY_MAX_BYTES,
       entries: raw.entries.filter((item) => item && typeof item.id === 'string'),
     };
   } catch {
@@ -273,9 +273,7 @@ export function saveToLibrary(opts: SaveLibraryOptions): SaveLibraryResult {
   if (duplicate) {
     return { entry: duplicate, duplicate: true, stats: libraryStats(root, index) };
   }
-  if (index.entries.reduce((sum, item) => sum + item.bytes, 0) + st.size > index.maxBytes) {
-    throw new Error(`翻唱库超过 ${Math.round(index.maxBytes / 1024 / 1024)} MB 上限，先删掉几首再保存`);
-  }
+  // 容量只用于面板提示：超了也照常保存，不拒绝、不自动删除。
   const ext = extname(sourcePath).toLowerCase() || '.wav';
   const folder = opts.kind;
   const base = `${safeSongName(title)}_${opts.kind === 'clean' ? '清唱' : '翻唱'}cover`;

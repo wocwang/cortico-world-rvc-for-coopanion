@@ -485,6 +485,45 @@ describe('翻唱库入库', () => {
     expect(after.totalBytes).toBe(0);
   });
 
+  it('上限来自配置：超了照常保存，只有统计标出已超', async () => {
+    const { invoke, dataDir } = await makeWorld({ libraryMaxGb: 0.000001 });
+    const { id } = seedSession(dataDir, { outputs: ['out/clean-1.wav'] });
+    const cap = Math.round(0.000001 * 1024 * 1024 * 1024);
+    const saved = (await invoke('librarySave', [id, 'output', 0, 'clean', ''])) as {
+      stats: { totalBytes: number; maxBytes: number };
+    };
+    expect(saved.stats.maxBytes).toBe(cap);
+    expect(saved.stats.totalBytes).toBe(2048);
+    expect(saved.stats.totalBytes).toBeGreaterThan(saved.stats.maxBytes);
+    const state = (await invoke('libraryState')) as { totalBytes: number; maxBytes: number; count: number };
+    expect(state.count).toBe(1);
+    expect(state.maxBytes).toBe(cap);
+    expect(state.totalBytes).toBeGreaterThan(state.maxBytes);
+  });
+
+  it('保存对话框能列出全部版本；母带类型跟随会话', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const { id } = seedSession(dataDir, {
+      outputs: ['out/mix-1.wav', 'out/clean-1.wav'],
+      masters: [{ path: 'out/master-1.wav' }],
+    });
+    const rec = readSession(dataDir, id)!;
+    rec.mix.withBgm = false;
+    writeSession(dataDir, id, rec);
+    const r = (await invoke('sessionFiles', [id])) as {
+      files: Array<{ kind: string; index: number; format: string; bytes: number; mediaKind?: string }>;
+    };
+    expect(r.files.filter((file) => file.kind === 'output').map((file) => file.index).sort()).toEqual([0, 1]);
+    expect(r.files.find((file) => file.kind === 'master')?.mediaKind).toBe('clean');
+    expect(r.files.find((file) => file.kind === 'master')?.bytes).toBe(3072);
+
+    // 会话当前是翻唱时，母带跟着标翻唱。
+    rec.mix.withBgm = true;
+    writeSession(dataDir, id, rec);
+    const again = (await invoke('sessionFiles', [id])) as { files: Array<{ kind: string; mediaKind?: string }> };
+    expect(again.files.find((file) => file.kind === 'master')?.mediaKind).toBe('cover');
+  });
+
   it('清唱只收 WAV；老会话没有原声歌名时用「未命名」兜底', async () => {
     const { invoke, dataDir } = await makeWorld();
     const mp3 = seedSession(dataDir, { outputs: ['out/mix-1.mp3'] });

@@ -22,6 +22,11 @@ export interface RvcConfigSection {
   sessionDays: number;
   /** 翻唱会话总容量上限（GB）；0 表示不按容量清理。 */
   sessionMaxGb: number;
+  /**
+   * 翻唱库容量上限（GB）；0 表示不限。超过只在面板提示「容量已超」，
+   * 照常保存，不拒绝也不自动删除。
+   */
+  libraryMaxGb: number;
   /** 推理档；改档后重建派生 venv 并重启引擎生效。 */
   tier: RvcTier;
   /**
@@ -75,6 +80,7 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   keepStems: true,
   sessionDays: 7,
   sessionMaxGb: 8,
+  libraryMaxGb: 2,
   tier: 'auto',
   codeDir: '',
   assetsDir: '',
@@ -105,6 +111,7 @@ const TEXT = {
     keepStems: { title: '保留分轨（可精修）', description: '翻唱后把人声、伴奏和变声结果留在插件数据目录的 sessions 下，面板可以只重做混音，不用重新分离和变声。每首 4 分钟的歌约占 250 MB；默认 7 天 / 8 GB 自动清理，只清 sessions，不动 out。关闭后与旧版一样不落盘。' },
     sessionDays: { title: '会话保留天数', description: '超过这么多天的翻唱会话会被清理；0 表示不按时间清理（仍受容量上限约束）。' },
     sessionMaxGb: { title: '会话容量上限（GB）', description: 'sessions 总占用超过这个值时，从最久未用的会话开始删；0 表示不限。只影响 sessions，不动 out。' },
+    libraryMaxGb: { title: '翻唱库容量上限（GB）', description: '翻唱库总占用超过这个值时，面板只提示「容量已超」，仍照常保存，不拒绝也不自动删除；0 表示不限。' },
     tier: { title: '推理档', description: '自动：检测到 NVIDIA 显卡就用显卡档，否则 CPU 档。显卡档的派生 venv 基于 CUDA 运行时，变声快很多（约 0.6–0.8 GB 显存）；CPU 档约 1–2 GB 内存。改档后在面板点「重启引擎」生效，切档会自动重建 venv。' },
     tierAuto: '自动',
     tierCuda: '显卡（NVIDIA）',
@@ -131,6 +138,7 @@ const TEXT = {
     keepStems: { title: 'Keep stems for refinement', description: 'After a cover, keep the separated vocals, instrumental and converted vocal under sessions in the plugin data folder, so the panel can remix without separating or converting again. About 250 MB per 4-minute song; 7 days / 8 GB auto-cleanup by default, and only sessions is touched. Off restores the old behavior (nothing kept).' },
     sessionDays: { title: 'Session retention (days)', description: 'Cover sessions older than this are cleaned up; 0 disables the age rule (the size cap still applies).' },
     sessionMaxGb: { title: 'Session size cap (GB)', description: 'When sessions exceed this size, the least recently used ones are removed first; 0 means no cap. Only sessions is touched, never out.' },
+    libraryMaxGb: { title: 'Cover library size cap (GB)', description: 'When the cover library exceeds this size, the panel only shows an "over capacity" hint and still saves. Nothing is rejected or deleted; 0 means no cap.' },
     tier: { title: 'Inference tier', description: 'Auto uses the GPU tier when an NVIDIA GPU is detected, otherwise CPU. The GPU tier builds the derived venv on the CUDA runtime and is much faster (about 0.6–0.8 GB VRAM); the CPU tier uses about 1–2 GB RAM. After changing this, click Restart engine — switching tiers rebuilds the venv automatically.' },
     tierAuto: 'Auto',
     tierCuda: 'GPU (NVIDIA)',
@@ -183,6 +191,7 @@ export function configGroups(language: Language): ConfigGroup[] {
           [`${K}.keepStems`]: { type: 'boolean', title: t.keepStems.title, description: t.keepStems.description, 'x-hot': true },
           [`${K}.sessionDays`]: { type: 'number', title: t.sessionDays.title, description: t.sessionDays.description, minimum: 0, maximum: 365, multipleOf: 1, 'x-hot': true },
           [`${K}.sessionMaxGb`]: { type: 'number', title: t.sessionMaxGb.title, description: t.sessionMaxGb.description, minimum: 0, maximum: 1000, multipleOf: 1, 'x-hot': true },
+          [`${K}.libraryMaxGb`]: { type: 'number', title: t.libraryMaxGb.title, description: t.libraryMaxGb.description, minimum: 0, maximum: 1000, multipleOf: 1, 'x-hot': true },
           [`${K}.codeDir`]: { type: 'string', title: t.codeDir.title, description: t.codeDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.assetsDir`]: { type: 'string', title: t.assetsDir.title, description: t.assetsDir.description, 'x-path': { kind: 'directory' }, 'x-hot': true },
           [`${K}.pythonPath`]: { type: 'string', title: t.pythonPath.title, description: t.pythonPath.description, 'x-path': { kind: 'file', extensions: ['.exe'] }, 'x-hot': true },

@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
 import type { Logger, ToolDef, ToolOutcome, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
-import { configGroups, DEFAULT_PORT, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
+import { configGroups, DEFAULT_PORT, RVC_DEFAULTS, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
 import { UVR_MODEL_FILE } from './catalog.ts';
 import { RvcEngine, RvcError, type ConvertDone, type EngineState } from './engine.ts';
 import { RvcInstaller } from './install.ts';
@@ -1206,7 +1206,9 @@ export class RvcWorld implements World {
       })),
       ...(session.masters ?? []).map((item, index) => ({
         kind: 'master' as const, index, format: item.format, path: item.path, at: item.at,
-        bytes: size(item.path), targetLufs: item.targetLufs, mediaKind: 'cover' as const,
+        bytes: size(item.path), targetLufs: item.targetLufs,
+        // 母带跟随会话当前的成品类型，清唱会话的母带不该标成翻唱。
+        mediaKind: (session.mix.withBgm === false ? 'clean' : 'cover') as 'clean' | 'cover',
       })),
     ];
     files.sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.path.localeCompare(b.path));
@@ -1245,6 +1247,7 @@ export class RvcWorld implements World {
         voice: session.engine.voice,
         mastered: media === 'master',
         durationSec: session.source.durationSec,
+        maxBytes: this.libraryMaxBytes(),
       });
       this.log?.info('保存到 RVC 翻唱库', { id, kind: libraryKind, title, duplicate: result.duplicate });
       return { ...result };
@@ -1255,12 +1258,30 @@ export class RvcWorld implements World {
 
   private libraryState(): Record<string, unknown> {
     const index = readLibrary(this.libraryDir);
+    // 配置是上限的唯一来源：旧索引/旧配置缺字段时按 2 GB 兜底，0 表示不限。
+    index.maxBytes = this.libraryMaxBytes();
     // 老索引没有时长：从 WAV 头补一次并写回，面板列表不用每次再算。
     if (backfillDurations(this.libraryDir, index)) writeLibrary(this.libraryDir, index);
     return {
       ...libraryStats(this.libraryDir, index),
       entries: index.entries.map(({ sourceHash: _hash, ...item }) => item),
     };
+  }
+
+  /** 翻唱库上限（字节）：配置页与面板同一份 `libraryMaxGb`；0 表示不限。 */
+  private libraryMaxBytes(): number {
+    const raw = this.opts.cfg.libraryMaxGb;
+    const gb = raw === undefined || raw === null ? RVC_DEFAULTS.libraryMaxGb : Number(raw);
+    if (!Number.isFinite(gb) || gb <= 0) return 0;
+    return Math.round(gb * 1024 * 1024 * 1024);
+  }
+
+  /** 列出某个会话的全部成品（混音 + 母带），保存到库时选版本用；不改当前会话。 */
+  private sessionFiles(id: string): { files: unknown[] } {
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    return { files: this.outputFiles(id, session) };
   }
 
   /** 试听：把库里的文件交给浏览器流式读取（`$file`），不用 base64 塞整首；sha256 边读边算。 */
@@ -1287,18 +1308,11 @@ export class RvcWorld implements World {
 
   private libraryDelete(id: string): Record<string, unknown> {
     try {
-      return this.libraryState0(deleteLibraryEntry(this.libraryDir, id));
+      deleteLibraryEntry(this.libraryDir, id);
+      return this.libraryState();
     } catch (err) {
       throw new RvcError('param', err instanceof Error ? err.message : String(err));
     }
-  }
-
-  private libraryState0(stats: ReturnType<typeof libraryStats>): Record<string, unknown> {
-    const index = readLibrary(this.libraryDir);
-    return {
-      ...stats,
-      entries: index.entries.map(({ sourceHash: _hash, ...item }) => item),
-    };
   }
 
   /** 桌宠点歌：按歌名或随机挑库里的歌，默认清唱；第一块 PCM 进声卡后回执。 */
@@ -1437,6 +1451,7 @@ export class RvcWorld implements World {
       return this.previewSession(String(args[0] ?? ''), raw);
     }
     if (method === 'sessionDelete') return this.deleteSession(String(args[0] ?? ''));
+    if (method === 'sessionFiles') return this.sessionFiles(String(args[0] ?? ''));
     if (method === 'sessionFile') return this.sessionFile(args);
     if (method === 'librarySave') return this.librarySave(args);
     if (method === 'libraryState') return this.libraryState();

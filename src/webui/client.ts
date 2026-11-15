@@ -155,12 +155,13 @@ interface LibraryState {
   count: number;
   entries: LibraryEntryView[];
 }
-/** 入库目标：会话成品（outputs）或母带（masters），index 为 -1 表示最近一条。 */
+/** 入库目标：会话成品（outputs）或母带（masters），index 为其在对应数组里的下标。 */
 interface LibraryTarget {
   media: 'output' | 'master';
   index: number;
   format: string;
-  mediaKind?: 'cover' | 'clean';
+  /** 跟随所选版本的类型；旧成品按文件名兜底。 */
+  kind: 'cover' | 'clean';
 }
 interface RefineState {
   root: string;
@@ -879,15 +880,22 @@ const coverPanel: WebUiPanel = {
       retentionLine,
     );
 
-    // 翻唱库：独立于会话的成品副本；列表、试听、删除与总占用。
+    // 翻唱库：独立于会话的成品副本；列表、试听、删除、总占用与可调上限。
     const librarySheet = ui.foldSheet('rvc-cover-library', { title: t.libraryPanelTitle, desc: t.libraryPanelHint });
     const librarySummary = ui.h('div', 'rvc-detail');
     const libraryLine = ui.h('div', 'rvc-detail');
     const libraryList = ui.h('div', 'rvc-library');
+    const libraryCapInput = ui.input({ type: 'number', value: '2' });
+    libraryCapInput.min = '0';
+    libraryCapInput.max = '1000';
+    libraryCapInput.step = '1';
+    const libraryCapSave = ui.button(t.libraryMaxSave, { size: 'sm', onClick: () => void saveLibraryCap() });
     const libraryRefreshBtn = ui.button(t.libraryRefresh, { size: 'sm', onClick: () => void loadLibrary(true) });
+    const libraryCapRow = ui.h('div', 'rvc-grid');
+    libraryCapRow.append(ui.field(t.libraryMaxGb, libraryCapInput));
     const libraryActs = ui.actions();
-    libraryActs.append(libraryRefreshBtn);
-    librarySheet.body.append(librarySummary, libraryActs, libraryLine, libraryList);
+    libraryActs.append(libraryCapSave, libraryRefreshBtn);
+    librarySheet.body.append(librarySummary, libraryCapRow, libraryActs, libraryLine, libraryList);
     const libraryAudio = document.createElement('audio');
     libraryAudio.hidden = true;
     libraryAudio.addEventListener('ended', () => {
@@ -1303,35 +1311,24 @@ const coverPanel: WebUiPanel = {
       exportForm = form;
     }
 
+    function targetOf(file: SessionOutputFile): LibraryTarget {
+      // 老会话没有 mediaKind，按文件名兜底（清唱文件固定 clean-*）。
+      const kind: 'clean' | 'cover' = file.mediaKind ?? (file.path.includes('clean-') ? 'clean' : 'cover');
+      return { media: file.kind, index: file.index, format: file.format, kind };
+    }
+
     function toggleLibrary(row: HTMLElement, s: SessionSummary): void {
       if (libraryForm) {
         libraryForm.remove();
         libraryForm = null;
       }
-      const picked = s.id === selectedId ? outputFiles.find((f) => f.path === pickedOutput) : undefined;
-      const latest = s.outputFiles[s.outputFiles.length - 1];
-      // 统一成「媒体 + 序号 + 类型」：-1 让后端按最近一条成品取。
-      const target: LibraryTarget | undefined = picked
-        ? { media: picked.kind, index: picked.index, format: picked.format, mediaKind: picked.mediaKind }
-        : latest
-          ? { media: 'output', index: -1, format: latest.format, mediaKind: latest.kind }
-          : undefined;
-      // 老会话没有 kind 字段，按文件名兜底（清唱文件固定 clean-*.wav）。
-      const targetPath = picked?.path ?? latest?.path ?? '';
-      const defaultKind: 'clean' | 'cover' = target?.mediaKind
-        ?? (targetPath.includes('clean-') ? 'clean' : 'cover');
       const form = ui.h('div', 'rvc-recent-form');
       const name = ui.input({ value: songName(s) });
-      const kind = ui.select({
-        value: defaultKind,
-        options: [{ value: 'clean', label: t.libraryKindClean }, { value: 'cover', label: t.libraryKindCover }],
-      });
+      const version = ui.select({ value: '', options: [{ value: '', label: t.libraryLoading }] });
       const line = ui.h('div', 'rvc-detail', t.libraryHint);
-      const grid = ui.h('div', 'rvc-grid');
-      grid.append(ui.field(t.libraryName, name), ui.field(t.libraryKind, kind));
-      const acts = ui.actions();
+      let target: LibraryTarget | undefined;
       const save = ui.button(t.libraryConfirm, {
-        variant: 'primary', size: 'sm', onClick: () => void doLibrarySave(s, target, kind, name, line),
+        variant: 'primary', size: 'sm', onClick: () => void doLibrarySave(s, target, name, line),
       });
       const cancel = ui.button(t.libraryCancel, {
         size: 'sm',
@@ -1340,16 +1337,56 @@ const coverPanel: WebUiPanel = {
           if (libraryForm === form) libraryForm = null;
         },
       });
+      const acts = ui.actions();
       acts.append(save, cancel);
+      const grid = ui.h('div', 'rvc-grid');
+      grid.append(ui.field(t.libraryName, name), ui.field(t.libraryVersion, version));
       form.append(grid, acts, line);
       row.after(form);
       libraryForm = form;
+
+      // 列出这个会话的全部成品（混音 + 母带），默认最近一条；类型跟着所选版本走。
+      void (async () => {
+        try {
+          const r = await ctx.invoke<{ files: SessionOutputFile[] }>('sessionFiles', [s.id]);
+          if (!r.files.length) {
+            version.textContent = '';
+            const empty = ui.h('option', null, t.exportNeedOutput);
+            empty.value = '';
+            version.append(empty);
+            save.disabled = true;
+            return;
+          }
+          fillSelect(ui, version, r.files.map((file, at) => ({
+            value: String(at),
+            label: t.libraryVersionOption(
+              new Date(file.at).toLocaleTimeString(),
+              file.format.toUpperCase(),
+              file.mediaKind === 'clean' || (!file.mediaKind && file.path.includes('clean-'))
+                ? t.libraryKindClean
+                : t.libraryKindCover,
+              ui.fmt.bytes(file.bytes),
+            ),
+          })));
+          const pick = (): void => {
+            target = targetOf(r.files[Number(version.value)] ?? r.files[r.files.length - 1]!);
+            line.classList.remove('bad');
+            line.textContent = t.libraryHint;
+          };
+          version.value = String(r.files.length - 1);
+          version.addEventListener('change', pick);
+          pick();
+        } catch (err) {
+          line.textContent = errText(err);
+          line.classList.add('bad');
+          save.disabled = true;
+        }
+      })();
     }
 
     async function doLibrarySave(
       s: SessionSummary,
       target: LibraryTarget | undefined,
-      kind: HTMLSelectElement,
       name: HTMLInputElement,
       line: HTMLElement,
     ): Promise<void> {
@@ -1359,7 +1396,7 @@ const coverPanel: WebUiPanel = {
         line.classList.add('bad');
         return;
       }
-      if (kind.value === 'clean' && target.format !== 'wav') {
+      if (target.kind === 'clean' && target.format !== 'wav') {
         line.textContent = t.libraryNeedWav;
         line.classList.add('bad');
         return;
@@ -1368,11 +1405,15 @@ const coverPanel: WebUiPanel = {
       try {
         const r = await ctx.invoke<{
           entry: { title: string; bytes: number }; duplicate: boolean;
-        }>('librarySave', [s.id, target.media, target.index, kind.value, name.value.trim()]);
-        const text = r.duplicate
+          stats: { totalBytes: number; maxBytes: number };
+        }>('librarySave', [s.id, target.media, target.index, target.kind, name.value.trim()]);
+        const over = r.stats.maxBytes > 0 && r.stats.totalBytes > r.stats.maxBytes;
+        let text = r.duplicate
           ? t.libraryDuplicate(r.entry.title)
-          : t.librarySaved(`${r.entry.title}_${kind.value === 'clean' ? '清唱' : '翻唱'}cover`, ui.fmt.bytes(r.entry.bytes));
+          : t.librarySaved(`${r.entry.title}_${target.kind === 'clean' ? '清唱' : '翻唱'}cover`, ui.fmt.bytes(r.entry.bytes));
+        if (over) text = `${text} · ${t.libraryOver}`;
         line.textContent = text;
+        line.classList.toggle('bad', over);
         ui.toast(text);
         void loadLibrary(true);
       } catch (err) {
@@ -1390,16 +1431,21 @@ const coverPanel: WebUiPanel = {
     function renderLibrary(data: LibraryState | null, force = false): void {
       libState = data;
       if (!data) return;
-      const key = JSON.stringify(data.entries.map((entry) => [
+      const key = JSON.stringify([data.maxBytes, data.entries.map((entry) => [
         entry.id, entry.title, entry.kind, entry.bytes, entry.durationSec, entry.createdAt,
-      ]));
+      ])]);
       if (!force && key === libKey) return;
       libKey = key;
-      librarySummary.textContent = t.libraryUsage(
+      const over = data.maxBytes > 0 && data.totalBytes > data.maxBytes;
+      librarySummary.textContent = `${t.libraryUsage(
         data.count,
         ui.fmt.bytes(data.totalBytes),
-        ui.fmt.bytes(data.maxBytes),
-      );
+        data.maxBytes > 0 ? ui.fmt.bytes(data.maxBytes) : t.libraryUnlimited,
+      )}${over ? ` · ${t.libraryOver}` : ''}`;
+      librarySummary.classList.toggle('bad', over);
+      if (document.activeElement !== libraryCapInput) {
+        libraryCapInput.value = String(Math.round(data.maxBytes / (1024 * 1024 * 1024)));
+      }
       libraryList.textContent = '';
       if (!data.entries.length) {
         libraryList.append(ui.h('div', 'rvc-detail', t.libraryEmpty));
@@ -1443,6 +1489,21 @@ const coverPanel: WebUiPanel = {
       }
       libPlaying = '';
       libraryLine.textContent = '';
+    }
+
+    async function saveLibraryCap(): Promise<void> {
+      libraryLine.classList.remove('bad');
+      const gb = Math.max(0, Math.min(1000, Math.round(Number(libraryCapInput.value) || 0)));
+      libraryCapInput.value = String(gb);
+      try {
+        await ctx.setConfig('world:rvc:service', { 'worlds.rvc.libraryMaxGb': gb });
+        libraryLine.textContent = t.libraryMaxSaved(gb);
+        // 配置已热更新：重读一次，让库面板与配置页同源。
+        await loadLibrary(true);
+      } catch (err) {
+        libraryLine.textContent = errText(err);
+        libraryLine.classList.add('bad');
+      }
     }
 
     async function loadLibrary(force = false): Promise<void> {
