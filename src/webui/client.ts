@@ -74,8 +74,8 @@ interface SessionSummary {
   durationSec: number;
   voice: string;
   outputs: number;
-  source: { file: string; bytes: number } | null;
-  outputFiles: Array<{ format: string; path: string; bytes: number; at: string }>;
+  source: { file: string; bytes: number; name?: string } | null;
+  outputFiles: Array<{ format: string; path: string; bytes: number; at: string; kind?: 'cover' | 'clean' }>;
 }
 interface SessionMix {
   vocalGainDb: number;
@@ -85,11 +85,12 @@ interface SessionMix {
   fadeInSec: number;
   fadeOutSec: number;
   peakScale: number;
+  withBgm?: boolean;
 }
 interface RefineSession {
   id: string;
   engine: { kind: string; voice: string; modelSampleRate: number };
-  source: { durationSec: number; inputPeak: number; format: string; file?: string; bytes?: number };
+  source: { durationSec: number; inputPeak: number; format: string; name?: string; file?: string; bytes?: number };
   converted: {
     path: string;
     sampleRate: number;
@@ -107,7 +108,7 @@ interface RefineSession {
     backup?: string;
   }>;
   mix: SessionMix;
-  outputs: Array<{ format: string; path: string; at: string }>;
+  outputs: Array<{ format: string; path: string; at: string; kind?: 'cover' | 'clean' }>;
   masters?: Array<{
     format: string; path: string; at: string; targetLufs: number;
     inputLufs: number; inputTruePeakDb: number; outputLufs: number; outputTruePeakDb: number;
@@ -131,6 +132,14 @@ interface SessionOutputFile {
   at: string;
   bytes: number;
   targetLufs?: number;
+  mediaKind?: 'cover' | 'clean';
+}
+/** 入库目标：会话成品（outputs）或母带（masters），index 为 -1 表示最近一条。 */
+interface LibraryTarget {
+  media: 'output' | 'master';
+  index: number;
+  format: string;
+  mediaKind?: 'cover' | 'clean';
 }
 interface RefineState {
   root: string;
@@ -658,6 +667,10 @@ const coverPanel: WebUiPanel = {
     const fadeIn = slider(t.fadeIn, 0, 10, 0.5);
     const fadeOut = slider(t.fadeOut, 0, 10, 0.5);
     const mixFormat = ui.select({ value: 'wav', options: [{ value: 'wav' }, { value: 'mp3' }] });
+    const bgmMode = ui.select({
+      value: 'bgm',
+      options: [{ value: 'bgm', label: t.bgmWith }, { value: 'clean', label: t.bgmWithout }],
+    });
     const mixKnobs = ui.h('div', 'rvc-grid');
     mixKnobs.append(vocalGainDb.field, instGainDb.field, fadeIn.field, fadeOut.field, ui.field(t.format, mixFormat));
 
@@ -677,6 +690,8 @@ const coverPanel: WebUiPanel = {
       ui.field(t.keepSource, keepSource),
       ui.h('div', 'rvc-detail', t.keepSourceHint),
       ui.field(t.voice, voiceSelect),
+      ui.field(t.bgmMode, bgmMode),
+      ui.h('div', 'rvc-detail', t.bgmHint),
       ui.h('div', 'rvc-detail', t.coverInferHint),
       inferKnobs,
       acts,
@@ -919,6 +934,7 @@ const coverPanel: WebUiPanel = {
     // ---- 翻唱按钮的语义与「最近翻唱」 -------------------------------------
     let recentKey = '';
     let exportForm: HTMLElement | null = null;
+    let libraryForm: HTMLElement | null = null;
 
     function currentParams(): CoverParams {
       return {
@@ -931,7 +947,9 @@ const coverPanel: WebUiPanel = {
         instGainDb: Number(instGainDb.input.value),
         fadeInSec: Number(fadeIn.input.value),
         fadeOutSec: Number(fadeOut.input.value),
-        format: mixFormat.value,
+        // 清唱固定 WAV；不把格式下拉的 mp3 算成「改动」。
+        format: bgmMode.value === 'clean' ? 'wav' : mixFormat.value,
+        withBgm: bgmMode.value !== 'clean',
       };
     }
 
@@ -952,6 +970,7 @@ const coverPanel: WebUiPanel = {
         fadeInSec: session.mix.fadeInSec,
         fadeOutSec: session.mix.fadeOutSec,
         format: lastFormatOf(session),
+        withBgm: session.mix.withBgm !== false,
       };
     }
 
@@ -1144,10 +1163,13 @@ const coverPanel: WebUiPanel = {
       sheet.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
-    /** 会话里的「歌名」：优先用原声副本的文件名，老会话退回 id。 */
+    /** 会话里的「歌名」：优先原始上传文件名；老会话没有该字段，显示未命名。 */
     function songName(s: SessionSummary): string {
-      const base = s.source?.file ?? '';
-      return base ? base.replace(/\.[^.]+$/, '') : s.id;
+      const base = s.source?.name ?? '';
+      if (base) return base.replace(/\.[^.]+$/, '');
+      // 老会话的 source.file 固定是 source.wav，不能当歌名用。
+      const copy = s.source?.file ?? '';
+      return copy && !/^source\.[^.]+$/i.test(copy) ? copy.replace(/\.[^.]+$/, '') : t.unnamed;
     }
 
     function renderRecent(r: RefineState): void {
@@ -1157,6 +1179,7 @@ const coverPanel: WebUiPanel = {
       if (key === recentKey) return;
       recentKey = key;
       exportForm = null;
+      libraryForm = null;
       recentList.textContent = '';
       if (!r.sessions.length) {
         recentList.append(ui.h('div', 'rvc-detail', t.recentEmpty));
@@ -1184,6 +1207,7 @@ const coverPanel: WebUiPanel = {
         acts.append(
           ui.button(t.recentResume, { size: 'sm', onClick: () => chooseSession(s.id) }),
           ui.button(t.recentExport, { size: 'sm', onClick: () => toggleExport(row, s) }),
+          ui.button(t.librarySave, { size: 'sm', onClick: () => toggleLibrary(row, s) }),
           ui.button(t.sessionDelete, { size: 'sm', onClick: () => void deleteById(s.id) }),
         );
         if (s.id === selectedId) {
@@ -1233,6 +1257,83 @@ const coverPanel: WebUiPanel = {
       form.append(grid, acts, line);
       row.after(form);
       exportForm = form;
+    }
+
+    function toggleLibrary(row: HTMLElement, s: SessionSummary): void {
+      if (libraryForm) {
+        libraryForm.remove();
+        libraryForm = null;
+      }
+      const picked = s.id === selectedId ? outputFiles.find((f) => f.path === pickedOutput) : undefined;
+      const latest = s.outputFiles[s.outputFiles.length - 1];
+      // 统一成「媒体 + 序号 + 类型」：-1 让后端按最近一条成品取。
+      const target: LibraryTarget | undefined = picked
+        ? { media: picked.kind, index: picked.index, format: picked.format, mediaKind: picked.mediaKind }
+        : latest
+          ? { media: 'output', index: -1, format: latest.format, mediaKind: latest.kind }
+          : undefined;
+      // 老会话没有 kind 字段，按文件名兜底（清唱文件固定 clean-*.wav）。
+      const targetPath = picked?.path ?? latest?.path ?? '';
+      const defaultKind: 'clean' | 'cover' = target?.mediaKind
+        ?? (targetPath.includes('clean-') ? 'clean' : 'cover');
+      const form = ui.h('div', 'rvc-recent-form');
+      const name = ui.input({ value: songName(s) });
+      const kind = ui.select({
+        value: defaultKind,
+        options: [{ value: 'clean', label: t.libraryKindClean }, { value: 'cover', label: t.libraryKindCover }],
+      });
+      const line = ui.h('div', 'rvc-detail', t.libraryHint);
+      const grid = ui.h('div', 'rvc-grid');
+      grid.append(ui.field(t.libraryName, name), ui.field(t.libraryKind, kind));
+      const acts = ui.actions();
+      const save = ui.button(t.libraryConfirm, {
+        variant: 'primary', size: 'sm', onClick: () => void doLibrarySave(s, target, kind, name, line),
+      });
+      const cancel = ui.button(t.libraryCancel, {
+        size: 'sm',
+        onClick: () => {
+          form.remove();
+          if (libraryForm === form) libraryForm = null;
+        },
+      });
+      acts.append(save, cancel);
+      form.append(grid, acts, line);
+      row.after(form);
+      libraryForm = form;
+    }
+
+    async function doLibrarySave(
+      s: SessionSummary,
+      target: LibraryTarget | undefined,
+      kind: HTMLSelectElement,
+      name: HTMLInputElement,
+      line: HTMLElement,
+    ): Promise<void> {
+      line.classList.remove('bad');
+      if (!target) {
+        line.textContent = t.exportNeedOutput;
+        line.classList.add('bad');
+        return;
+      }
+      if (kind.value === 'clean' && target.format !== 'wav') {
+        line.textContent = t.libraryNeedWav;
+        line.classList.add('bad');
+        return;
+      }
+      line.textContent = t.librarySaving;
+      try {
+        const r = await ctx.invoke<{
+          entry: { title: string; bytes: number }; duplicate: boolean;
+        }>('librarySave', [s.id, target.media, target.index, kind.value, name.value.trim()]);
+        const text = r.duplicate
+          ? t.libraryDuplicate(r.entry.title)
+          : t.librarySaved(`${r.entry.title}_${kind.value === 'clean' ? '清唱' : '翻唱'}cover`, ui.fmt.bytes(r.entry.bytes));
+        line.textContent = text;
+        ui.toast(text);
+      } catch (err) {
+        line.textContent = errText(err);
+        line.classList.add('bad');
+      }
     }
 
     function extOf(file: string): string {
@@ -1356,6 +1457,7 @@ const coverPanel: WebUiPanel = {
         setSlider(fadeIn, session.mix.fadeInSec);
         setSlider(fadeOut, session.mix.fadeOutSec);
         mixFormat.value = lastFormatOf(session);
+        bgmMode.value = session.mix.withBgm === false ? 'clean' : 'bgm';
         applied = appliedFromSession(session);
         mixKey = `${session.id}:${JSON.stringify(session.mix)}`;
       }
@@ -1368,6 +1470,7 @@ const coverPanel: WebUiPanel = {
           setSlider(instGainDb, session.mix.instGainDb);
           setSlider(fadeIn, session.mix.fadeInSec);
           setSlider(fadeOut, session.mix.fadeOutSec);
+          bgmMode.value = session.mix.withBgm === false ? 'clean' : 'bgm';
         }
       }
       if (session) {
@@ -1861,6 +1964,7 @@ const coverPanel: WebUiPanel = {
           format: mixFormat.value,
           chunk: chunk.value === 'chunk',
           keepSource: keepSource.checked,
+          withBgm: bgmMode.value !== 'clean',
         }]);
       } catch (err) {
         pendingApplied = null;
@@ -1914,6 +2018,7 @@ const coverPanel: WebUiPanel = {
           fadeInSec: Number(fadeIn.input.value),
           fadeOutSec: Number(fadeOut.input.value),
           format: mixFormat.value,
+          withBgm: bgmMode.value !== 'clean',
         }]);
       } catch (err) {
         pendingApplied = null;

@@ -14,6 +14,8 @@ export interface CoverParams {
   fadeInSec: number;
   fadeOutSec: number;
   format: string;
+  /** 是否有 BGM；不传按 true。 */
+  withBgm?: boolean;
 }
 
 export interface CoverDirty {
@@ -39,7 +41,8 @@ export function coverDirty(current: CoverParams, applied: CoverParams): CoverDir
       !same(current.instGainDb, applied.instGainDb) ||
       !same(current.fadeInSec, applied.fadeInSec) ||
       !same(current.fadeOutSec, applied.fadeOutSec) ||
-      current.format !== applied.format,
+      current.format !== applied.format ||
+      (current.withBgm !== false) !== (applied.withBgm !== false),
   };
 }
 

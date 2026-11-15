@@ -42,9 +42,16 @@ describe('翻唱按钮的 dirty 判定', () => {
       { fadeInSec: 1.5 },
       { fadeOutSec: 2 },
       { format: 'mp3' },
+      { withBgm: false },
     ] satisfies Array<Partial<CoverParams>>) {
       expect(coverDirty(with_(patch), base)).toEqual({ inference: false, mix: true });
     }
+  });
+
+  it('BGM 开关只算混音改动；显式 true 与省略等价', () => {
+    expect(coverDirty(with_({ withBgm: true }), base)).toEqual({ inference: false, mix: false });
+    expect(coverDirty(with_({ withBgm: false }), with_({ withBgm: true })).mix).toBe(true);
+    expect(coverDirty(with_({ withBgm: false }), base).inference).toBe(false);
   });
 
   it('改了又改回去不算改动', () => {
