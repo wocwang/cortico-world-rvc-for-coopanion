@@ -2,9 +2,12 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { Logger, WorldHost } from 'cortico/core/types.ts';
+import type { Logger, ToolOutcome, WorldHost } from 'cortico/core/types.ts';
 import { RVC_DEFAULTS, configGroups } from '../src/config.ts';
 import { createSession, readSession, writeSession, type RefineSession } from '../src/session.ts';
+import { saveToLibrary } from '../src/library.ts';
+import type { SongPlayer } from '../src/player.ts';
+import type { WavInfo } from '../src/wav.ts';
 import { RvcWorld, isMemoryError } from '../src/world.ts';
 
 const roots: string[] = [];
@@ -21,7 +24,10 @@ const log: Logger = {
 };
 
 /** 起一个 World：不碰网络、不装任何东西；python 路径故意指向不存在的位置，引擎会立刻报错。 */
-async function makeWorld(overrides: Partial<typeof RVC_DEFAULTS> = {}): Promise<{ world: RvcWorld; invoke: (method: string, args?: unknown[]) => Promise<unknown>; dataDir: string }> {
+async function makeWorld(
+  overrides: Partial<typeof RVC_DEFAULTS> = {},
+  createSongPlayer?: (log: Logger) => SongPlayer,
+): Promise<{ world: RvcWorld; invoke: (method: string, args?: unknown[]) => Promise<unknown>; dataDir: string }> {
   const dataDir = mkdtempSync(join(tmpdir(), 'rvc-world-'));
   roots.push(dataDir);
   const world = new RvcWorld({
@@ -30,11 +36,45 @@ async function makeWorld(overrides: Partial<typeof RVC_DEFAULTS> = {}): Promise<
     packageDir: join(dataDir, 'pkg'),
     libraryDir: join(dataDir, 'library'),
     runtimesRoot: () => join(dataDir, 'runtimes'),
+    ...(createSongPlayer ? { createSongPlayer } : {}),
   });
   worlds.push(world);
   await world.start({ log } as unknown as WorldHost);
   const decl = world.webUi('zh');
   return { world, dataDir, invoke: (method, args = []) => decl.invoke!('service', method, args) };
+}
+
+interface FakePlayer extends SongPlayer {
+  cuts: number;
+  files: string[];
+  closed: number;
+}
+
+/** 假播放器：只记调用顺序，不加载原生模块、不出声。 */
+function fakePlayer(): FakePlayer {
+  const state: FakePlayer = {
+    cuts: 0,
+    files: [],
+    closed: 0,
+    stop() { state.cuts += 1; },
+    playFile(path: string) {
+      state.files.push(path);
+      return Promise.resolve({ durationSec: 12.5, info: {} as WavInfo });
+    },
+    close() { state.closed += 1; },
+  };
+  return state;
+}
+
+/** 直接把 WAV 字节放进翻唱库；歌名/类型就是 `rvc_sing` 要检索的字段。 */
+function seedLibrary(dataDir: string, songs: Array<{ title: string; kind: 'clean' | 'cover'; ext?: string }>): void {
+  const src = join(dataDir, 'lib-src');
+  mkdirSync(src, { recursive: true });
+  songs.forEach((song, at) => {
+    const path = join(src, `${at}${song.ext ?? '.wav'}`);
+    writeFileSync(path, Buffer.alloc(128 + at));
+    saveToLibrary({ root: join(dataDir, 'library'), kind: song.kind, title: song.title, sourcePath: path });
+  });
 }
 
 /** 造一个「看起来像」的 .pth：zip 头 + 1 MB。 */
@@ -441,6 +481,87 @@ describe('翻唱库入库', () => {
     expect(cover.entry.title).toBe('未命名');
     await expect(invoke('librarySave', ['nope', 'output', 0, 'cover', ''])).rejects.toThrow('找不到会话');
     await expect(invoke('librarySave', [mp3.id, 'output', 3, 'cover', ''])).rejects.toThrow('还没有成品');
+  });
+});
+
+describe('rvc_sing 桌宠点歌', () => {
+  const call = async (world: RvcWorld, args: Record<string, unknown>): Promise<ToolOutcome> => {
+    const tool = world.tools().find((item) => item.name === 'rvc_sing');
+    expect(tool).toBeTruthy();
+    return await tool!.handler(args, {} as never) as ToolOutcome;
+  };
+
+  it('注册为 speak 工具，类型只有清唱 / 翻唱且默认不传', async () => {
+    const { world } = await makeWorld();
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    expect(tool.tags).toEqual(['speak']);
+    const schema = tool.parameters as {
+      properties: { kind: { enum: string[] }; song: { type: string } };
+      required: string[];
+    };
+    expect(schema.properties.kind.enum).toEqual(['clean', 'cover']);
+    expect(schema.required).toEqual([]);
+  });
+
+  it('按歌名点清唱；再点明确翻唱时先停上一首', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({}, () => player);
+    seedLibrary(dataDir, [
+      { title: '起风了', kind: 'cover' },
+      { title: '起风了', kind: 'clean' },
+    ]);
+    const clean = await call(world, { song: '《起风了》' });
+    expect(clean.failed).toBeUndefined();
+    expect(clean.text).toContain('起风了');
+    expect(clean.text).toContain('clean vocal');
+    expect(clean.text).toContain('0:13');
+    expect(player.files[0]).toContain('清唱cover');
+
+    const cuts = player.cuts;
+    const cover = await call(world, { song: '起风了', kind: 'cover' });
+    expect(player.cuts).toBe(cuts + 1);
+    expect(player.files[1]).toContain('翻唱cover');
+    expect(cover.text).toContain('with backing track');
+  });
+
+  it('不给歌名时随机清唱；库为空只回文本，不算失败', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({}, () => player);
+    const empty = await call(world, {});
+    expect(empty.failed).toBeUndefined();
+    expect(empty.text).toContain('empty');
+    expect(player.files).toHaveLength(0);
+
+    seedLibrary(dataDir, [{ title: '晴天', kind: 'clean' }]);
+    const random = await call(world, {});
+    expect(random.failed).toBeUndefined();
+    expect(random.text).toContain('晴天');
+    expect(player.files[0]).toContain('清唱cover');
+  });
+
+  it('只有翻唱版时不偷放；明确要翻唱才播', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({}, () => player);
+    seedLibrary(dataDir, [{ title: '稻香', kind: 'cover' }]);
+    const clean = await call(world, { song: '稻香' });
+    expect(clean.failed).toBeUndefined();
+    expect(clean.text).toContain('only as cover');
+    expect(player.files).toHaveLength(0);
+
+    const cover = await call(world, { song: '稻香', kind: 'cover' });
+    expect(cover.failed).toBeUndefined();
+    expect(player.files[0]).toContain('翻唱cover');
+  });
+
+  it('mp3 成品明确拒播，并说明怎么补', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({}, () => player);
+    seedLibrary(dataDir, [{ title: '七里香', kind: 'cover', ext: '.mp3' }]);
+    const out = await call(world, { song: '七里香', kind: 'cover' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('.mp3');
+    expect(out.text).toContain('WAV');
+    expect(player.files).toHaveLength(0);
   });
 });
 

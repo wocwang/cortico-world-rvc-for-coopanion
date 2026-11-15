@@ -5,7 +5,8 @@
  * 1. 常驻 Python worker（`src/python/worker.py`，见 engine.ts）——载入模型并预热，之后热态 0.3 秒；
  * 2. 本机 HTTP 接口（server.ts，默认 127.0.0.1:9881）——给其他插件与面板用。
  *
- * 本 World 不注册工具、不发事件：文字由 gpt-sovits 管，QQ 消息由 QQ 插件管。
+ * 工具 `rvc_sing` 给桌宠 / 对话页点歌：从翻唱库按歌名或随机挑一首，写进本机声卡后回执；
+ * 默认清唱，只有用户明确要翻唱 / 带伴奏才用翻唱版。
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -13,7 +14,7 @@ import { dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
-import type { Logger, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
+import type { Logger, ToolDef, ToolOutcome, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { configGroups, DEFAULT_PORT, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
 import { UVR_MODEL_FILE } from './catalog.ts';
 import { RvcEngine, RvcError, type ConvertDone, type EngineState } from './engine.ts';
@@ -33,8 +34,14 @@ import {
   defaultLibraryDir, deleteLibraryEntry, libraryStats, readLibrary, resolveLibraryFile,
   saveToLibrary, type LibraryKind,
 } from './library.ts';
+import { AudifySink, BackgroundSongPlayer, type SongPlayer } from './player.ts';
+import { pickSong } from './sing.ts';
+import { RVC_TOOL_DECLS } from './tools.ts';
+import { clock } from './wav.ts';
 
 const WORKER_SCRIPT = fileURLToPath(new URL('./python/worker.py', import.meta.url));
+/** 告诉模型「怎么点歌」的环境提示词模板。 */
+const ENV_PROMPT_PATH = fileURLToPath(new URL('../prompts/env.md', import.meta.url));
 
 export interface RvcWorldOptions {
   cfg: RvcConfigSection;
@@ -44,6 +51,8 @@ export interface RvcWorldOptions {
   runtimesRoot: () => string;
   /** 翻唱库根目录；默认 `<dataDir>/../../../../extensions/rvc-library`，测试可覆盖。 */
   libraryDir?: string;
+  /** 建本机播放器；单测里注入假播放器用，不传就用随包 audify 的真播放器。 */
+  createSongPlayer?: (log: Logger) => SongPlayer;
 }
 
 /** 在 `<runtimesRoot>/gpt-sovits/<版本>/<档>/runtime/python.exe` 里挑一个可用运行时。
@@ -179,6 +188,8 @@ export class RvcWorld implements World {
   private activeSession: string | null = null;
   /** 翻唱库根目录（独立于会话，不随升级丢失）。 */
   private readonly libraryDir: string;
+  /** 本机播放器：`rvc_sing` 把库里的歌写进它；原生模块用到才加载。 */
+  private songPlayer: SongPlayer | null = null;
 
   constructor(opts: RvcWorldOptions) {
     this.opts = opts;
@@ -186,11 +197,28 @@ export class RvcWorld implements World {
   }
 
   envPromptVars(): Record<string, string> | null {
-    return null;
+    const st = this.engine?.state();
+    const state = st?.phase === 'ready'
+      ? '就绪'
+      : st?.phase === 'starting'
+        ? '正在启动'
+        : st?.phase === 'error'
+          ? `出错：${st.detail || this.launchDetail || '未知原因'}`
+          : '未启动';
+    let library = '0 首';
+    try {
+      const entries = readLibrary(this.libraryDir).entries;
+      if (entries.length) {
+        const clean = entries.filter((entry) => entry.kind === 'clean').length;
+        library = `${entries.length} 首（清唱 ${clean} / 翻唱 ${entries.length - clean}）`;
+      }
+    } catch { /* 库读不出来时按空库说 */ }
+    return { 'rvc.state': state, 'rvc.library': library };
   }
 
-  tools(): [] {
-    return [];
+  tools(): ToolDef[] {
+    const decl = RVC_TOOL_DECLS[0]!;
+    return [{ ...decl, handler: (args) => this.rvcSing(args) }];
   }
 
   webUi(language: Language = 'zh'): WorldWebUiDecl {
@@ -211,6 +239,18 @@ export class RvcWorld implements World {
         { id: 'voices', title: t.voicesTitle, description: t.voicesHint, getMethods: ['state', 'voices'] },
       ],
       invoke: async (panel, method, args) => this.invoke(panel, method, args),
+      // 给模型的点歌写法：按歌名或随机、默认清唱、再点先停上一首。
+      promptDocs: [{
+        key: `worlds.${RVC_ID}.envPrompt`,
+        title: `${worldLabel(language)} · 环境提示词`,
+        description: '桌宠点歌：rvc_sing 按歌名从翻唱库取歌，省略 song 随机；默认清唱，明确要翻唱 / 带伴奏才传 cover。',
+        path: ENV_PROMPT_PATH,
+        role: 'envPrompt',
+        vars: [
+          { name: 'rvc.state', description: 'RVC 引擎此刻的状态（就绪 / 启动中 / 出错 / 未启动）。' },
+          { name: 'rvc.library', description: '翻唱库里保存的歌曲数量与清唱 / 翻唱分布。' },
+        ],
+      }],
       // 配置组交给框架自带的配置视图，不各占一个面板。
       config: configGroups(language),
     };
@@ -218,6 +258,9 @@ export class RvcWorld implements World {
 
   async start(host: WorldHost): Promise<void> {
     this.log = host.log;
+    this.songPlayer = this.opts.createSongPlayer
+      ? this.opts.createSongPlayer(host.log)
+      : new BackgroundSongPlayer(new AudifySink(host.log), host.log);
     this.stopped = false;
     // 「随软件自动启动」关掉时，把引擎按「用户手动停过」处理，等面板点启动。
     this.engineHeld = this.opts.cfg.autoStart === false;
@@ -267,6 +310,8 @@ export class RvcWorld implements World {
   async stop(): Promise<void> {
     this.stopped = true;
     this.cancelIdle();
+    this.songPlayer?.close();
+    this.songPlayer = null;
     this.installer?.cancel();
     this.venv?.cancel();
     const server = this.server;
@@ -1240,6 +1285,40 @@ export class RvcWorld implements World {
       ...stats,
       entries: index.entries.map(({ sourceHash: _hash, ...item }) => item),
     };
+  }
+
+  /** 桌宠点歌：按歌名或随机挑库里的歌，默认清唱；第一块 PCM 进声卡后回执。 */
+  private async rvcSing(args: Record<string, unknown>): Promise<ToolOutcome> {
+    const song = typeof args.song === 'string' ? args.song.trim() : '';
+    const kind: LibraryKind = args.kind === 'cover' ? 'cover' : 'clean';
+    const player = this.songPlayer;
+    // 再点歌先停上一首；这一首找不到也不让旧歌继续放。
+    player?.stop();
+    const pick = pickSong(this.libraryDir, { song, kind });
+    if ('issue' in pick) return { text: pick.issue.message };
+    if (!player) return { text: 'Nothing played: the local player is not ready.', failed: true };
+    const full = join(this.libraryDir, pick.entry.file);
+    if (!existsSync(full)) {
+      return { text: `Found "${pick.entry.title}" in the library, but its file is missing. Save it again from the RVC panel.`, failed: true };
+    }
+    const ext = extname(full).toLowerCase();
+    if (ext !== '.wav') {
+      return {
+        text: `"${pick.entry.title}" is saved as ${ext || 'an unknown format'}; the pet can only play WAV from the library. Re-mix it as WAV and save it again.`,
+        failed: true,
+      };
+    }
+    try {
+      const { durationSec } = await player.playFile(full);
+      this.log?.info('桌宠点歌', { title: pick.entry.title, kind, file: pick.entry.file, seconds: durationSec });
+      const label = kind === 'clean' ? 'clean vocal, no backing track' : 'cover, with backing track';
+      return { text: `Playing "${pick.entry.title}" (${label}), ${clock(durationSec)}.` };
+    } catch (err) {
+      return {
+        text: `Found "${pick.entry.title}", but could not play it on this computer: ${err instanceof Error ? err.message : String(err)}.`,
+        failed: true,
+      };
+    }
   }
 
   private deleteSession(id: string): Record<string, unknown> {

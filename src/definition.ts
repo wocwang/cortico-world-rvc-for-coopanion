@@ -2,12 +2,21 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runtimesRoot } from 'cortico/paths.ts';
-import type { WorldDefinition, WorldDescribe } from 'cortico/world.ts';
+import { describeTools, type WorldDefinition, type WorldDescribe } from 'cortico/world.ts';
 import { RVC_DEFAULTS, RVC_ID, TIER_OPTIONS, tierOptions, type RvcConfigSection } from './config.ts';
 import { RvcWorld } from './world.ts';
+import { RVC_TOOL_DECLS } from './tools.ts';
 
-/** 本 World 不注册工具、不发事件：它只提供 HTTP 接口与面板。 */
-const DESCRIBE: WorldDescribe = { tools: [], events: [] };
+/** 工具 `rvc_sing` 从翻唱库点歌；事件仍不发。 */
+const DESCRIBE: WorldDescribe = {
+  tools: describeTools(RVC_TOOL_DECLS, {
+    rvc_sing: {
+      zh: '从翻唱库按歌名或随机点一首，本机外放；默认清唱，明确要翻唱 / 带伴奏才用翻唱版。',
+      en: 'Plays a saved song from the local cover library through the speakers — by name or random; clean vocals by default, cover only when explicitly asked.',
+    },
+  }),
+  events: [],
+};
 
 /**
  * 扩展自己的包目录：宿主的 `ctx.packageDir` 指向加载它的 bot 包（Coopanion 里是
