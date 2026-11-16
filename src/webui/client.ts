@@ -217,6 +217,13 @@ interface PanelState {
   install: JobState;
   voiceCount: number;
   defaultVoice: string;
+  /** 配置里的初始值；老版本 World 可能没有这个字段。 */
+  defaults?: {
+    singKind: 'clean' | 'cover';
+    panelKind: 'clean' | 'cover';
+    saveToLibrary: boolean;
+    keepSource: boolean;
+  };
   lastConvert: ConvertDone | null;
   lastCover: CoverDone | null;
   lastMix: MixDone | null;
@@ -727,6 +734,8 @@ const coverPanel: WebUiPanel = {
     const t = panelText(ctx.language);
     const msg = ui.msgline();
     let state: PanelState | null = null;
+    /** 配置里的默认值只在第一次拿到状态时套用，之后保留用户本次的手动选择。 */
+    let defaultsApplied = false;
     let pickedPath: string | null = null;
     let pickedName = '';
     let url: string | null = null;
@@ -2504,6 +2513,13 @@ const coverPanel: WebUiPanel = {
 
     function render(s: PanelState, voices: VoiceRow[]): void {
       state = s;
+      if (!defaultsApplied && s.defaults) {
+        defaultsApplied = true;
+        keepSource.checked = s.defaults.keepSource;
+        toLibrary.checked = s.defaults.saveToLibrary;
+        biliKind.value = s.defaults.panelKind;
+        bgmMode.value = s.defaults.panelKind === 'clean' ? 'clean' : 'bgm';
+      }
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
       fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
       updateCoverButton();

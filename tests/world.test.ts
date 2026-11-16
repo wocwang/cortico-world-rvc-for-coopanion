@@ -133,7 +133,7 @@ describe('World 面板数据面', () => {
     const { world } = await makeWorld();
     const decl = world.webUi('zh');
     expect(decl.panels?.map((p) => p.id)).toEqual(['service', 'convert', 'cover', 'voices']);
-    expect(decl.config?.map((g) => g.id)).toEqual(['world:rvc', 'world:rvc:service']);
+    expect(decl.config?.map((g) => g.id)).toEqual(['world:rvc', 'world:rvc:defaults', 'world:rvc:service']);
     expect(world.webUi('en').panels?.[0]?.title).toBe('Service');
   });
 
@@ -809,6 +809,20 @@ describe('B 站一键翻唱', () => {
     expect(out.text).toContain('Playing');
     expect(player.files[0]).toContain('清唱cover');
   });
+
+  it('默认类型读配置：设为翻唱时不传 kind 也唱翻唱版', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({ singKind: 'cover' }, () => player);
+    seedLibrary(dataDir, [
+      { title: '起风了', kind: 'clean' },
+      { title: '起风了', kind: 'cover' },
+    ]);
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    const out = await tool.handler({ song: '起风了' }, {} as never) as ToolOutcome;
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('cover, with backing track');
+    expect(player.files[0]).toContain('翻唱cover');
+  });
 });
 
 describe('闲置回收配置', () => {
@@ -821,5 +835,35 @@ describe('闲置回收配置', () => {
     const prop = group?.schema.properties?.['worlds.rvc.idleMinutes'] as { type?: string; minimum?: number } | undefined;
     expect(prop?.type).toBe('number');
     expect(prop?.minimum).toBe(0);
+  });
+});
+
+describe('点歌与翻唱默认值配置', () => {
+  it('默认值保持原有行为', () => {
+    expect(RVC_DEFAULTS.singKind).toBe('clean');
+    expect(RVC_DEFAULTS.panelKind).toBe('cover');
+    expect(RVC_DEFAULTS.saveToLibrary).toBe(true);
+    expect(RVC_DEFAULTS.keepSource).toBe(true);
+  });
+
+  it('默认值分组里四项都可改', () => {
+    const group = configGroups('zh').find((g) => g.id.endsWith(':defaults'));
+    const props = group?.schema.properties ?? {};
+    expect(props['worlds.rvc.singKind']).toMatchObject({ type: 'string', 'x-options': 'rvc:kind' });
+    expect(props['worlds.rvc.panelKind']).toMatchObject({ type: 'string', 'x-options': 'rvc:kind' });
+    expect(props['worlds.rvc.saveToLibrary']).toMatchObject({ type: 'boolean' });
+    expect(props['worlds.rvc.keepSource']).toMatchObject({ type: 'boolean' });
+  });
+
+  it('面板状态带回配置默认值', async () => {
+    const { invoke } = await makeWorld({
+      singKind: 'cover', panelKind: 'clean', saveToLibrary: false, keepSource: false,
+    });
+    const state = await invoke('state') as {
+      defaults: { singKind: string; panelKind: string; saveToLibrary: boolean; keepSource: boolean };
+    };
+    expect(state.defaults).toEqual({
+      singKind: 'cover', panelKind: 'clean', saveToLibrary: false, keepSource: false,
+    });
   });
 });

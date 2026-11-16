@@ -232,7 +232,8 @@ export class RvcWorld implements World {
         library = `${entries.length} 首（清唱 ${clean} / 翻唱 ${entries.length - clean}）`;
       }
     } catch { /* 库读不出来时按空库说 */ }
-    return { 'rvc.state': state, 'rvc.library': library };
+    const defaultKind = this.singKind() === 'cover' ? '翻唱（带伴奏）' : '清唱（只留人声）';
+    return { 'rvc.state': state, 'rvc.library': library, 'rvc.defaultKind': defaultKind };
   }
 
   tools(): ToolDef[] {
@@ -258,16 +259,17 @@ export class RvcWorld implements World {
         { id: 'voices', title: t.voicesTitle, description: t.voicesHint, getMethods: ['state', 'voices'] },
       ],
       invoke: async (panel, method, args) => this.invoke(panel, method, args),
-      // 给模型的点歌写法：按歌名或随机、默认清唱、再点先停上一首。
+      // 给模型的点歌写法：按歌名或随机、默认类型读配置、再点先停上一首。
       promptDocs: [{
         key: `worlds.${RVC_ID}.envPrompt`,
         title: `${worldLabel(language)} · 环境提示词`,
-        description: '桌宠点歌：rvc_sing 按歌名从翻唱库取歌，省略 song 随机；默认清唱，明确要翻唱 / 带伴奏才传 cover。',
+        description: '桌宠点歌：rvc_sing 按歌名从翻唱库取歌，省略 song 随机；不传 kind 时用配置里的默认类型，明确要另一种才传 kind。',
         path: ENV_PROMPT_PATH,
         role: 'envPrompt',
         vars: [
           { name: 'rvc.state', description: 'RVC 引擎此刻的状态（就绪 / 启动中 / 出错 / 未启动）。' },
           { name: 'rvc.library', description: '翻唱库里保存的歌曲数量与清唱 / 翻唱分布。' },
+          { name: 'rvc.defaultKind', description: '配置里的桌宠点歌默认类型（清唱 / 翻唱）。' },
         ],
       }],
       // 配置组交给框架自带的配置视图，不各占一个面板。
@@ -795,6 +797,7 @@ export class RvcWorld implements World {
       };
       return {
         $binary: { mime: outFormat === 'mp3' ? 'audio/mpeg' : 'audio/wav', base64: audio.toString('base64') },
+        savedPath,
         ...(library ? { library } : {}),
         ...(libraryError ? { libraryError } : {}),
       };
@@ -1596,10 +1599,11 @@ export class RvcWorld implements World {
     }
   }
 
-  /** 桌宠点歌：库优先；库里没有就按歌名跑一次 B 站一键翻唱（默认清唱），入库后直接播放。 */
+  /** 桌宠点歌：库优先；库里没有就按歌名跑一次 B 站一键翻唱（默认类型读配置），完成后直接播放。 */
   private async rvcSing(args: Record<string, unknown>): Promise<ToolOutcome> {
     const song = typeof args.song === 'string' ? args.song.trim() : '';
-    const kind: LibraryKind = args.kind === 'cover' ? 'cover' : 'clean';
+    // 显式传了 kind 就以调用为准；没传才用配置里的桌宠默认类型。
+    const kind: LibraryKind = args.kind === 'cover' ? 'cover' : args.kind === 'clean' ? 'clean' : this.singKind();
     // source=bilibili 表示用户已经否掉了库里的相近版本，明确要去找原版。
     const source = args.source === 'bilibili' ? 'bilibili' : 'library';
     const player = this.songPlayer;
@@ -1716,19 +1720,25 @@ export class RvcWorld implements World {
           vocalGain: 0,
           format: 'wav',
           chunk: true,
-          keepSource: true,
+          keepSource: this.keepSourceByDefault(),
           withBgm: bgm,
-          toLibrary: true,
+          // 配置里关掉「默认入库」时仍照常播放，只是不写翻唱库。
+          toLibrary: this.saveToLibraryByDefault(),
           title: query,
-        }]) as { library?: { file: string; title: string }; libraryError?: string };
+        }]) as { library?: { file: string; title: string }; libraryError?: string; savedPath?: string };
         if (generation !== this.singGeneration) return;
-        if (!result.library?.file) {
-          this.log?.warn('桌宠点歌：生成完成但未入库', { query, err: result.libraryError || 'unknown' });
+        const target = result.library?.file ? join(this.libraryDir, result.library.file) : result.savedPath;
+        if (!target) {
+          this.log?.warn('桌宠点歌：生成完成但没有可播放文件', {
+            query, err: result.libraryError || 'no saved output',
+          });
           return;
         }
         try {
-          const { durationSec } = await player.playFile(join(this.libraryDir, result.library.file));
-          this.log?.info('桌宠点歌：自动翻唱后播放', { title: result.library.title, seconds: durationSec });
+          const { durationSec } = await player.playFile(target);
+          this.log?.info('桌宠点歌：自动翻唱后播放', {
+            title: result.library?.title ?? query, seconds: durationSec, savedToLibrary: !!result.library,
+          });
         } catch (err) {
           this.log?.warn('桌宠点歌：自动翻唱后播放失败', { err: err instanceof Error ? err.message : String(err) });
         }
@@ -1990,6 +2000,26 @@ export class RvcWorld implements World {
     });
   }
 
+  /** 配置里的桌宠默认类型；老配置没有这个字段时按清唱。 */
+  private singKind(): LibraryKind {
+    return this.opts.cfg.singKind === 'cover' ? 'cover' : 'clean';
+  }
+
+  /** 配置里的面板默认类型；老配置没有这个字段时按翻唱。 */
+  private panelKind(): LibraryKind {
+    return this.opts.cfg.panelKind === 'clean' ? 'clean' : 'cover';
+  }
+
+  /** 翻唱完成后默认是否入库；老配置没有这个字段时保持旧行为（入库）。 */
+  private saveToLibraryByDefault(): boolean {
+    return this.opts.cfg.saveToLibrary !== false;
+  }
+
+  /** 默认是否保留原声副本；老配置没有这个字段时保持旧行为（保留）。 */
+  private keepSourceByDefault(): boolean {
+    return this.opts.cfg.keepSource !== false;
+  }
+
   /** 面板与状态行看到的一切。 */
   private status(): Record<string, unknown> {
     const st: EngineState | null = this.engine ? this.engine.state() : null;
@@ -2022,6 +2052,12 @@ export class RvcWorld implements World {
       install: this.installer?.state() ?? { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' },
       voiceCount: voices.length,
       defaultVoice: this.defaultVoice(voices),
+      defaults: {
+        singKind: this.singKind(),
+        panelKind: this.panelKind(),
+        saveToLibrary: this.saveToLibraryByDefault(),
+        keepSource: this.keepSourceByDefault(),
+      },
       lastConvert: this.lastConvert,
       lastCover: this.lastCover,
       lastMix: this.lastMix,

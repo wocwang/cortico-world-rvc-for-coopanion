@@ -3,7 +3,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runtimesRoot } from 'cortico/paths.ts';
 import { describeTools, type WorldDefinition, type WorldDescribe } from 'cortico/world.ts';
-import { RVC_DEFAULTS, RVC_ID, TIER_OPTIONS, tierOptions, type RvcConfigSection } from './config.ts';
+import {
+  KIND_OPTIONS, RVC_DEFAULTS, RVC_ID, TIER_OPTIONS, kindOptions, tierOptions, type RvcConfigSection,
+} from './config.ts';
 import { RvcWorld } from './world.ts';
 import { RVC_TOOL_DECLS } from './tools.ts';
 
@@ -11,8 +13,8 @@ import { RVC_TOOL_DECLS } from './tools.ts';
 const DESCRIBE: WorldDescribe = {
   tools: describeTools(RVC_TOOL_DECLS, {
     rvc_sing: {
-      zh: '从翻唱库按歌名或随机点一首，本机外放；精确命中直接播，只有相近版本时先问；默认清唱，明确要翻唱 / 带伴奏才用翻唱版。',
-      en: 'Plays a saved song from the local cover library through the speakers — by name or random; exact titles play directly, close versions are confirmed first; clean vocals by default, cover only when explicitly asked.',
+      zh: '从翻唱库按歌名或随机点一首，本机外放；精确命中直接播，只有相近版本时先问；默认唱法读配置，明确要另一种时再传 kind。',
+      en: 'Plays a saved song from the local cover library through the speakers — by name or random; exact titles play directly, close versions are confirmed first; the default singing type comes from settings.',
     },
   }),
   events: [],
@@ -31,6 +33,7 @@ export const RVC: WorldDefinition<RvcConfigSection> = {
   defaults: () => structuredClone(RVC_DEFAULTS),
   configOptions(kind, language) {
     if (kind === TIER_OPTIONS) return tierOptions(language);
+    if (kind === KIND_OPTIONS) return kindOptions(language);
     return [];
   },
   // ctx.cfg 是 `worlds.rvc` 的活引用：http 开关、参数改了现读即生效

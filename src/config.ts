@@ -6,6 +6,9 @@ export const RVC_ID = 'rvc';
 /** 推理档：沿用 gpt-sovits 的口径，`auto` 检测 NVIDIA 显卡后优先 CUDA 档运行时。 */
 export type RvcTier = 'auto' | 'cuda' | 'cpu';
 
+/** 清唱 / 翻唱；与翻唱库的 `LibraryKind` 同一口径。 */
+export type RvcKind = 'clean' | 'cover';
+
 /** config.json 的 `worlds.rvc` 段。 */
 export interface RvcConfigSection {
   enabled: boolean;
@@ -18,6 +21,14 @@ export interface RvcConfigSection {
   idleMinutes: number;
   /** 翻唱后保留人声/伴奏/变声结果，供面板重新混音；默认开。 */
   keepStems: boolean;
+  /** 桌宠点歌默认类型：用户没明确说清唱 / 翻唱时用它。 */
+  singKind: RvcKind;
+  /** 面板翻唱与 B 站一键生成的默认类型。 */
+  panelKind: RvcKind;
+  /** 翻唱完成后默认保存到翻唱库（面板勾选框与桌宠自动生成共用）。 */
+  saveToLibrary: boolean;
+  /** 默认保存原声副本，方便之后原地重跑。 */
+  keepSource: boolean;
   /** 翻唱会话保留天数；0 表示不按时间清理。 */
   sessionDays: number;
   /** 翻唱会话总容量上限（GB）；0 表示不按容量清理。 */
@@ -83,6 +94,11 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   idleMinutes: 0,
   // 默认开：不留分轨就没有可精修的素材；用 7 天 / 8 GB 兜住磁盘。
   keepStems: true,
+  // 保持原有行为：桌宠默认清唱，面板一键翻唱默认带伴奏，训完默认入库、默认留原声。
+  singKind: 'clean',
+  panelKind: 'cover',
+  saveToLibrary: true,
+  keepSource: true,
   sessionDays: 7,
   sessionMaxGb: 8,
   libraryMaxGb: 2,
@@ -106,15 +122,23 @@ const K = `worlds.${RVC_ID}`;
 
 /** `x-options` 的选项源，由定义的 `configOptions` 给出。 */
 export const TIER_OPTIONS = `${RVC_ID}:tier`;
+export const KIND_OPTIONS = `${RVC_ID}:kind`;
 
 const TEXT = {
   zh: {
     title: 'RVC 变声',
     groupConvert: { title: '变声参数', description: '推理档、默认音色与三个推理参数；面板上传时还可以逐次覆盖。' },
+    groupDefaults: { title: '点歌与翻唱默认值', description: '桌宠点歌、面板翻唱和两个勾选项的初始值；只影响没明确指定的情况，面板里仍可逐次改。' },
     groupService: { title: '运行与接口', description: '推理代码、派生 venv 与音色目录，以及给其他插件用的本机 HTTP 接口。' },
     autoStart: { title: '随软件自动启动', description: '开启后 Coopanion 启动时就预热 RVC 引擎（约 0.7 GB 显存 / 2.5 GB 内存）；关闭后启动时不预热，但桌宠点歌、面板生成和 9881 请求仍会按需拉起。手动点「停止引擎」后不会被自动拉起。' },
     idleMinutes: { title: '闲置回收（分钟）', description: '多久没有变声/翻唱就停掉引擎子进程、释放显存与内存；0 表示不回收（默认，保持旧行为）。只回收引擎，9881 接口照常监听，下一条请求会自动重新拉起。手动点「停止引擎」后不会自动重启，也不会被桌宠拉起。' },
     keepStems: { title: '保留分轨（可精修）', description: '翻唱后把人声、伴奏和变声结果留在插件数据目录的 sessions 下，面板可以只重做混音，不用重新分离和变声。每首 4 分钟的歌约占 250 MB；默认 7 天 / 8 GB 自动清理，只清 sessions，不动 out。关闭后与旧版一样不落盘。' },
+    singKind: { title: '桌宠点歌默认类型', description: '用户没明确说「清唱」或「翻唱」时，rvc_sing 用这个类型；也决定 B 站自动生成时带不带伴奏。' },
+    panelKind: { title: '面板翻唱默认类型', description: '翻唱页 BGM 下拉与 B 站一键生成的初始选项；面板里仍可逐次切换。' },
+    saveToLibrary: { title: '完成后默认保存到翻唱库', description: '翻唱页「完成后保存到翻唱库」的初始勾选；桌宠自动生成也按它决定是否入库。关闭后桌宠仍会播放生成结果，只是不入库。' },
+    keepSource: { title: '默认保存原声副本', description: '翻唱页「保存原声副本」的初始勾选；保存后可以在「最近翻唱」里原地重跑，不必重新选文件。' },
+    kindClean: '清唱（只留人声）',
+    kindCover: '翻唱（带伴奏）',
     sessionDays: { title: '会话保留天数', description: '超过这么多天的翻唱会话会被清理；0 表示不按时间清理（仍受容量上限约束）。' },
     sessionMaxGb: { title: '会话容量上限（GB）', description: 'sessions 总占用超过这个值时，从最久未用的会话开始删；0 表示不限。只影响 sessions，不动 out。' },
     libraryMaxGb: { title: '翻唱库容量上限（GB）', description: '翻唱库总占用超过这个值时，面板只提示「容量已超」，仍照常保存，不拒绝也不自动删除；0 表示不限。' },
@@ -139,10 +163,17 @@ const TEXT = {
   en: {
     title: 'RVC Voice Changer',
     groupConvert: { title: 'Conversion', description: 'Inference tier, default voice and the three inference knobs; the panel can override them per upload.' },
+    groupDefaults: { title: 'Singing defaults', description: 'Starting values for pet song requests, panel covers and the two checkboxes; they only apply when nothing is specified and can still be changed per run.' },
     groupService: { title: 'Runtime and API', description: 'Inference code, derived venv, voices folder, and the loopback HTTP endpoint for other plugins.' },
     autoStart: { title: 'Warm up on launch', description: 'When on, the RVC engine is warmed up when Coopanion launches (about 0.7 GB VRAM / 2.5 GB RAM). When off, it is not warmed up, but pet song requests, panel generations and 9881 requests still start it on demand. A manual Stop engine is never overridden.' },
     idleMinutes: { title: 'Idle shutdown (minutes)', description: 'Stop the engine process and free VRAM/RAM after this many idle minutes; 0 keeps it running (default, same as before). Only the engine is recycled — the 9881 API keeps listening and the next request starts it again. A manual Stop engine is never restarted, including by the pet.' },
     keepStems: { title: 'Keep stems for refinement', description: 'After a cover, keep the separated vocals, instrumental and converted vocal under sessions in the plugin data folder, so the panel can remix without separating or converting again. About 250 MB per 4-minute song; 7 days / 8 GB auto-cleanup by default, and only sessions is touched. Off restores the old behavior (nothing kept).' },
+    singKind: { title: 'Default pet singing type', description: 'Used by rvc_sing when the person does not explicitly ask for clean vocals or a cover; also decides whether Bilibili auto generation keeps the backing track.' },
+    panelKind: { title: 'Default panel cover type', description: 'Starting value for the BGM selector and Bilibili one-click generation; still switchable per run in the panel.' },
+    saveToLibrary: { title: 'Save finished covers to the library by default', description: 'Starting state of the "save to cover library" checkbox and whether pet auto generation is saved. When off, the pet still plays the generated result, it just is not added to the library.' },
+    keepSource: { title: 'Keep the source audio by default', description: 'Starting state of the "keep source copy" checkbox; keeping it lets you rerun a cover in place from Recent covers without picking the file again.' },
+    kindClean: 'Clean vocals (no backing track)',
+    kindCover: 'Cover (with backing track)',
     sessionDays: { title: 'Session retention (days)', description: 'Cover sessions older than this are cleaned up; 0 disables the age rule (the size cap still applies).' },
     sessionMaxGb: { title: 'Session size cap (GB)', description: 'When sessions exceed this size, the least recently used ones are removed first; 0 means no cap. Only sessions is touched, never out.' },
     libraryMaxGb: { title: 'Cover library size cap (GB)', description: 'When the cover library exceeds this size, the panel only shows an "over capacity" hint and still saves. Nothing is rejected or deleted; 0 means no cap.' },
@@ -187,6 +218,21 @@ export function configGroups(language: Language): ConfigGroup[] {
       },
     },
     {
+      id: `${owner}:defaults`,
+      owner,
+      schema: {
+        type: 'object',
+        title: t.groupDefaults.title,
+        description: t.groupDefaults.description,
+        properties: {
+          [`${K}.singKind`]: { type: 'string', title: t.singKind.title, description: t.singKind.description, 'x-options': KIND_OPTIONS, 'x-hot': true },
+          [`${K}.panelKind`]: { type: 'string', title: t.panelKind.title, description: t.panelKind.description, 'x-options': KIND_OPTIONS, 'x-hot': true },
+          [`${K}.saveToLibrary`]: { type: 'boolean', title: t.saveToLibrary.title, description: t.saveToLibrary.description, 'x-hot': true },
+          [`${K}.keepSource`]: { type: 'boolean', title: t.keepSource.title, description: t.keepSource.description, 'x-hot': true },
+        },
+      },
+    },
+    {
       id: `${owner}:service`,
       owner,
       schema: {
@@ -226,5 +272,14 @@ export function tierOptions(language: Language): Array<{ value: RvcTier; label: 
     { value: 'auto', label: t.tierAuto },
     { value: 'cuda', label: t.tierCuda },
     { value: 'cpu', label: t.tierCpu },
+  ];
+}
+
+/** 清唱 / 翻唱下拉的选项。 */
+export function kindOptions(language: Language): Array<{ value: RvcKind; label: string }> {
+  const t = pick(language, TEXT);
+  return [
+    { value: 'clean', label: t.kindClean },
+    { value: 'cover', label: t.kindCover },
   ];
 }
