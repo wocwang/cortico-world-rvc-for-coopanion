@@ -87,6 +87,12 @@ export const PITCH_MAX = 24;
 export const PROTECT_MAX = 0.5;
 export const DEFAULT_PORT = 9881;
 
+/** 闲置分钟转毫秒：支持小数（0.5 = 30 秒），0 / 非法值表示不回收。 */
+export function idleDelayMs(minutes: unknown): number {
+  const value = Number(minutes);
+  return Number.isFinite(value) && value > 0 ? Math.round(value * 60_000) : 0;
+}
+
 export const RVC_DEFAULTS: RvcConfigSection = {
   enabled: false,
   autoStart: true,
@@ -131,7 +137,7 @@ const TEXT = {
     groupDefaults: { title: '点歌与翻唱默认值', description: '桌宠点歌、面板翻唱和两个勾选项的初始值；只影响没明确指定的情况，面板里仍可逐次改。' },
     groupService: { title: '运行与接口', description: '推理代码、派生 venv 与音色目录，以及给其他插件用的本机 HTTP 接口。' },
     autoStart: { title: '随软件自动启动', description: '开启后 Coopanion 启动时就预热 RVC 引擎（约 0.7 GB 显存 / 2.5 GB 内存）；关闭后启动时不预热，但桌宠点歌、面板生成和 9881 请求仍会按需拉起。手动点「停止引擎」后不会被自动拉起。' },
-    idleMinutes: { title: '闲置回收（分钟）', description: '多久没有变声/翻唱就停掉引擎子进程、释放显存与内存；0 表示不回收（默认，保持旧行为）。只回收引擎，9881 接口照常监听，下一条请求会自动重新拉起。手动点「停止引擎」后不会自动重启，也不会被桌宠拉起。' },
+    idleMinutes: { title: '闲置回收（分钟）', description: '多久没有变声/翻唱就停掉引擎子进程、释放显存与内存；支持小数，例如 0.5 = 30 秒，按秒计时。0 表示不回收（默认，保持旧行为）。只回收引擎，9881 接口照常监听，下一条请求会自动重新拉起；桌宠按需拉起的引擎也照此回收。手动点「停止引擎」后不会自动重启，也不会被桌宠拉起。' },
     keepStems: { title: '保留分轨（可精修）', description: '翻唱后把人声、伴奏和变声结果留在插件数据目录的 sessions 下，面板可以只重做混音，不用重新分离和变声。每首 4 分钟的歌约占 250 MB；默认 7 天 / 8 GB 自动清理，只清 sessions，不动 out。关闭后与旧版一样不落盘。' },
     singKind: { title: '桌宠点歌默认类型', description: '用户没明确说「清唱」或「翻唱」时，rvc_sing 用这个类型；也决定 B 站自动生成时带不带伴奏。' },
     panelKind: { title: '面板翻唱默认类型', description: '翻唱页 BGM 下拉与 B 站一键生成的初始选项；面板里仍可逐次切换。' },
@@ -166,7 +172,7 @@ const TEXT = {
     groupDefaults: { title: 'Singing defaults', description: 'Starting values for pet song requests, panel covers and the two checkboxes; they only apply when nothing is specified and can still be changed per run.' },
     groupService: { title: 'Runtime and API', description: 'Inference code, derived venv, voices folder, and the loopback HTTP endpoint for other plugins.' },
     autoStart: { title: 'Warm up on launch', description: 'When on, the RVC engine is warmed up when Coopanion launches (about 0.7 GB VRAM / 2.5 GB RAM). When off, it is not warmed up, but pet song requests, panel generations and 9881 requests still start it on demand. A manual Stop engine is never overridden.' },
-    idleMinutes: { title: 'Idle shutdown (minutes)', description: 'Stop the engine process and free VRAM/RAM after this many idle minutes; 0 keeps it running (default, same as before). Only the engine is recycled — the 9881 API keeps listening and the next request starts it again. A manual Stop engine is never restarted, including by the pet.' },
+    idleMinutes: { title: 'Idle shutdown (minutes)', description: 'Stop the engine process and free VRAM/RAM after this many idle minutes; decimals work (0.5 = 30 seconds) and the timer is accurate to the second. 0 keeps it running (default, same as before). Only the engine is recycled — the 9881 API keeps listening and the next request starts it again; an engine started by the pet is recycled the same way. A manual Stop engine is never restarted, including by the pet.' },
     keepStems: { title: 'Keep stems for refinement', description: 'After a cover, keep the separated vocals, instrumental and converted vocal under sessions in the plugin data folder, so the panel can remix without separating or converting again. About 250 MB per 4-minute song; 7 days / 8 GB auto-cleanup by default, and only sessions is touched. Off restores the old behavior (nothing kept).' },
     singKind: { title: 'Default pet singing type', description: 'Used by rvc_sing when the person does not explicitly ask for clean vocals or a cover; also decides whether Bilibili auto generation keeps the backing track.' },
     panelKind: { title: 'Default panel cover type', description: 'Starting value for the BGM selector and Bilibili one-click generation; still switchable per run in the panel.' },
@@ -241,7 +247,7 @@ export function configGroups(language: Language): ConfigGroup[] {
         description: t.groupService.description,
         properties: {
           [`${K}.autoStart`]: { type: 'boolean', title: t.autoStart.title, description: t.autoStart.description, 'x-hot': true },
-          [`${K}.idleMinutes`]: { type: 'number', title: t.idleMinutes.title, description: t.idleMinutes.description, minimum: 0, maximum: 1440, multipleOf: 1, 'x-hot': true },
+          [`${K}.idleMinutes`]: { type: 'number', title: t.idleMinutes.title, description: t.idleMinutes.description, minimum: 0, maximum: 1440, 'x-hot': true },
           [`${K}.keepStems`]: { type: 'boolean', title: t.keepStems.title, description: t.keepStems.description, 'x-hot': true },
           [`${K}.sessionDays`]: { type: 'number', title: t.sessionDays.title, description: t.sessionDays.description, minimum: 0, maximum: 365, multipleOf: 1, 'x-hot': true },
           [`${K}.sessionMaxGb`]: { type: 'number', title: t.sessionMaxGb.title, description: t.sessionMaxGb.description, minimum: 0, maximum: 1000, multipleOf: 1, 'x-hot': true },

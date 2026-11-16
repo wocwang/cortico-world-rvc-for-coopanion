@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
 import type { Logger, ToolDef, ToolOutcome, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
-import { configGroups, DEFAULT_PORT, RVC_DEFAULTS, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
+import { configGroups, DEFAULT_PORT, idleDelayMs, RVC_DEFAULTS, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
 import { MELBAND_FILES, UVR_MODEL_FILE } from './catalog.ts';
 import { RvcEngine, RvcError, type ConvertDone, type EngineState } from './engine.ts';
 import { FileSetJob, hasFile, RvcInstaller } from './install.ts';
@@ -369,13 +369,13 @@ export class RvcWorld implements World {
   /** 闲置回收：到点停掉引擎子进程。手动停过（`engineHeld`）或 World 已卸载时不排期。 */
   private armIdle(): void {
     this.cancelIdle();
-    const minutes = Math.max(0, Math.floor(Number(this.opts.cfg.idleMinutes) || 0));
-    if (!minutes || this.stopped || this.engineHeld) return;
+    const delayMs = idleDelayMs(this.opts.cfg.idleMinutes);
+    if (!delayMs || this.stopped || this.engineHeld) return;
     const engine = this.engine;
     if (!engine?.ready()) return;
     if (this.job?.phase === 'working') return;
     if (engine.queue() > 0) return;
-    this.idleTimer = setTimeout(() => { void this.sleepIdle(); }, minutes * 60_000);
+    this.idleTimer = setTimeout(() => { void this.sleepIdle(); }, delayMs);
     this.idleTimer.unref?.();
   }
 
@@ -1680,10 +1680,9 @@ export class RvcWorld implements World {
       rmSync(download.source, { force: true });
       return { text: 'Cancelled: another song was requested.' };
     }
-    const label = kind === 'clean' ? 'clean-vocal (no backing track)' : 'cover (with backing track)';
     this.startAutoSing(generation, query, kind, download.source, player);
     return {
-      text: `"${query}" is not saved yet. Bilibili match: "${download.title}". Started making a ${label} version; it usually takes 2-5 minutes and will play automatically when done. Say another song to cancel.`,
+      text: `I haven't sung "${query}" before. I'm going to sing it now; it usually takes 2-5 minutes, and it will play on its own when it is ready. Say another song to cancel.`,
     };
   }
 

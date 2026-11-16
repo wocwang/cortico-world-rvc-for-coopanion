@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Logger, ToolOutcome, WorldHost } from 'cortico/core/types.ts';
-import { RVC_DEFAULTS, configGroups } from '../src/config.ts';
+import { RVC_DEFAULTS, configGroups, idleDelayMs } from '../src/config.ts';
 import { MELBAND_FILES, UVR_MODEL_FILE } from '../src/catalog.ts';
 import { createSession, readSession, writeSession, type RefineSession } from '../src/session.ts';
 import { saveToLibrary } from '../src/library.ts';
@@ -830,11 +830,17 @@ describe('闲置回收配置', () => {
     expect(RVC_DEFAULTS.idleMinutes).toBe(0);
   });
 
-  it('服务分组里能改，最小 0（0 表示不回收）', () => {
+  it('服务分组里能改，最小 0（0 表示不回收），支持小数到秒', () => {
     const group = configGroups('zh').find((g) => g.id.endsWith(':service'));
-    const prop = group?.schema.properties?.['worlds.rvc.idleMinutes'] as { type?: string; minimum?: number } | undefined;
+    const prop = group?.schema.properties?.['worlds.rvc.idleMinutes'] as {
+      type?: string; minimum?: number; multipleOf?: number;
+    } | undefined;
     expect(prop?.type).toBe('number');
     expect(prop?.minimum).toBe(0);
+    expect(prop?.multipleOf).toBeUndefined();
+    expect(idleDelayMs(0.5)).toBe(30_000);
+    expect(idleDelayMs(0.02)).toBe(1_200);
+    expect(idleDelayMs(0)).toBe(0);
   });
 });
 
