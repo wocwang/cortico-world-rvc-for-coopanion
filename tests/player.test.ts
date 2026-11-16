@@ -1,10 +1,12 @@
 import { execFileSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { ChildProcess } from 'node:child_process';
 import type { Logger } from 'cortico/core/types.ts';
-import { BackgroundSongPlayer, convertChannels, type AudioSink } from '../src/player.ts';
+import { FfplayPlayer, type SpawnLike } from '../src/player.ts';
 import { clock, parseWav } from '../src/wav.ts';
 
 const dirs: string[] = [];
@@ -66,20 +68,33 @@ function hasFfmpeg(): boolean {
   }
 }
 
-class FakeSink implements AudioSink {
-  writes: Array<{ bytes: number; channels: number; sampleRate: number }> = [];
-  cuts = 0;
-  flushes = 0;
-  closed = 0;
-  async write(sampleRate: number, pcm: Buffer, channels: number): Promise<void> {
-    this.writes.push({ bytes: pcm.length, channels, sampleRate });
+/** 假播放器进程：记录参数，手动触发 spawn / exit。 */
+class FakeChild extends EventEmitter {
+  exitCode: number | null = null;
+  killed = 0;
+  stderr = new EventEmitter();
+  kill(): boolean {
+    this.killed += 1;
+    this.exitCode = 0;
+    return true;
   }
-  flush(): void { this.flushes += 1; }
-  cut(): void { this.cuts += 1; }
-  close(): void { this.closed += 1; }
 }
 
-const wait = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
+function fakeSpawn(behavior?: (child: FakeChild) => void): { spawn: SpawnLike; calls: Array<{ cmd: string; args: string[] }>; last: () => FakeChild } {
+  const calls: Array<{ cmd: string; args: string[] }> = [];
+  const children: FakeChild[] = [];
+  const spawnFn: SpawnLike = (cmd, args) => {
+    const child = new FakeChild();
+    calls.push({ cmd, args });
+    children.push(child);
+    setImmediate(() => {
+      child.emit('spawn');
+      behavior?.(child);
+    });
+    return child as unknown as ChildProcess;
+  };
+  return { spawn: spawnFn, calls, last: () => children[children.length - 1]! };
+}
 
 describe('WAV 头', () => {
   it('取出采样率、声道、位深与数据区', () => {
@@ -99,73 +114,72 @@ describe('WAV 头', () => {
   });
 });
 
-describe('声道转换', () => {
-  it('单声道复制成两路，立体声平均成一路', () => {
-    const mono = Buffer.alloc(4);
-    mono.writeInt16LE(1000, 0);
-    mono.writeInt16LE(-1000, 2);
-    const stereo = convertChannels(mono, 1, 2);
-    expect(stereo.readInt16LE(0)).toBe(1000);
-    expect(stereo.readInt16LE(2)).toBe(1000);
-    expect(stereo.readInt16LE(4)).toBe(-1000);
-    expect(stereo.readInt16LE(6)).toBe(-1000);
-    const back = convertChannels(stereo, 2, 1);
-    expect(back.readInt16LE(0)).toBe(1000);
-    expect(back.readInt16LE(2)).toBe(-1000);
-  });
-});
-
-describe('背景播放', () => {
-  it('第一块写进输出流就返回，播完补齐尾巴', async () => {
-    const sink = new FakeSink();
-    const player = new BackgroundSongPlayer(sink, log);
+describe('ffplay 播放器', () => {
+  it('用外部 ffplay 打开 WAV，停止时杀掉进程', async () => {
+    const fake = fakeSpawn();
+    const player = new FfplayPlayer(log, { spawn: fake.spawn });
     const done = await player.playFile(file(wav({ seconds: 0.2 })));
     expect(done.durationSec).toBeCloseTo(0.2, 2);
-    expect(sink.writes).toHaveLength(1);
-    expect(sink.writes[0]).toMatchObject({ channels: 1, sampleRate: 44100 });
-    await wait(20);
-    expect(sink.flushes).toBe(1);
-    player.close();
-    expect(sink.closed).toBe(1);
-  });
-
-  it('播立体声时把声道数交给 sink', async () => {
-    const sink = new FakeSink();
-    const player = new BackgroundSongPlayer(sink, log);
-    await player.playFile(file(wav({ seconds: 0.1, channels: 2 })));
-    expect(sink.writes[0]?.channels).toBe(2);
-    player.close();
-  });
-
-  it('再点一首先停上一首：旧循环不再写', async () => {
-    const sink = new FakeSink();
-    const player = new BackgroundSongPlayer(sink, log);
-    await player.playFile(file(wav({ seconds: 5 })));
-    const before = sink.writes.length;
-    expect(before).toBeGreaterThan(0);
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]?.cmd).toBe('ffplay');
+    expect(fake.calls[0]?.args).toEqual(expect.arrayContaining(['-nodisp', '-autoexit']));
+    expect(fake.calls[0]?.args.at(-1)).toMatch(/song\.wav$/);
+    const child = fake.last();
     player.stop();
-    expect(sink.cuts).toBeGreaterThan(0);
-    await wait(40);
-    expect(sink.writes).toHaveLength(before);
+    expect(child.killed).toBe(1);
+    player.close();
+    // 已经停过就不再重复 kill。
+    expect(child.killed).toBe(1);
+  });
+
+  it('再点一首先杀上一首的进程', async () => {
+    const fake = fakeSpawn();
+    const player = new FfplayPlayer(log, { spawn: fake.spawn });
+    await player.playFile(file(wav({ seconds: 0.2 })));
+    const first = fake.last();
+    await player.playFile(file(wav({ seconds: 0.2, channels: 2 })));
+    expect(first.killed).toBe(1);
+    expect(fake.calls).toHaveLength(2);
     player.close();
   });
 
-  it('非 WAV / 非 PCM16 明确报错', async () => {
-    const player = new BackgroundSongPlayer(new FakeSink(), log);
+  it('启动即非零退出时把 stderr 带回来', async () => {
+    const fake = fakeSpawn((child) => {
+      child.emit('spawn');
+      child.stderr.emit('data', Buffer.from('Could not initialize SDL - No available audio device'));
+      child.exitCode = 1;
+      child.emit('exit', 1, null);
+    });
+    const player = new FfplayPlayer(log, { spawn: fake.spawn, startGraceMs: 20 });
+    await expect(player.playFile(file(wav({ seconds: 0.1 })))).rejects.toThrow(/立即退出.*audio device/s);
+  });
+
+  it('ffplay 不可用时明确说清，不悄悄静音', async () => {
+    const player = new FfplayPlayer(log, { ffplay: join(tmpdir(), 'no-such-ffplay.exe') });
+    await expect(player.playFile(file(wav({ seconds: 0.1 })))).rejects.toThrow(/ffplay 不可用/);
+  });
+
+  it('非 WAV / 非 PCM16 明确报错，不调起播放器', async () => {
+    const fake = fakeSpawn();
+    const player = new FfplayPlayer(log, { spawn: fake.spawn });
     await expect(player.playFile(file(Buffer.from('ID3 fake mp3')))).rejects.toThrow('WAV');
     await expect(player.playFile(file(wav({ format: 3 })))).rejects.toThrow('PCM');
+    expect(fake.calls).toHaveLength(0);
     player.close();
   });
 
   it('ffmpeg 不可用时明确说清，不悄悄静音', async () => {
-    const sink = new FakeSink();
-    const player = new BackgroundSongPlayer(sink, log, { ffmpeg: join(tmpdir(), 'no-such-ffmpeg.exe') });
+    const fake = fakeSpawn();
+    const player = new FfplayPlayer(log, {
+      spawn: fake.spawn,
+      ffmpeg: join(tmpdir(), 'no-such-ffmpeg.exe'),
+    });
     await expect(player.playFile(file(Buffer.from('ID3 fake mp3'), '.mp3'))).rejects.toThrow('ffmpeg 不可用');
-    expect(sink.writes).toHaveLength(0);
+    expect(fake.calls).toHaveLength(0);
     player.close();
   });
 
-  it.skipIf(!hasFfmpeg())('mp3 先用 ffmpeg 转临时 WAV 再播', async () => {
+  it.skipIf(!hasFfmpeg())('mp3 先用 ffmpeg 转临时 WAV 再交给 ffplay', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'rvc-player-mp3-'));
     dirs.push(dir);
     const source = join(dir, 'source.wav');
@@ -173,12 +187,11 @@ describe('背景播放', () => {
     const mp3 = join(dir, 'song.mp3');
     execFileSync('ffmpeg', ['-nostdin', '-y', '-i', source, '-c:a', 'libmp3lame', '-b:a', '128k', mp3], { stdio: 'ignore' });
 
-    const sink = new FakeSink();
-    const player = new BackgroundSongPlayer(sink, log);
+    const fake = fakeSpawn();
+    const player = new FfplayPlayer(log, { spawn: fake.spawn });
     const done = await player.playFile(mp3);
     expect(done.durationSec).toBeGreaterThan(0.2);
-    expect(sink.writes.length).toBeGreaterThan(0);
-    expect(sink.writes[0]?.channels).toBe(2);
+    expect(fake.calls[0]?.args.at(-1)).toMatch(/rvc-play-.*song\.wav$/);
     player.close();
   });
 });

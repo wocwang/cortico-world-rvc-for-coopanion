@@ -34,7 +34,7 @@ import {
   backfillDurations, defaultLibraryDir, deleteLibraryEntry, libraryStats, readLibrary, resolveLibraryFile,
   safeSongName, saveToLibrary, writeLibrary, type LibraryKind,
 } from './library.ts';
-import { AudifySink, BackgroundSongPlayer, type SongPlayer } from './player.ts';
+import { FfplayPlayer, type SongPlayer } from './player.ts';
 import { pickSong } from './sing.ts';
 import { defaultBiliClient, isBvid, pickCandidates, type BiliClient, type BiliPick, type SearchHit } from './bili.ts';
 import { RVC_TOOL_DECLS } from './tools.ts';
@@ -52,7 +52,7 @@ export interface RvcWorldOptions {
   runtimesRoot: () => string;
   /** 翻唱库根目录；默认 `<dataDir>/../../../../extensions/rvc-library`，测试可覆盖。 */
   libraryDir?: string;
-  /** 建本机播放器；单测里注入假播放器用，不传就用随包 audify 的真播放器。 */
+  /** 建本机播放器；单测里注入假播放器用，不传就 spawn 外部 ffplay 的真播放器。 */
   createSongPlayer?: (log: Logger) => SongPlayer;
   /** B 站搜索 / 下载；单测里注入替身，不联网。 */
   bili?: BiliClient;
@@ -279,7 +279,7 @@ export class RvcWorld implements World {
     this.log = host.log;
     this.songPlayer = this.opts.createSongPlayer
       ? this.opts.createSongPlayer(host.log)
-      : new BackgroundSongPlayer(new AudifySink(host.log), host.log);
+      : new FfplayPlayer(host.log);
     this.stopped = false;
     // 「随软件自动启动」关掉时，把引擎按「用户手动停过」处理，等面板点启动。
     this.engineHeld = this.opts.cfg.autoStart === false;
@@ -1555,6 +1555,8 @@ export class RvcWorld implements World {
   private async rvcSing(args: Record<string, unknown>): Promise<ToolOutcome> {
     const song = typeof args.song === 'string' ? args.song.trim() : '';
     const kind: LibraryKind = args.kind === 'cover' ? 'cover' : 'clean';
+    // source=bilibili 表示用户已经否掉了库里的相近版本，明确要去找原版。
+    const source = args.source === 'bilibili' ? 'bilibili' : 'library';
     const player = this.songPlayer;
     // 再点歌先停上一首与上一次自动翻唱；旧任务的结果不再抢播放条。
     this.singGeneration += 1;
@@ -1563,48 +1565,53 @@ export class RvcWorld implements World {
     if (this.autoSingBusy) await this.interruptAutoSing();
     if (!player) return { text: 'Nothing played: the local player is not ready.', failed: true };
 
-    const pick = pickSong(this.libraryDir, { song, kind });
-    if (!('issue' in pick)) {
-      const full = join(this.libraryDir, pick.entry.file);
-      if (!existsSync(full)) {
-        return { text: `Found "${pick.entry.title}" in the library, but its file is missing. Save it again from the RVC panel.`, failed: true };
+    if (source === 'library') {
+      const pick = pickSong(this.libraryDir, { song, kind });
+      if ('entry' in pick) {
+        const full = join(this.libraryDir, pick.entry.file);
+        if (!existsSync(full)) {
+          return { text: `Found "${pick.entry.title}" in the library, but its file is missing. Save it again from the RVC panel.`, failed: true };
+        }
+        try {
+          const { durationSec } = await player.playFile(full);
+          this.log?.info('桌宠点歌', { title: pick.entry.title, kind, file: pick.entry.file, seconds: durationSec });
+          const label = kind === 'clean' ? 'clean vocal, no backing track' : 'cover, with backing track';
+          return { text: `Playing "${pick.entry.title}" (${label}), ${clock(durationSec)}.` };
+        } catch (err) {
+          return {
+            text: `Found "${pick.entry.title}", but could not play it on this computer: ${err instanceof Error ? err.message : String(err)}.`,
+            failed: true,
+          };
+        }
       }
-      try {
-        const { durationSec } = await player.playFile(full);
-        this.log?.info('桌宠点歌', { title: pick.entry.title, kind, file: pick.entry.file, seconds: durationSec });
-        const label = kind === 'clean' ? 'clean vocal, no backing track' : 'cover, with backing track';
-        return { text: `Playing "${pick.entry.title}" (${label}), ${clock(durationSec)}.` };
-      } catch (err) {
-        return {
-          text: `Found "${pick.entry.title}", but could not play it on this computer: ${err instanceof Error ? err.message : String(err)}.`,
-          failed: true,
-        };
-      }
+      // 只是包含关系 / 版本后缀不同：先问清楚，别直接播成另一个版本。
+      if ('ambiguous' in pick) return { text: pick.ambiguous.message };
+      // 没给歌名就只能说明；给了歌名继续走 B 站兜底。
+      if (!song) return { text: pick.issue.message };
+    } else if (!song) {
+      return { text: 'To look for the original on Bilibili, pass the song name in "song".' };
     }
-
-    // 库里没有：没给歌名就只能说明；给了歌名就走「B 站搜索 → 下载 → 翻唱 → 入库 → 播放」。
-    if (!song) return { text: pick.issue.message };
     if (this.job?.phase === 'working') {
       return { text: 'The RVC panel is busy with another conversion. Wait for it to finish, or stop it, then ask again.' };
     }
     if (!this.biliReady()) {
-      return { text: `"${song}" is not in the library, and the vocal-separation model is not installed, so I cannot make it automatically. Ask the person to open the RVC panel and click "install" on the Service page.`, failed: true };
+      return { text: `I cannot make "${song}" automatically: the vocal-separation model is not installed. Ask the person to open the RVC panel and click "install" on the Service page.`, failed: true };
     }
     const query = song.replace(/[《》「」『』]/g, '').trim();
     let hits: SearchHit[];
     try {
       hits = await this.bili.search(query, 20);
     } catch (err) {
-      return { text: `"${query}" is not in the library, and the Bilibili search failed: ${err instanceof Error ? err.message : String(err)}. Try again later.`, failed: true };
+      return { text: `Bilibili search for "${query}" failed: ${err instanceof Error ? err.message : String(err)}. Try again later.`, failed: true };
     }
     if (generation !== this.singGeneration) return { text: 'Cancelled: another song was requested.' };
     const decision = pickCandidates(hits, query, 6);
     if (!decision.candidates.length) {
-      return { text: `"${query}" is not saved, and Bilibili returned no results. Try another song name later.` };
+      return { text: `Bilibili returned no results for "${query}". Try another song name later.` };
     }
     if (!decision.confident) {
       return {
-        text: `"${query}" is not saved, and I could not pick a reliable Bilibili version (${decision.reason}). Ask the person which one to use:\n${candidateLines(decision.candidates)}`,
+        text: `I could not pick a reliable Bilibili version for "${query}" (${decision.reason}). Ask the person which one to use:\n${candidateLines(decision.candidates)}`,
       };
     }
     const engine = this.engine;
@@ -1612,14 +1619,14 @@ export class RvcWorld implements World {
     if (!engine.ready()) {
       await this.ensureReady();
       if (!engine.ready()) {
-        return { text: `"${query}" is not in the library, and the RVC engine is not ready yet (${engine.state().detail ?? 'starting'}). Try again in a moment.`, failed: true };
+        return { text: `The RVC engine is not ready yet (${engine.state().detail ?? 'starting'}), so I cannot make "${query}" right now. Try again in a moment.`, failed: true };
       }
     }
     // 先把音频下下来：下载失败要当场回原因，别让用户等几分钟后才发现没下成。
     const download = await this.downloadBiliCandidates(decision.candidates, query);
     if (!download.source) {
       return {
-        text: `"${query}" is not saved, and the Bilibili audio download failed: ${download.failures.slice(-1)[0] ?? 'no usable candidate'}. Try again later.`,
+        text: `The Bilibili audio download for "${query}" failed: ${download.failures.slice(-1)[0] ?? 'no usable candidate'}. Try again later.`,
         failed: true,
       };
     }

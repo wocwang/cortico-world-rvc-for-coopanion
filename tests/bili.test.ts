@@ -72,6 +72,34 @@ describe('B 站候选打分', () => {
     expect(short.reason).toBe('version');
   });
 
+  it('点名版本后缀时，没带后缀的候选不进首选', () => {
+    const pick = pickCandidates([
+      hit('BV0000000001', '春日影 官方MV', { play: 8_000_000, durationSec: 240 }),
+      hit('BV0000000002', '🐧春日影 | 司凤版🐧', { play: 1_000_000, durationSec: 494 }),
+      hit('BV0000000003', '《又三郎》司凤版'),
+    ], '春日影 司凤版');
+    expect(pick.confident).toBe(true);
+    expect(pick.reason).toBe('ok');
+    expect(pick.candidates.map((item) => item.bvid)).toEqual(['BV0000000002']);
+  });
+
+  it('标题党「这才是原版」不压过真正的目标', () => {
+    const pick = pickCandidates([
+      hit('BV0000000001', '这才是《雨爱司凤版》原版MV', { play: 3_900_000, durationSec: 124 }),
+      hit('BV0000000002', '「雨爱 (司凤版)」', { play: 9_800_000, durationSec: 140 }),
+    ], '雨爱 司凤版');
+    expect(pick.confident).toBe(true);
+    expect(pick.candidates[0]!.bvid).toBe('BV0000000002');
+  });
+
+  it('「不是司凤版」这类否定标题直接排除', () => {
+    const pick = pickCandidates([
+      hit('BV0000000001', '不是司凤版！雨爱 DJ 降调循环'),
+    ], '雨爱 司凤版');
+    expect(pick.confident).toBe(false);
+    expect(pick.reason).toBe('weak-match');
+  });
+
   it('同一录音的不同搬运可以确定，不同演绎（现场 / MV）分数接近时列候选', () => {
     const same = pickCandidates([
       hit('BV0000000001', '起风了 高音质'),

@@ -24,7 +24,7 @@ function library(songs: Array<{ title: string; kind: LibraryKind; ext?: string }
 }
 
 const codes = (result: ReturnType<typeof pickSong>): string =>
-  'issue' in result ? result.issue.code : result.entry.kind;
+  'issue' in result ? result.issue.code : 'ambiguous' in result ? 'ambiguous' : result.entry.kind;
 
 describe('rvc_sing 选歌', () => {
   it('按歌名找清唱版：书名号、扩展名都能去掉', () => {
@@ -79,6 +79,23 @@ describe('rvc_sing 选歌', () => {
     const named = pickSong(root, { song: '起风了' });
     expect(codes(named)).toBe('kind-missing');
     expect('issue' in named && named.issue.message).toContain('only as cover');
+  });
+
+  it('精确命中优先，不会被更长的相近版本抢走', () => {
+    const root = library([
+      { title: '雨爱', kind: 'clean' },
+      { title: '雨爱 司凤版', kind: 'clean' },
+    ]);
+    const picked = pickSong(root, { song: '雨爱' });
+    expect('entry' in picked && picked.entry.title).toBe('雨爱');
+  });
+
+  it('只是包含关系 / 版本后缀不同时先问，不直接播', () => {
+    const root = library([{ title: '雨爱 司凤版', kind: 'clean' }]);
+    const picked = pickSong(root, { song: '雨爱' });
+    expect(codes(picked)).toBe('ambiguous');
+    expect('ambiguous' in picked && picked.ambiguous.entries.map((entry) => entry.title)).toEqual(['雨爱 司凤版']);
+    expect('ambiguous' in picked && picked.ambiguous.message).toContain('source "bilibili"');
   });
 
   it('歌名对不上时回可选歌名', () => {

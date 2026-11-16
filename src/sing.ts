@@ -2,7 +2,12 @@
  * `rvc_sing` 的选歌规则：按歌名在翻唱库里找，没给歌名就随机挑一首。
  *
  * 类型默认清唱（`clean`）；只有用户明确说「翻唱 / 带伴奏」时调用方才传 `cover`。
- * 库为空、只有另一种类型、歌名对不上都返回文本原因，不抛错。
+ *
+ * 匹配分三档：
+ * - 规范化后完全相同 → 直接播；
+ * - 只是包含关系 / 版本后缀不同（「雨爱」vs「雨爱 司凤版」）→ 不替用户做主，
+ *   返回可选项让桌宠先问；
+ * - 完全对不上 → 再由 World 决定去 B 站找原版。
  */
 import { readLibrary, songKey, type LibraryEntry, type LibraryKind } from './library.ts';
 
@@ -10,6 +15,8 @@ export interface SingQuery {
   /** 歌名，可带《》、扩展名；省略表示随机。 */
   song?: string;
   kind?: LibraryKind;
+  /** `bilibili` 表示跳过库里的相近版本，直接按原版去 B 站找。 */
+  source?: 'library' | 'bilibili';
 }
 
 export interface SingIssue {
@@ -18,7 +25,14 @@ export interface SingIssue {
   message: string;
 }
 
-export type SingPick = { entry: LibraryEntry } | { issue: SingIssue };
+export interface SingAmbiguous {
+  /** 只是包含关系 / 版本后缀不同的候选，最多 6 条。 */
+  entries: LibraryEntry[];
+  /** 先让用户确认，不要直接播。 */
+  message: string;
+}
+
+export type SingPick = { entry: LibraryEntry } | { ambiguous: SingAmbiguous } | { issue: SingIssue };
 
 const kindLabel = (kind: LibraryKind): string =>
   kind === 'clean' ? 'clean vocal (no backing track)' : 'cover (with backing track)';
@@ -26,9 +40,13 @@ const kindLabel = (kind: LibraryKind): string =>
 const titles = (entries: LibraryEntry[], limit = 8): string =>
   [...new Set(entries.map((entry) => entry.title))].slice(0, limit).join(' / ');
 
-/** 精确优先，其次包含；同档取最新的。 */
-function rank(entry: LibraryEntry, key: string): number {
-  return entry.song === key ? 0 : entry.song.includes(key) || key.includes(entry.song) ? 1 : 9;
+/** 只看包含关系/版本后缀；完全相同不算。距离越近越靠前，同距离取最新的。 */
+function closeMatches(entries: LibraryEntry[], key: string): LibraryEntry[] {
+  return entries
+    .filter((entry) => entry.song !== key && (entry.song.includes(key) || key.includes(entry.song)))
+    .sort((a, b) =>
+      Math.abs(a.song.length - key.length) - Math.abs(b.song.length - key.length)
+      || Date.parse(b.createdAt) - Date.parse(a.createdAt));
 }
 
 export function pickSong(root: string, query: SingQuery, random: () => number = Math.random): SingPick {
@@ -57,18 +75,44 @@ export function pickSong(root: string, query: SingQuery, random: () => number = 
     const at = Math.min(same.length - 1, Math.max(0, Math.floor(random() * same.length)));
     return { entry: same[at]! };
   }
-  const hits = same
-    .filter((entry) => rank(entry, key) < 9)
-    .sort((a, b) => rank(a, key) - rank(b, key) || Date.parse(b.createdAt) - Date.parse(a.createdAt));
-  if (hits.length) return { entry: hits[0]! };
+
+  // 精确命中：规范化后的歌名完全相同，直接播，不再问。
+  const exact = same
+    .filter((entry) => entry.song === key)
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  if (exact.length) return { entry: exact[0]! };
+
+  // 只是包含关系 / 版本后缀不同：先问用户是不是这一版。
+  const close = closeMatches(same, key);
+  if (close.length) {
+    const list = close.slice(0, 6);
+    const names = list.map((entry) => `"${entry.title}"`).join(', ');
+    return {
+      ambiguous: {
+        entries: list,
+        message: `"${query.song}" is not an exact title in the library. Close matches: ${names}. Ask the person whether they meant one of these versions. To play one, call rvc_sing again with that exact title as song. If they want the original instead, call rvc_sing again with song "${query.song}" and source "bilibili".`,
+      },
+    };
+  }
+
   // 歌名对得上但类型不对：告诉模型它只存了另一种，别偷偷放带伴奏的版本。
-  const otherHits = all.filter((entry) => rank(entry, key) === 0);
-  if (otherHits.length) {
-    const other = [...new Set(otherHits.map((entry) => entry.kind))].map(kindLabel).join(', ');
+  const otherExact = all.filter((entry) => entry.song === key);
+  if (otherExact.length) {
+    const other = [...new Set(otherExact.map((entry) => entry.kind))].map(kindLabel).join(', ');
     return {
       issue: {
         code: 'kind-missing',
         message: `"${query.song}" is saved only as ${other}. Tell the person; only use it if they explicitly ask for that version.`,
+      },
+    };
+  }
+  const otherClose = closeMatches(all.filter((entry) => entry.kind !== kind), key);
+  if (otherClose.length) {
+    const other = [...new Set(otherClose.map((entry) => entry.kind))].map(kindLabel).join(', ');
+    return {
+      issue: {
+        code: 'kind-missing',
+        message: `"${query.song}" is only close to ${titles(otherClose)}, saved as ${other}. Tell the person; do not silently switch the type.`,
       },
     };
   }

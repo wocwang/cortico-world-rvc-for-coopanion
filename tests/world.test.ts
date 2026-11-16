@@ -601,10 +601,11 @@ describe('rvc_sing 桌宠点歌', () => {
     const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
     expect(tool.tags).toEqual(['speak']);
     const schema = tool.parameters as {
-      properties: { kind: { enum: string[] }; song: { type: string } };
+      properties: { kind: { enum: string[] }; song: { type: string }; source: { enum: string[] } };
       required: string[];
     };
     expect(schema.properties.kind.enum).toEqual(['clean', 'cover']);
+    expect(schema.properties.source.enum).toEqual(['library', 'bilibili']);
     expect(schema.required).toEqual([]);
   });
 
@@ -651,7 +652,7 @@ describe('rvc_sing 桌宠点歌', () => {
     const clean = await call(world, { song: '稻香' });
     // 不再把翻唱版当清唱偷放；测试环境没有 B 站客户端，明确回失败。
     expect(clean.failed).toBe(true);
-    expect(clean.text).toContain('not in the library');
+    expect(clean.text).toContain('vocal-separation model is not installed');
     expect(player.files).toHaveLength(0);
 
     const cover = await call(world, { song: '稻香', kind: 'cover' });
@@ -677,6 +678,40 @@ describe('rvc_sing 桌宠点歌', () => {
     const out = await call(world, { song: '七里香', kind: 'cover' });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('ffmpeg 不可用');
+  });
+
+  it('只有相近版本时先问，不直接播；确认完整标题后才播', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({}, () => player);
+    seedLibrary(dataDir, [{ title: '雨爱 司凤版', kind: 'clean' }]);
+
+    const ask = await call(world, { song: '雨爱' });
+    expect(ask.failed).toBeUndefined();
+    expect(ask.text).toContain('not an exact title');
+    expect(ask.text).toContain('雨爱 司凤版');
+    expect(ask.text).toContain('source "bilibili"');
+    expect(player.files).toHaveLength(0);
+
+    const yes = await call(world, { song: '雨爱 司凤版' });
+    expect(yes.failed).toBeUndefined();
+    expect(yes.text).toContain('Playing');
+    expect(player.files[0]).toContain('清唱cover');
+  });
+
+  it('用户拒绝相近版本后，source=bilibili 跳过库里那一版', async () => {
+    const player = fakePlayer();
+    const queries: string[] = [];
+    const { world, dataDir } = await makeWorld({}, () => player, {
+      search: async (keyword) => { queries.push(keyword); return []; },
+      fetch: async () => { throw new Error('不该下载'); },
+    });
+    installUvr(dataDir);
+    seedLibrary(dataDir, [{ title: '雨爱 司凤版', kind: 'clean' }]);
+
+    const out = await call(world, { song: '雨爱', source: 'bilibili' });
+    expect(queries).toEqual(['雨爱']);
+    expect(out.text).toContain('no results');
+    expect(player.files).toHaveLength(0);
   });
 });
 

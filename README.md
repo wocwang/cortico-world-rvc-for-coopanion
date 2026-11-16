@@ -126,17 +126,18 @@ gpt-sovits 0.5.13 起可在「与其他插件联动」页打开「出口变声�
 
 ## ffmpeg
 
-**插件不自带、也不代装 ffmpeg**：mp3 的播放与部分解码要靠它，走系统 `PATH`（另外也会在派生
-venv 的 `Scripts` 与共享运行时的 `runtime` 目录里找）。
+**插件不自带、也不代装 ffmpeg**：播放（通过同目录的 `ffplay`）与 mp3 解码要靠它，走系统 `PATH`
+（另外也会在派生 venv 的 `Scripts` 与共享运行时的 `runtime` 目录里找）。
 
 - 安装（任选其一）：
   - `winget install --id Gyan.FFmpeg -e`（装完重启 Coopanion，让新的 `PATH` 生效）；
   - 从 <https://www.gyan.dev/ffmpeg/builds/> 或 <https://github.com/BtbN/FFmpeg-Builds/releases>
     下压缩包，解压后把 `bin` 目录加进系统 `PATH`。
-- 验证：新开一个终端执行 `ffmpeg -version`，能打印版本即可。
+- 验证：新开一个终端执行 `ffmpeg -version` 与 `ffplay -version`，都能打印版本即可（Gyan 的
+  full build、winget 安装都同时带这两个可执行文件）。
 - 缺了会怎样：
-  - 翻唱库 / 桌宠点歌播 **mp3** 成品会提示「ffmpeg 不可用」（面板提示里指向本节），
-    不会静默无声；**WAV 成品不受影响**。
+  - 翻唱库 / 桌宠点歌会提示「ffplay 不可用」（面板提示里指向本节），不会静默无声；
+    WAV 与 mp3 都走同一条播放链路。
   - worker 解码 mp3 音源时会先退回 torchaudio；两条路都不通时按「解码失败」报错。
 - 不影响：安装运行时、下载权重、RVC 推理本身（这些都不依赖 ffmpeg）。
 

@@ -49,6 +49,12 @@ const BAD_TITLE =
 const GOOD_TITLE = /官方|mv|原唱|原版|纯享|收藏级|高音质|无损|完整版|歌词|无损音质|hi-?res/i;
 /** 能用但「不是原版」的标记：同名多版本时别硬挑。 */
 const VERSION_TITLE = /翻唱|cover|女声|男声|男版|女版|现场|live|演唱会|remix|dj|加速|减速|慢速|升调|降调|改编|翻自/i;
+/** 用户明确点了版本后缀（如「司凤版」）时，标题必须带这个后缀。 */
+const VERSION_TOKEN = /版$|翻唱|cover|live|现场|演唱会|remix|dj|女声|男声|男版|女版|加速|减速|慢速|升调|降调|改编|翻自/i;
+/** 标题党：自称「这才是原版」的搬运，不能靠 GOOD_TITLE 加分压过真目标。 */
+const CLICKBAIT_TITLE = /这才是|不是原版|伪原版|盗版|搬运|补档|全网首发|震惊/;
+/** 不同演绎方式；两条都命中关键词时，演绎不同才需要问用户。 */
+const RENDITION_TITLE = /翻唱|cover|现场|live|演唱会|remix|dj|加速|减速|慢速|升调|降调|改编|翻自|男版|女版|童声|合唱/i;
 
 export type BiliReason = 'ok' | 'no-result' | 'weak-match' | 'version' | 'ambiguous';
 
@@ -183,19 +189,27 @@ function tokensOf(keyword: string): string[] {
     .filter((t) => t.length > 0);
 }
 
+const isVersionToken = (token: string): boolean => VERSION_TOKEN.test(token);
+const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 /**
  * 相关性打分。为什么需要：只看第一条经常挑到教程、合集、伴奏、甚至不是那首歌的翻弹。
- * 规则：关键词逐个命中加分、缺一个重罚；坏词重罚、好词小加；播放量小幅加权（封顶 4，
- * 防止大 UP 的无关视频靠粉数压过准确度）；90~330 秒是常见流行歌长度，小幅加分。
+ *
+ * 搜索结果本身是 B 站搜索接口的原始顺序（综合排序），这里再重排；原始名次只当
+ * 很轻的同分决胜。用户明确说了版本后缀（「司凤版」）时，这个后缀是硬权重：
+ * 命中 +10、缺失 -14，标题里「不是司凤版」这类否定直接重罚；完整关键词短语
+ * 再 +12。播放量仍封顶 4，避免大 UP 的无关视频靠粉数压过准确度。
  */
 export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''): SearchHit[] {
   const tokens = tokensOf(keyword);
+  const versionTokens = tokens.filter(isVersionToken);
+  const fullPhrase = norm(keyword);
   const extraBad = excludeWords
     .split(/[,，、]+/)
     .map((w) => w.trim().toLowerCase())
     .filter((w) => w.length > 0);
   return hits
-    .map((hit) => {
+    .map((hit, index) => {
       const low = hit.title.toLowerCase();
       const plain = norm(hit.title);
       let score = 0;
@@ -203,58 +217,77 @@ export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''):
       for (const t of tokens) {
         if (plain.includes(t)) hitCount += 1;
       }
-      score += hitCount * 6 - (tokens.length - hitCount) * 7;
-      if (BAD_TITLE.test(low)) score -= 14;
-      const version = VERSION_TITLE.test(low);
-      if (version && !GOOD_TITLE.test(low)) score -= 6;
-      if (GOOD_TITLE.test(low)) score += 3;
+      score += hitCount * 8 - (tokens.length - hitCount) * 10;
+      if (fullPhrase && plain.includes(fullPhrase)) score += 12;
+      if (versionTokens.length) {
+        const have = versionTokens.filter((t) => plain.includes(t)).length;
+        score += have * 10 - (versionTokens.length - have) * 14;
+        for (const t of versionTokens) {
+          if (new RegExp(`(?:不是|并非|非|没有|无)${escapeRe(t)}`).test(plain)) score -= 30;
+        }
+      }
+      if (BAD_TITLE.test(low)) score -= 20;
+      if (CLICKBAIT_TITLE.test(low)) score -= 8;
+      // 非版本查询才把「现场 / 翻唱」当减分项；用户点名要某个版本时不该反过来扣它。
+      if (!versionTokens.length && RENDITION_TITLE.test(low) && !GOOD_TITLE.test(low)) score -= 6;
+      if (GOOD_TITLE.test(low)) score += 2;
       for (const w of extraBad) if (low.includes(w)) score -= 10;
       score += Math.min(4, (hit.play || 0) / 500_000);
-      if (hit.durationSec >= 90 && hit.durationSec <= 330) score += 2;
+      // 原始名次只做很轻的决胜，避免完全无视 B 站的相关度。
+      score += Math.max(0, 1 - index * 0.05);
+      if (hit.durationSec >= 90 && hit.durationSec <= 600) score += 2;
       return { ...hit, score: Math.round(score * 10) / 10 };
     })
     .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 }
 
 /**
- * 选歌：先看有没有「标题含全部关键词」的命中，再看分数、坏词、版本标记与名次差距。
- * 不确定时 `confident=false`，把候选交给用户；不在这里硬挑。
+ * 选歌：先看有没有「标题含全部关键词」的命中；用户点名版本后缀时，只把带该后缀的
+ * 候选放进首选。不确定时 `confident=false`，把候选交给用户；不在这里硬挑。
  */
 export function pickCandidates(hits: SearchHit[], keyword: string, limit = 6): BiliPick {
   const ranked = rankHits(hits, keyword);
   const tokens = tokensOf(keyword);
-  const keep = (hit: SearchHit): boolean =>
-    tokens.length > 0 && tokens.every((t) => norm(hit.title).includes(t));
-  const matched = ranked.filter(keep);
+  const versionTokens = tokens.filter(isVersionToken);
+  const fullPhrase = norm(keyword);
+  const hasAll = (hit: SearchHit, want: string[]): boolean =>
+    want.length > 0 && want.every((t) => norm(hit.title).includes(t));
+  const negatesVersion = (hit: SearchHit): boolean => versionTokens.some((t) =>
+    new RegExp(`(?:不是|并非|非|没有|无)${escapeRe(t)}`).test(norm(hit.title)));
+  const matched = ranked.filter((hit) => hasAll(hit, tokens) && !negatesVersion(hit));
   // 一条都没匹配到：把最接近的几条列出来，让用户自己判断。
   if (!matched.length) {
     return { confident: false, reason: ranked.length ? 'weak-match' : 'no-result', candidates: ranked.slice(0, limit) };
   }
-  const top = matched[0]!;
-  const second = matched[1];
+  // 版本后缀是硬条件：有带后缀的候选时，明显不符的候选不进首选。
+  const strict = versionTokens.length ? matched.filter((hit) => hasAll(hit, versionTokens)) : matched;
+  const pool = strict.length ? strict : matched;
+  const top = pool[0]!;
+  const second = pool[1];
   const low = top.title.toLowerCase();
-  const good = GOOD_TITLE.test(low);
-  const version = VERSION_TITLE.test(low);
   const duration = top.durationSec;
-  const short = duration > 0 && (duration < 60 || duration > 420);
-  // 坏词、明显不是一首歌的时长、没人认可的非官方版本：都交给用户。
-  if (BAD_TITLE.test(low) || short || (version && !good)) {
-    return { confident: false, reason: 'version', candidates: matched.slice(0, limit) };
+  const short = duration > 0 && duration < 60;
+  const missingVersion = versionTokens.length > 0 && !hasAll(top, versionTokens);
+  const topFull = fullPhrase !== '' && norm(top.title).includes(fullPhrase);
+  const renditionOnly = !versionTokens.length && RENDITION_TITLE.test(low) && !GOOD_TITLE.test(low);
+  // 坏词、标题党、明显不是一首歌的时长、点名版本却没带上、只有翻唱/现场标记：都交给用户。
+  if (BAD_TITLE.test(low) || CLICKBAIT_TITLE.test(low) || short || missingVersion || renditionOnly) {
+    return { confident: false, reason: 'version', candidates: pool.slice(0, limit) };
   }
-  if ((top.score ?? 0) < 6) {
-    return { confident: false, reason: 'weak-match', candidates: matched.slice(0, limit) };
+  if ((top.score ?? 0) < 8 && !topFull) {
+    return { confident: false, reason: 'weak-match', candidates: pool.slice(0, limit) };
   }
   // 同名的多个上传分数接近：如果都是「原版 / 无损 / Hi-res」这种同一录音的不同搬运，
-  // 可以确定；只要出现现场 / 翻唱 / remix 等不同演绎，就先问用户。
+  // 可以确定；只有现场 / 翻唱 / remix 等不同演绎才需要问用户。
   if (second && !BAD_TITLE.test(second.title.toLowerCase())) {
     const gap = (top.score ?? 0) - (second.score ?? 0);
-    const secondGood = GOOD_TITLE.test(second.title.toLowerCase());
-    const secondVersion = VERSION_TITLE.test(second.title.toLowerCase());
-    if (gap < 3 && !(good && !secondGood) && (version || secondVersion)) {
-      return { confident: false, reason: 'ambiguous', candidates: matched.slice(0, limit) };
+    const topRendition = RENDITION_TITLE.test(top.title);
+    const secondRendition = RENDITION_TITLE.test(second.title);
+    if (gap < 3 && topRendition !== secondRendition) {
+      return { confident: false, reason: 'ambiguous', candidates: pool.slice(0, limit) };
     }
   }
-  return { confident: true, reason: 'ok', candidates: matched.slice(0, limit) };
+  return { confident: true, reason: 'ok', candidates: pool.slice(0, limit) };
 }
 
 /** 视频信息 + 音频流地址（dash 里码率最高那轨：分离与变声都吃音质，多几 MB 值得）。 */

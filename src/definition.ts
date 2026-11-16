@@ -11,8 +11,8 @@ import { RVC_TOOL_DECLS } from './tools.ts';
 const DESCRIBE: WorldDescribe = {
   tools: describeTools(RVC_TOOL_DECLS, {
     rvc_sing: {
-      zh: '从翻唱库按歌名或随机点一首，本机外放；默认清唱，明确要翻唱 / 带伴奏才用翻唱版。',
-      en: 'Plays a saved song from the local cover library through the speakers — by name or random; clean vocals by default, cover only when explicitly asked.',
+      zh: '从翻唱库按歌名或随机点一首，本机外放；精确命中直接播，只有相近版本时先问；默认清唱，明确要翻唱 / 带伴奏才用翻唱版。',
+      en: 'Plays a saved song from the local cover library through the speakers — by name or random; exact titles play directly, close versions are confirmed first; clean vocals by default, cover only when explicitly asked.',
     },
   }),
   events: [],
