@@ -32,7 +32,15 @@ const DESCRIBE: WorldDescribe = {
       en: 'Stop current playback and cancel a cover still being prepared.',
     },
   }),
-  events: [],
+  events: [{
+    type: 'rvc.playback',
+    description: {
+      zh: '播放状态变化：后台翻唱做好开始播放、自然播完、被停止或启动失败。',
+      en: 'Playback status changes: a background cover starts playing, a song finishes, playback is stopped, or it fails to start.',
+    },
+    trigger: 'debounce',
+    tags: ['snapshot'],
+  }],
 };
 
 /**
