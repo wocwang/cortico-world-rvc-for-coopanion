@@ -30,6 +30,7 @@
  * （内容一般是 audio/mp4）。不需要登录。
  */
 import { writeFile } from 'node:fs/promises';
+import { isRendition, norm, renditionKinds, splitQuery } from './match.ts';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
@@ -47,14 +48,8 @@ export interface SearchHit {
 const BAD_TITLE =
   /教程|教学|谱|翻弹|指弹|钢琴|吉他|架子鼓|纯音乐|伴奏|消音|卡拉ok|ktv|合集|串烧|一小时|10小时|循环|直播|录播|reaction|解说|舞蹈|手书|试听|片段|切片|音频预览/;
 const GOOD_TITLE = /官方|mv|原唱|原版|纯享|收藏级|高音质|无损|完整版|歌词|无损音质|hi-?res/i;
-/** 能用但「不是原版」的标记：同名多版本时别硬挑。 */
-const VERSION_TITLE = /翻唱|cover|女声|男声|男版|女版|现场|live|演唱会|remix|dj|加速|减速|慢速|升调|降调|改编|翻自/i;
-/** 用户明确点了版本后缀（如「司凤版」）时，标题必须带这个后缀。 */
-const VERSION_TOKEN = /版$|翻唱|cover|live|现场|演唱会|remix|dj|女声|男声|男版|女版|加速|减速|慢速|升调|降调|改编|翻自/i;
 /** 标题党：自称「这才是原版」的搬运，不能靠 GOOD_TITLE 加分压过真目标。 */
 const CLICKBAIT_TITLE = /这才是|不是原版|伪原版|盗版|搬运|补档|全网首发|震惊/;
-/** 不同演绎方式；两条都命中关键词时，演绎不同才需要问用户。 */
-const RENDITION_TITLE = /翻唱|cover|现场|live|演唱会|remix|dj|加速|减速|慢速|升调|降调|改编|翻自|男版|女版|童声|合唱/i;
 
 export type BiliReason = 'ok' | 'no-result' | 'weak-match' | 'version' | 'ambiguous';
 
@@ -173,37 +168,24 @@ export async function searchBili(
     }));
 }
 
-/** 检索名规范化：去书名号、空格与常见标点，统一小写。 */
-function norm(text: string): string {
-  return String(text || '')
-    .toLowerCase()
-    .replace(/[《》「」『』【】()[\]（）\s,，、.!！?？:：;；'"“”‘’\-_/\\]+/g, '');
-}
-
-function tokensOf(keyword: string): string[] {
-  return String(keyword || '')
-    .toLowerCase()
-    .replace(/[《》「」『』【】()（）[\]]/g, ' ')
-    .split(/[\s,，、]+/)
-    .map((t) => norm(t))
-    .filter((t) => t.length > 0);
-}
-
-const isVersionToken = (token: string): boolean => VERSION_TOKEN.test(token);
 const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** 标题 + UP 主名：附加片段可以是歌名后的人名 / 团体名，所以作者也参与匹配。 */
+function corpusOf(hit: SearchHit): string {
+  return `${norm(hit.title)}\u0000${norm(hit.author)}`;
+}
 
 /**
  * 相关性打分。为什么需要：只看第一条经常挑到教程、合集、伴奏、甚至不是那首歌的翻弹。
  *
  * 搜索结果本身是 B 站搜索接口的原始顺序（综合排序），这里再重排；原始名次只当
- * 很轻的同分决胜。用户明确说了版本后缀（「司凤版」）时，这个后缀是硬权重：
- * 命中 +10、缺失 -14，标题里「不是司凤版」这类否定直接重罚；完整关键词短语
- * 再 +12。播放量仍封顶 4，避免大 UP 的无关视频靠粉数压过准确度。
+ * 很轻的同分决胜。查询里的附加片段（歌名之后的任何词，如「xxx版」「某某翻唱」
+ * 「歌手名」「团体名」）不依赖预置词表：命中 +10、缺失 -14，标题里「不是 xxx」
+ * 这类否定直接重罚；完整关键词短语再 +12。播放量仍封顶 4，避免大 UP 的无关
+ * 视频靠粉数压过准确度。
  */
 export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''): SearchHit[] {
-  const tokens = tokensOf(keyword);
-  const versionTokens = tokens.filter(isVersionToken);
-  const fullPhrase = norm(keyword);
+  const { tokens, qualifiers, full: fullPhrase, suffixIntent } = splitQuery(keyword);
   const extraBad = excludeWords
     .split(/[,，、]+/)
     .map((w) => w.trim().toLowerCase())
@@ -212,24 +194,26 @@ export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''):
     .map((hit, index) => {
       const low = hit.title.toLowerCase();
       const plain = norm(hit.title);
+      const author = norm(hit.author);
+      const corpus = corpusOf(hit);
       let score = 0;
       let hitCount = 0;
       for (const t of tokens) {
-        if (plain.includes(t)) hitCount += 1;
+        if (corpus.includes(t)) hitCount += 1;
       }
       score += hitCount * 8 - (tokens.length - hitCount) * 10;
-      if (fullPhrase && plain.includes(fullPhrase)) score += 12;
-      if (versionTokens.length) {
-        const have = versionTokens.filter((t) => plain.includes(t)).length;
-        score += have * 10 - (versionTokens.length - have) * 14;
-        for (const t of versionTokens) {
+      if (fullPhrase && (plain.includes(fullPhrase) || author.includes(fullPhrase))) score += 12;
+      if (qualifiers.length) {
+        const have = qualifiers.filter((t) => corpus.includes(t)).length;
+        score += have * 10 - (qualifiers.length - have) * 14;
+        for (const t of qualifiers) {
           if (new RegExp(`(?:不是|并非|非|没有|无)${escapeRe(t)}`).test(plain)) score -= 30;
         }
       }
       if (BAD_TITLE.test(low)) score -= 20;
       if (CLICKBAIT_TITLE.test(low)) score -= 8;
       // 非版本查询才把「现场 / 翻唱」当减分项；用户点名要某个版本时不该反过来扣它。
-      if (!versionTokens.length && RENDITION_TITLE.test(low) && !GOOD_TITLE.test(low)) score -= 6;
+      if (!suffixIntent && isRendition(low) && !GOOD_TITLE.test(low)) score -= 6;
       if (GOOD_TITLE.test(low)) score += 2;
       for (const w of extraBad) if (low.includes(w)) score -= 10;
       score += Math.min(4, (hit.play || 0) / 500_000);
@@ -242,36 +226,36 @@ export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''):
 }
 
 /**
- * 选歌：先看有没有「标题含全部关键词」的命中；用户点名版本后缀时，只把带该后缀的
+ * 选歌：先看有没有「标题/作者含全部关键词」的命中；查询带附加片段时，只把带该片段的
  * 候选放进首选。不确定时 `confident=false`，把候选交给用户；不在这里硬挑。
  */
 export function pickCandidates(hits: SearchHit[], keyword: string, limit = 6): BiliPick {
   const ranked = rankHits(hits, keyword);
-  const tokens = tokensOf(keyword);
-  const versionTokens = tokens.filter(isVersionToken);
-  const fullPhrase = norm(keyword);
-  const hasAll = (hit: SearchHit, want: string[]): boolean =>
-    want.length > 0 && want.every((t) => norm(hit.title).includes(t));
-  const negatesVersion = (hit: SearchHit): boolean => versionTokens.some((t) =>
+  const { tokens, qualifiers, full: fullPhrase, suffixIntent } = splitQuery(keyword);
+  const hasAll = (hit: SearchHit, want: string[]): boolean => {
+    const corpus = corpusOf(hit);
+    return want.length > 0 && want.every((t) => corpus.includes(t));
+  };
+  const negatesQualifier = (hit: SearchHit): boolean => qualifiers.some((t) =>
     new RegExp(`(?:不是|并非|非|没有|无)${escapeRe(t)}`).test(norm(hit.title)));
-  const matched = ranked.filter((hit) => hasAll(hit, tokens) && !negatesVersion(hit));
+  const matched = ranked.filter((hit) => hasAll(hit, tokens) && !negatesQualifier(hit));
   // 一条都没匹配到：把最接近的几条列出来，让用户自己判断。
   if (!matched.length) {
     return { confident: false, reason: ranked.length ? 'weak-match' : 'no-result', candidates: ranked.slice(0, limit) };
   }
-  // 版本后缀是硬条件：有带后缀的候选时，明显不符的候选不进首选。
-  const strict = versionTokens.length ? matched.filter((hit) => hasAll(hit, versionTokens)) : matched;
+  // 附加片段是硬条件：有带片段的候选时，明显不符的候选不进首选。
+  const strict = qualifiers.length ? matched.filter((hit) => hasAll(hit, qualifiers)) : matched;
   const pool = strict.length ? strict : matched;
   const top = pool[0]!;
   const second = pool[1];
   const low = top.title.toLowerCase();
   const duration = top.durationSec;
   const short = duration > 0 && duration < 60;
-  const missingVersion = versionTokens.length > 0 && !hasAll(top, versionTokens);
-  const topFull = fullPhrase !== '' && norm(top.title).includes(fullPhrase);
-  const renditionOnly = !versionTokens.length && RENDITION_TITLE.test(low) && !GOOD_TITLE.test(low);
-  // 坏词、标题党、明显不是一首歌的时长、点名版本却没带上、只有翻唱/现场标记：都交给用户。
-  if (BAD_TITLE.test(low) || CLICKBAIT_TITLE.test(low) || short || missingVersion || renditionOnly) {
+  const missingQualifier = qualifiers.length > 0 && !hasAll(top, qualifiers);
+  const topFull = fullPhrase !== '' && corpusOf(top).includes(fullPhrase);
+  const renditionOnly = !suffixIntent && isRendition(low) && !GOOD_TITLE.test(low);
+  // 坏词、标题党、明显不是一首歌的时长、点名片段却没带上、只有翻唱/现场标记：都交给用户。
+  if (BAD_TITLE.test(low) || CLICKBAIT_TITLE.test(low) || short || missingQualifier || renditionOnly) {
     return { confident: false, reason: 'version', candidates: pool.slice(0, limit) };
   }
   if ((top.score ?? 0) < 8 && !topFull) {
@@ -281,9 +265,7 @@ export function pickCandidates(hits: SearchHit[], keyword: string, limit = 6): B
   // 可以确定；只有现场 / 翻唱 / remix 等不同演绎才需要问用户。
   if (second && !BAD_TITLE.test(second.title.toLowerCase())) {
     const gap = (top.score ?? 0) - (second.score ?? 0);
-    const topRendition = RENDITION_TITLE.test(top.title);
-    const secondRendition = RENDITION_TITLE.test(second.title);
-    if (gap < 3 && topRendition !== secondRendition) {
+    if (gap < 3 && renditionKinds(top.title) !== renditionKinds(second.title)) {
       return { confident: false, reason: 'ambiguous', candidates: pool.slice(0, limit) };
     }
   }

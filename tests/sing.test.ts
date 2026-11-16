@@ -98,6 +98,36 @@ describe('rvc_sing 选歌', () => {
     expect('ambiguous' in picked && picked.ambiguous.message).toContain('source "bilibili"');
   });
 
+  it('未收录的版本后缀 / 人名 / 团体名也先问，不依赖词表', () => {
+    const root = library([
+      { title: '雨爱 0.9x版', kind: 'clean' },
+      { title: '雨爱 吴青峰', kind: 'clean' },
+      { title: '雨爱 MyGO', kind: 'clean' },
+    ]);
+    const picked = pickSong(root, { song: '雨爱' });
+    expect(codes(picked)).toBe('ambiguous');
+    expect('ambiguous' in picked && picked.ambiguous.entries).toHaveLength(3);
+  });
+
+  it('库里只有短名时，用户带版本后缀也会先问', () => {
+    const root = library([{ title: '雨爱', kind: 'clean' }]);
+    const picked = pickSong(root, { song: '雨爱 0.9x版' });
+    expect(codes(picked)).toBe('ambiguous');
+    expect('ambiguous' in picked && picked.ambiguous.entries.map((entry) => entry.title)).toEqual(['雨爱']);
+  });
+
+  it('只是多一个字、不像版本/人名时不误问', () => {
+    const root = library([{ title: '雨天', kind: 'clean' }]);
+    const picked = pickSong(root, { song: '雨' });
+    expect(codes(picked)).toBe('not-found');
+  });
+
+  it('歌名后连写人名也先问', () => {
+    const root = library([{ title: '雨爱吴青峰', kind: 'clean' }]);
+    const picked = pickSong(root, { song: '雨爱' });
+    expect(codes(picked)).toBe('ambiguous');
+  });
+
   it('歌名对不上时回可选歌名', () => {
     const root = library([
       { title: '起风了', kind: 'clean' },

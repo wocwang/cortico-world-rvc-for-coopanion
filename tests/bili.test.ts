@@ -100,6 +100,52 @@ describe('B 站候选打分', () => {
     expect(pick.reason).toBe('weak-match');
   });
 
+  it('未收录的新后缀也按附加片段处理', () => {
+    const pick = pickCandidates([
+      hit('BV0000000001', '晴天 原版', { play: 5_000_000 }),
+      hit('BV0000000002', '晴天 某某自定义'),
+    ], '晴天 某某自定义');
+    expect(pick.confident).toBe(true);
+    expect(pick.reason).toBe('ok');
+    expect(pick.candidates.map((item) => item.bvid)).toEqual(['BV0000000002']);
+  });
+
+  it('倍率后缀（0.9x版）不依赖版本词表', () => {
+    const pick = pickCandidates([
+      hit('BV0000000001', '晴天 原版', { play: 5_000_000 }),
+      hit('BV0000000002', '晴天 0.9x版'),
+    ], '晴天 0.9x版');
+    expect(pick.confident).toBe(true);
+    expect(pick.candidates[0]!.bvid).toBe('BV0000000002');
+  });
+
+  it('歌手名在 UP 主字段里也算命中附加片段', () => {
+    const pick = pickCandidates([
+      hit('BV0000000001', '晴天', { author: '周杰伦', play: 5_000_000 }),
+      hit('BV0000000002', '晴天 翻唱', { author: '某UP' }),
+    ], '晴天 周杰伦');
+    expect(pick.confident).toBe(true);
+    expect(pick.reason).toBe('ok');
+    expect(pick.candidates.map((item) => item.bvid)).toEqual(['BV0000000001']);
+  });
+
+  it('团体名附加片段同样生效', () => {
+    const pick = pickCandidates([
+      hit('BV0000000001', '春日影', { author: 'MyGO!!!!!' }),
+      hit('BV0000000002', '春日影 原版', { author: '某UP', play: 5_000_000 }),
+    ], '春日影 MyGO');
+    expect(pick.confident).toBe(true);
+    expect(pick.candidates[0]!.bvid).toBe('BV0000000001');
+  });
+
+  it('对任意附加片段的否定都排除', () => {
+    const pick = pickCandidates([
+      hit('BV0000000001', '不是某某自定义！雨爱'),
+    ], '雨爱 某某自定义');
+    expect(pick.confident).toBe(false);
+    expect(pick.reason).toBe('weak-match');
+  });
+
   it('同一录音的不同搬运可以确定，不同演绎（现场 / MV）分数接近时列候选', () => {
     const same = pickCandidates([
       hit('BV0000000001', '起风了 高音质'),

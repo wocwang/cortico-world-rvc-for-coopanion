@@ -5,11 +5,12 @@
  *
  * 匹配分三档：
  * - 规范化后完全相同 → 直接播；
- * - 只是包含关系 / 版本后缀不同（「雨爱」vs「雨爱 司凤版」）→ 不替用户做主，
- *   返回可选项让桌宠先问；
+ * - 长标题只是「短标题 + 一个版本 / 演唱者片段」（任何「xxx版」「xxx cover」「歌手名」
+ *   这类结构，见 `match.ts`）→ 不替用户做主，返回可选项让桌宠先问；
  * - 完全对不上 → 再由 World 决定去 B 站找原版。
  */
 import { readLibrary, songKey, type LibraryEntry, type LibraryKind } from './library.ts';
+import { appendedSuffix } from './match.ts';
 
 export interface SingQuery {
   /** 歌名，可带《》、扩展名；省略表示随机。 */
@@ -26,7 +27,7 @@ export interface SingIssue {
 }
 
 export interface SingAmbiguous {
-  /** 只是包含关系 / 版本后缀不同的候选，最多 6 条。 */
+  /** 只是版本 / 演唱者片段不同的候选，最多 6 条。 */
   entries: LibraryEntry[];
   /** 先让用户确认，不要直接播。 */
   message: string;
@@ -40,10 +41,25 @@ const kindLabel = (kind: LibraryKind): string =>
 const titles = (entries: LibraryEntry[], limit = 8): string =>
   [...new Set(entries.map((entry) => entry.title))].slice(0, limit).join(' / ');
 
-/** 只看包含关系/版本后缀；完全相同不算。距离越近越靠前，同距离取最新的。 */
-function closeMatches(entries: LibraryEntry[], key: string): LibraryEntry[] {
+/** 去掉扩展名，保留展示用的分隔符与大小写，交给 `appendedSuffix` 判断结构。 */
+function displayTitle(title: string): string {
+  return String(title || '').replace(/\.[a-z0-9]{1,5}$/i, '').trim();
+}
+
+/**
+ * 只看「短名 + 附加片段」这种关系；完全相同不算。
+ * 多出来的是版本 / 演唱者片段（有分隔符、xxx版、xxx cover、连写的人名 / 团体名）才询问；
+ * 单纯多一个字（「雨」vs「雨天」）不算相近版本，继续按未命中处理。
+ * 距离越近越靠前，同距离取最新的。
+ */
+function closeMatches(entries: LibraryEntry[], key: string, display: string): LibraryEntry[] {
   return entries
-    .filter((entry) => entry.song !== key && (entry.song.includes(key) || key.includes(entry.song)))
+    .filter((entry) => {
+      if (entry.song === key) return false;
+      if (entry.song.includes(key)) return appendedSuffix(display, entry.title)?.suffix === true;
+      if (key.includes(entry.song)) return appendedSuffix(entry.title, display)?.suffix === true;
+      return false;
+    })
     .sort((a, b) =>
       Math.abs(a.song.length - key.length) - Math.abs(b.song.length - key.length)
       || Date.parse(b.createdAt) - Date.parse(a.createdAt));
@@ -61,6 +77,7 @@ export function pickSong(root: string, query: SingQuery, random: () => number = 
     };
   }
   const same = all.filter((entry) => entry.kind === kind);
+  const display = displayTitle(query.song ?? '');
   const key = songKey(query.song ?? '');
   if (!key) {
     if (!same.length) {
@@ -82,8 +99,8 @@ export function pickSong(root: string, query: SingQuery, random: () => number = 
     .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   if (exact.length) return { entry: exact[0]! };
 
-  // 只是包含关系 / 版本后缀不同：先问用户是不是这一版。
-  const close = closeMatches(same, key);
+  // 只是版本 / 演唱者片段不同：先问用户是不是这一版。
+  const close = closeMatches(same, key, display);
   if (close.length) {
     const list = close.slice(0, 6);
     const names = list.map((entry) => `"${entry.title}"`).join(', ');
@@ -106,7 +123,7 @@ export function pickSong(root: string, query: SingQuery, random: () => number = 
       },
     };
   }
-  const otherClose = closeMatches(all.filter((entry) => entry.kind !== kind), key);
+  const otherClose = closeMatches(all.filter((entry) => entry.kind !== kind), key, display);
   if (otherClose.length) {
     const other = [...new Set(otherClose.map((entry) => entry.kind))].map(kindLabel).join(', ');
     return {
