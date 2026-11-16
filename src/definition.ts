@@ -19,6 +19,18 @@ const DESCRIBE: WorldDescribe = {
       zh: '从翻唱库按歌名或随机点一首，本机外放；精确命中直接播，只有相近版本时先问；默认唱法读配置，明确要另一种时再传 kind。',
       en: 'Plays a saved song from the local cover library through the speakers — by name or random; exact titles play directly, close versions are confirmed first; the default singing type comes from settings.',
     },
+    rvc_find: {
+      zh: '按关键词在翻唱库里找歌，空关键词列出全部；找到后把准确标题交给 rvc_sing。',
+      en: 'Search the saved cover library by keywords; an empty query lists everything. Pass an exact title to rvc_sing.',
+    },
+    rvc_status: {
+      zh: '查看当前是在播放、在后台准备，还是空闲。',
+      en: 'Report whether a song is playing, a cover is being prepared, or the singer is idle.',
+    },
+    rvc_stop: {
+      zh: '停止当前播放，并取消还在后台准备的翻唱。',
+      en: 'Stop current playback and cancel a cover still being prepared.',
+    },
   }),
   events: [],
 };

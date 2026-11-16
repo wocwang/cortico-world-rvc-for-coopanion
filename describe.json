@@ -35,8 +35,79 @@
         "speak"
       ],
       "summary": {
-        "zh": "桌宠点歌：精确命中直接播；只有相近版本时先问；确认要原版后从 B 站搜索、自动生成并按配置入库、播放；默认唱法读配置。",
-        "en": "Plays exact library matches directly; close versions are confirmed first; if the person wants the original, searches Bilibili, makes a cover, saves it according to settings and plays it. The default singing type comes from settings."
+        "zh": "从翻唱库按歌名或随机点一首，本机外放；精确命中直接播，只有相近版本时先问；默认唱法读配置，明确要另一种时再传 kind。",
+        "en": "Plays a saved song from the local cover library through the speakers — by name or random; exact titles play directly, close versions are confirmed first; the default singing type comes from settings."
+      }
+    },
+    {
+      "name": "rvc_find",
+      "description": "Search the local RVC cover library by keywords instead of requiring an exact title. Use it when the person asks what songs you can sing, gives a partial or fuzzy title, or asks whether a song is saved. An empty query lists the saved songs (up to limit). Returns exact titles with clean/cover labels; then call rvc_sing with one of those exact titles. If nothing matches, ask the person rather than pretending.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Keywords to match against saved titles; empty lists all saved songs."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "clean",
+              "cover"
+            ],
+            "description": "Only return this kind; omit for both."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Maximum results; default 20."
+          }
+        },
+        "required": []
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "按关键词在翻唱库里找歌，空关键词列出全部；找到后把准确标题交给 rvc_sing。",
+        "en": "Search the saved cover library by keywords; an empty query lists everything. Pass an exact title to rvc_sing."
+      }
+    },
+    {
+      "name": "rvc_status",
+      "description": "Check what the RVC singer is doing right now: playing a song, preparing a cover in the background, or idle. Use it when the person asks whether you are still singing, whether it finished, or what is playing.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "查看当前是在播放、在后台准备，还是空闲。",
+        "en": "Report whether a song is playing, a cover is being prepared, or the singer is idle."
+      }
+    },
+    {
+      "name": "rvc_stop",
+      "description": "Stop the current RVC playback and cancel any cover that is still being prepared in the background. Use it when the person says stop singing, be quiet, or switch away. Returns whether something was playing or being prepared.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "停止当前播放，并取消还在后台准备的翻唱。",
+        "en": "Stop current playback and cancel a cover still being prepared."
       }
     }
   ],
@@ -46,7 +117,7 @@
       "key": "worlds.rvc.envPrompt",
       "title": "RVC 变声 · 环境提示词",
       "role": "envPrompt",
-      "content": "## 点歌（RVC 翻唱库）\n\n状态：{{rvc.state}}\n库里：{{rvc.library}}\n\n- 桌宠或对话页里，用户说「给我唱《歌名》」「来一首」「来首清唱」「来首翻唱」，就真的点歌：调 `rvc_sing`，`song` 填歌名（书名号可带），没说歌名就不传 `song` 让它随机挑一首。\n- **默认类型读配置**：不传 `kind` 时用配置里的桌宠点歌默认类型（当前：{{rvc.defaultKind}}）。用户明确说「清唱」时传 `kind: \"clean\"`，明确说「翻唱」「带伴奏」「要有 BGM」时传 `kind: \"cover\"`。\n- 点歌会立刻开始播放并返回歌名、类型与时长；不要等整首播完，也不要在同一轮里重复调用。工具返回失败或说明时，如实转告，不要假装已经唱了；对用户说话像在点歌，不要暴露翻唱库、搜索、入库、生成这些内部流程。\n- **歌名精确命中**（库里就叫这个名字）时直接播放，不用再问。\n- **歌名相同、只是多了版本或演唱者片段**时（例如库里的标题是「歌名 + 某某版 / 某某翻唱 / 某某 cover / 歌手名 / 团体名」），工具不会直接播，而是返回相近版本。这时要先问用户是不是这一版，把候选作为选项列出来；用户确认后，用那个完整标题再调一次 `rvc_sing`。用户说不是、要原版时，用同一个歌名加上 `source: \"bilibili\"` 再调一次，不要自己改歌名。判断只看结构和分隔符，不依赖某个固定版本名。\n- 嘴型：{{rvc.mouth}} 不要把嘴型动画说成音频对嘴；用户没问就不用解释。\n- 用户再点一首时直接调 `rvc_sing`，它会先停掉上一首和上一次正在生成的自动翻唱，不用提醒用户手动停。\n- 库里没有相近版本时，工具会在后台准备一版并自动播放；首次准备要 2–5 分钟，工具会马上返回。对用户就用「我还没唱过这首歌，等我唱一遍回来放给你听」这类自然说法，只告诉需要几分钟、做完会自动放；不要提翻唱库、B 站、入库、清唱/翻唱、现做、生成这些实现细节，也不要在同一轮里反复调用或假装已经唱了。\n- 工具返回候选列表（低置信：同名版本太多、像伴奏/片段、搜索结果不明确）时，照实把候选告诉用户并问用哪一首，不要自己硬挑一首。用「我找到几个版本，你想听哪个」这类说法，不要提「翻唱库」「搜索」「B 站」这些实现细节。\n- 库为空且用户没给歌名时，工具只回一段说明：告诉用户先说歌名（会自动生成），或先在「RVC唱歌-大肥鱼」面板里翻唱一首，不要当作报错。\n- 只有清唱版或翻唱版其中一种时，工具会说明不会擅自换类型；用户明确要另一种时，再调一次并传对应的 kind。\n- 不要再调 `singer_sing` 唱同一首歌：它是 DiffSinger 现编一句，不会从翻唱库取歌。\n"
+      "content": "## 点歌（RVC 翻唱库）\n\n状态：{{rvc.state}}\n库里：{{rvc.library}}\n播放：{{rvc.playback}}\n\n- 桌宠或对话页里，用户说「给我唱《歌名》」「来一首」「来首清唱」「来首翻唱」，就真的点歌：调 `rvc_sing`，`song` 填歌名（书名号可带），没说歌名就不传 `song` 让它随机挑一首。\n- **自己找歌，别让用户先报完整歌名**：用户问「你会唱什么」「都有哪些歌」「有没有某首」「来首 XX 的歌」，或只说了模糊的歌名 / 关键词时，先调 `rvc_find`，`query` 填关键词；想看全部就不传 `query`（`limit` 可调大）。拿到完整标题后直接用这个标题调 `rvc_sing` 播放。只有多首都对得上、拿不准是哪一首时才把候选简短报给用户选；`rvc_find` 一首都没匹配到，再如实说没找到并问要不要现学或换一首，不要反过来要求用户报完整歌名。\n- **播放状态以 `{{rvc.playback}}` 为准**：用户问「在唱吗」「唱完没」「刚才那首呢」「怎么没声音」，或你不确定时，先看这一行，必要时调 `rvc_status`。「currently playing」就是在唱，「preparing」是在后台准备、还没开始，「nothing is playing」就是没在唱或已经唱完。不要凭记忆说「还没做好」「不知道」。\n- **后台准备完成会自动开播**：`rvc_sing` 在库里没找到、去现学一首时会马上返回，做好后自动播放并更新播放状态。用户之后问起，按 `{{rvc.playback}}` 如实回答；不要说还在准备，也不要说没做好。\n- **用户要停**（「别唱了」「停下」「关掉」）时调 `rvc_stop`；它会同时停掉正在播放的歌和还在后台准备的翻唱，返回停了什么。不要说自己停不了，也不要让用户自己去面板操作。\n- **默认类型读配置**：不传 `kind` 时用配置里的桌宠点歌默认类型（当前：{{rvc.defaultKind}}）。用户明确说「清唱」时传 `kind: \"clean\"`，明确说「翻唱」「带伴奏」「要有 BGM」时传 `kind: \"cover\"`。\n- 点歌会立刻开始播放并返回歌名、类型与时长；不要等整首播完，也不要在同一轮里重复调用。工具返回失败或说明时，如实转告，不要假装已经唱了；对用户说话像在点歌，不要暴露翻唱库、搜索、入库、生成这些内部流程。\n- **歌名精确命中**（库里就叫这个名字）时直接播放，不用再问。\n- **歌名相同、只是多了版本或演唱者片段**时（例如库里的标题是「歌名 + 某某版 / 某某翻唱 / 某某 cover / 歌手名 / 团体名」），工具不会直接播，而是返回相近版本。这时要先问用户是不是这一版，把候选作为选项列出来；用户确认后，用那个完整标题再调一次 `rvc_sing`。用户说不是、要原版时，用同一个歌名加上 `source: \"bilibili\"` 再调一次，不要自己改歌名。判断只看结构和分隔符，不依赖某个固定版本名。\n- 嘴型：{{rvc.mouth}} 不要把嘴型动画说成音频对嘴；用户没问就不用解释。\n- 用户再点一首时直接调 `rvc_sing`，它会先停掉上一首和上一次正在生成的自动翻唱，不用提醒用户手动停。\n- 库里没有相近版本时，工具会在后台准备一版并自动播放；首次准备要 2–5 分钟，工具会马上返回。对用户就用「我还没唱过这首歌，等我唱一遍回来放给你听」这类自然说法，只告诉需要几分钟、做完会自动放；不要提翻唱库、B 站、入库、清唱/翻唱、现做、生成这些实现细节，也不要在同一轮里反复调用或假装已经唱了。\n- 工具返回候选列表（低置信：同名版本太多、像伴奏/片段、搜索结果不明确）时，照实把候选告诉用户并问用哪一首，不要自己硬挑一首。用「我找到几个版本，你想听哪个」这类说法，不要提「翻唱库」「搜索」「B 站」这些实现细节。\n- 库为空且用户没给歌名时，工具只回一段说明：告诉用户先说歌名（会自动生成），或先在「RVC唱歌-大肥鱼」面板里翻唱一首，不要当作报错。\n- 只有清唱版或翻唱版其中一种时，工具会说明不会擅自换类型；用户明确要另一种时，再调一次并传对应的 kind。\n- 不要再调 `singer_sing` 唱同一首歌：它是 DiffSinger 现编一句，不会从翻唱库取歌。\n"
     }
   ]
 }

@@ -31,6 +31,7 @@ async function makeWorld(
   overrides: Partial<typeof RVC_DEFAULTS> = {},
   createSongPlayer?: (log: Logger) => SongPlayer,
   bili?: BiliClient,
+  extraHost?: Partial<WorldHost>,
 ): Promise<{ world: RvcWorld; invoke: (method: string, args?: unknown[]) => Promise<unknown>; dataDir: string }> {
   const dataDir = mkdtempSync(join(tmpdir(), 'rvc-world-'));
   roots.push(dataDir);
@@ -48,7 +49,7 @@ async function makeWorld(
     },
   });
   worlds.push(world);
-  await world.start({ log } as unknown as WorldHost);
+  await world.start({ log, ...extraHost } as unknown as WorldHost);
   const decl = world.webUi('zh');
   return { world, dataDir, invoke: (method, args = []) => decl.invoke!('service', method, args) };
 }
@@ -57,20 +58,33 @@ interface FakePlayer extends SongPlayer {
   cuts: number;
   files: string[];
   closed: number;
+  /** 模拟这一首自然播完：触发最近一次 playFile 的 onEnded。 */
+  end(): void;
 }
 
 /** 假播放器：只记调用顺序，不加载原生模块、不出声。 */
 function fakePlayer(): FakePlayer {
+  let onEnded: (() => void) | null = null;
+  const fire = (): void => {
+    const end = onEnded;
+    onEnded = null;
+    end?.();
+  };
   const state: FakePlayer = {
     cuts: 0,
     files: [],
     closed: 0,
-    stop() { state.cuts += 1; },
-    playFile(path: string) {
+    stop() {
+      state.cuts += 1;
+      fire();
+    },
+    playFile(path: string, hooks) {
       state.files.push(path);
+      onEnded = hooks?.onEnded ?? null;
       return Promise.resolve({ durationSec: 12.5, info: {} as WavInfo });
     },
     close() { state.closed += 1; },
+    end: fire,
   };
   return state;
 }
@@ -744,6 +758,83 @@ describe('rvc_sing 桌宠点歌', () => {
     expect(queries).toEqual(['雨爱']);
     expect(out.text).toContain('no results');
     expect(player.files).toHaveLength(0);
+  });
+});
+
+describe('rvc_find / rvc_status / rvc_stop', () => {
+  const call = async (world: RvcWorld, name: string, args: Record<string, unknown> = {}): Promise<ToolOutcome> => {
+    const tool = world.tools().find((item) => item.name === name);
+    expect(tool).toBeTruthy();
+    return await tool!.handler(args, {} as never) as ToolOutcome;
+  };
+
+  it('rvc_find 空关键词列出全部，关键词只回匹配，可按类型过滤', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({}, () => player);
+    seedLibrary(dataDir, [
+      { title: '起风了', kind: 'clean' },
+      { title: '起风了 现场版', kind: 'cover' },
+      { title: '晴天', kind: 'clean' },
+    ]);
+    const all = await call(world, 'rvc_find');
+    expect(all.failed).toBeUndefined();
+    expect(all.text).toContain('Saved songs (3)');
+    expect(all.text).toContain('起风了 现场版');
+
+    const hit = await call(world, 'rvc_find', { query: '起风' });
+    expect(hit.text).toContain('Songs matching "起风" (2)');
+    expect(hit.text).not.toContain('晴天');
+
+    const cover = await call(world, 'rvc_find', { query: '起风', kind: 'cover' });
+    expect(cover.text).toContain('(1)');
+    expect(cover.text).toContain('起风了 现场版');
+
+    const none = await call(world, 'rvc_find', { query: '不存在的歌' });
+    expect(none.failed).toBeUndefined();
+    expect(none.text).toContain('No saved song matches');
+  });
+
+  it('rvc_status 播放中显示歌名，rvc_stop 能停并清空状态', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({}, () => player);
+    seedLibrary(dataDir, [{ title: '晴天', kind: 'clean' }]);
+    const play = await call(world, 'rvc_sing', { song: '晴天' });
+    expect(play.text).toContain('Playing');
+
+    expect(world.envPromptVars()!['rvc.playback']).toContain('currently playing "晴天"');
+    const status = await call(world, 'rvc_status');
+    expect(status.text).toContain('Playing "晴天"');
+    expect(status.text).toContain('of 0:13');
+
+    const cuts = player.cuts;
+    const stop = await call(world, 'rvc_stop');
+    expect(stop.text).toBe('Stopped "晴天".');
+    expect(player.cuts).toBe(cuts + 1);
+    expect(world.envPromptVars()!['rvc.playback']).toBe('nothing is playing');
+    expect((await call(world, 'rvc_status')).text).toContain('Nothing is playing');
+  });
+
+  it('自然播完后播放状态回到 nothing，并推一条完成事件给宿主', async () => {
+    const player = fakePlayer();
+    const events: Array<{ text: string; type: string }> = [];
+    const { world, dataDir } = await makeWorld({}, () => player, undefined, {
+      pushEvent: (async (e: { text: string; type: string }) => {
+        events.push(e);
+        return e;
+      }) as unknown as WorldHost['pushEvent'],
+    });
+    seedLibrary(dataDir, [{ title: '晴天', kind: 'clean' }]);
+    await call(world, 'rvc_sing', { song: '晴天' });
+    expect(world.envPromptVars()!['rvc.playback']).toContain('currently playing');
+    player.end();
+    expect(world.envPromptVars()!['rvc.playback']).toBe('nothing is playing');
+    expect(events.map((e) => e.text)).toContain('[RVC] Playback finished: "晴天".');
+  });
+
+  it('没在播时 rvc_stop 如实说没有可停的', async () => {
+    const { world } = await makeWorld();
+    const out = await call(world, 'rvc_stop');
+    expect(out.text).toBe('Nothing was playing.');
   });
 });
 

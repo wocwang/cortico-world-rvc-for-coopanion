@@ -35,7 +35,7 @@ import {
   safeSongName, saveToLibrary, writeLibrary, type LibraryKind,
 } from './library.ts';
 import { FfplayPlayer, type SongPlayer } from './player.ts';
-import { pickSong } from './sing.ts';
+import { findSongs, pickSong } from './sing.ts';
 import { defaultBiliClient, isBvid, pickCandidates, type BiliClient, type BiliPick, type SearchHit } from './bili.ts';
 import { RVC_TOOL_DECLS } from './tools.ts';
 import { clock } from './wav.ts';
@@ -208,6 +208,20 @@ export class RvcWorld implements World {
   private singGeneration = 0;
   /** 自动一键翻唱是否在跑：再次点歌时据此停引擎、让旧任务尽快结束。 */
   private autoSingBusy = false;
+  /** 正在后台准备的歌名；`rvc_status` 和提示词用。 */
+  private autoSingQuery = '';
+  /** 当前播放；`rvc_status`、`rvc.playback` 和环境提示词都用它。 */
+  private playback: {
+    id: number;
+    title: string;
+    kind: LibraryKind;
+    durationSec: number;
+    startedAt: number;
+  } | null = null;
+  /** 播放代次：stop / 新歌会自增，旧的 onEnded 回调不再改状态。 */
+  private playbackId = 0;
+  /** 宿主事件：播完 / 开始播放时告诉模型，不靠猜。 */
+  private host: WorldHost | null = null;
 
   constructor(opts: RvcWorldOptions) {
     this.opts = opts;
@@ -236,12 +250,23 @@ export class RvcWorld implements World {
     const mouth = this.opts.cfg.mouthAnimation === false
       ? '已关闭：不要为了嘴型调用 pet_say，正常说话即可。'
       : '已开启：开唱后用 pet_say 短哼一句（如「♪～」）让嘴型动起来；不要挂长气泡，唱完或切歌后让气泡自然结束。';
-    return { 'rvc.state': state, 'rvc.library': library, 'rvc.defaultKind': defaultKind, 'rvc.mouth': mouth };
+    return {
+      'rvc.state': state,
+      'rvc.library': library,
+      'rvc.defaultKind': defaultKind,
+      'rvc.mouth': mouth,
+      'rvc.playback': this.playbackStatus(),
+    };
   }
 
   tools(): ToolDef[] {
-    const decl = RVC_TOOL_DECLS[0]!;
-    return [{ ...decl, handler: (args) => this.rvcSing(args) }];
+    const [sing, find, status, stop] = RVC_TOOL_DECLS;
+    return [
+      { ...sing!, handler: (args) => this.rvcSing(args) },
+      { ...find!, handler: async (args) => this.findLibrarySongs(args) },
+      { ...status!, handler: async () => this.playbackState() },
+      { ...stop!, handler: () => this.stopSinging() },
+    ];
   }
 
   webUi(language: Language = 'zh'): WorldWebUiDecl {
@@ -274,6 +299,7 @@ export class RvcWorld implements World {
           { name: 'rvc.library', description: '翻唱库里保存的歌曲数量与清唱 / 翻唱分布。' },
           { name: 'rvc.defaultKind', description: '配置里的桌宠点歌默认类型（清唱 / 翻唱）。' },
           { name: 'rvc.mouth', description: '唱歌时是否用 pet_say 带动嘴型（读配置里的「唱歌时让嘴型动起来」）。' },
+          { name: 'rvc.playback', description: '当前播放状态：正在播 / 正在后台准备 / 没在播。' },
         ],
       }],
       // 配置组交给框架自带的配置视图，不各占一个面板。
@@ -282,6 +308,7 @@ export class RvcWorld implements World {
   }
 
   async start(host: WorldHost): Promise<void> {
+    this.host = host;
     this.log = host.log;
     this.songPlayer = this.opts.createSongPlayer
       ? this.opts.createSongPlayer(host.log)
@@ -338,6 +365,9 @@ export class RvcWorld implements World {
     this.stopped = true;
     this.singGeneration += 1;
     this.autoSingBusy = false;
+    this.autoSingQuery = '';
+    this.playback = null;
+    this.playbackId += 1;
     this.cancelIdle();
     this.songPlayer?.close();
     this.songPlayer = null;
@@ -350,6 +380,7 @@ export class RvcWorld implements World {
     this.engine = null;
     await this.starting?.catch(() => undefined);
     this.starting = null;
+    this.host = null;
   }
 
   /** 拉起/重拉引擎；失败原因进 `launchDetail`，面板与接口据此解释。`auto=false` 用于「重启引擎」这类明确动作。 */
@@ -1603,6 +1634,69 @@ export class RvcWorld implements World {
     }
   }
 
+  /** 播放状态给模型看：正在播 / 正在准备 / 没在播，避免它靠猜。 */
+  private playbackStatus(): string {
+    const current = this.playback;
+    if (current) {
+      const elapsed = Math.max(0, Math.floor((Date.now() - current.startedAt) / 1000));
+      const total = current.durationSec > 0 ? ` of ${clock(current.durationSec)}` : '';
+      const label = current.kind === 'clean' ? 'clean vocal' : 'cover';
+      return `currently playing "${current.title}" (${label}), ${clock(elapsed)}${total} elapsed`;
+    }
+    if (this.autoSingBusy) {
+      return `preparing "${this.autoSingQuery || 'a song'}" in the background; nothing is playing yet`;
+    }
+    return 'nothing is playing';
+  }
+
+  /** 只在有宿主事件能力时投递；单测的假宿主没有 pushEvent，直接跳过。 */
+  private pushPlayback(text: string, trigger: 'debounce' | 'piggyback'): void {
+    const host = this.host;
+    if (!host || typeof host.pushEvent !== 'function') return;
+    void host.pushEvent({
+      type: 'rvc.playback',
+      source: RVC_ID,
+      senderKey: 'rvc.playback',
+      ts: new Date().toISOString(),
+      text: `[RVC] ${text}`,
+      origin: 'internal',
+      tags: ['snapshot'],
+    }, { trigger }).catch((err: unknown) => {
+      this.log?.warn('RVC 播放状态事件没有送出', { err: err instanceof Error ? err.message : String(err) });
+    });
+  }
+
+  /** 记下开始播放；返回代次，结束回调据此决定是否还改状态。 */
+  private beginPlayback(title: string, kind: LibraryKind, notify: boolean): number {
+    const id = ++this.playbackId;
+    this.playback = { id, title, kind, durationSec: 0, startedAt: Date.now() };
+    if (notify) {
+      const label = kind === 'clean' ? 'clean vocal' : 'cover';
+      this.pushPlayback(`Started playing "${title}" (${label}).`, 'debounce');
+    }
+    return id;
+  }
+
+  private updatePlaybackDuration(id: number, durationSec: number): void {
+    if (this.playback?.id === id) this.playback.durationSec = durationSec;
+  }
+
+  private finishPlayback(id: number, reason = 'finished'): void {
+    const current = this.playback;
+    if (!current || current.id !== id) return;
+    this.playback = null;
+    this.pushPlayback(`Playback ${reason}: "${current.title}".`, 'debounce');
+  }
+
+  /** 新点歌 / 显式停止：先清状态再杀进程，旧 onEnded 不会重复上报。 */
+  private stopPlayback(notify: boolean): void {
+    const current = this.playback;
+    this.playback = null;
+    this.playbackId += 1;
+    this.songPlayer?.stop();
+    if (current && notify) this.pushPlayback(`Stopped "${current.title}".`, 'debounce');
+  }
+
   /** 桌宠点歌：库优先；库里没有就按歌名跑一次 B 站一键翻唱（默认类型读配置），完成后直接播放。 */
   private async rvcSing(args: Record<string, unknown>): Promise<ToolOutcome> {
     const song = typeof args.song === 'string' ? args.song.trim() : '';
@@ -1614,7 +1708,7 @@ export class RvcWorld implements World {
     // 再点歌先停上一首与上一次自动翻唱；旧任务的结果不再抢播放条。
     this.singGeneration += 1;
     const generation = this.singGeneration;
-    player?.stop();
+    this.stopPlayback(false);
     if (this.autoSingBusy) await this.interruptAutoSing();
     if (!player) return { text: 'Nothing played: the local player is not ready.', failed: true };
 
@@ -1625,12 +1719,15 @@ export class RvcWorld implements World {
         if (!existsSync(full)) {
           return { text: `Found "${pick.entry.title}" in the library, but its file is missing. Save it again from the RVC panel.`, failed: true };
         }
+        const id = this.beginPlayback(pick.entry.title, kind, false);
         try {
-          const { durationSec } = await player.playFile(full);
+          const { durationSec } = await player.playFile(full, { onEnded: () => this.finishPlayback(id) });
+          this.updatePlaybackDuration(id, durationSec);
           this.log?.info('桌宠点歌', { title: pick.entry.title, kind, file: pick.entry.file, seconds: durationSec });
           const label = kind === 'clean' ? 'clean vocal, no backing track' : 'cover, with backing track';
           return { text: `Playing "${pick.entry.title}" (${label}), ${clock(durationSec)}.` };
         } catch (err) {
+          this.finishPlayback(id, 'failed');
           return {
             text: `Found "${pick.entry.title}", but could not play it on this computer: ${err instanceof Error ? err.message : String(err)}.`,
             failed: true,
@@ -1690,6 +1787,68 @@ export class RvcWorld implements World {
     };
   }
 
+  /** 桌宠自己找歌：关键词匹配库里的标题，不要求用户先报完整歌名。 */
+  private findLibrarySongs(args: Record<string, unknown>): ToolOutcome {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    const kind = args.kind === 'cover' ? 'cover' : args.kind === 'clean' ? 'clean' : undefined;
+    const rawLimit = typeof args.limit === 'number' ? args.limit : 20;
+    const limit = Math.min(50, Math.max(1, Math.round(rawLimit)));
+    let result: ReturnType<typeof findSongs>;
+    try {
+      result = findSongs(this.libraryDir, query, kind, limit);
+    } catch (err) {
+      return { text: `Could not read the cover library: ${err instanceof Error ? err.message : String(err)}.`, failed: true };
+    }
+    if (!result.matches.length) {
+      return {
+        text: query
+          ? `No saved song matches "${query}". ${result.total ? `${result.total} songs are saved; ask the person for a title, or call rvc_find with an empty query to list them.` : 'The cover library is empty.'}`
+          : 'The cover library is empty.',
+      };
+    }
+    const lines = result.matches.map((entry, at) => {
+      const label = entry.kind === 'clean' ? 'clean vocal' : 'cover';
+      return `${at + 1}. "${entry.title}" — ${label}, ${clock(entry.durationSec)}`;
+    });
+    const heading = query
+      ? `Songs matching "${query}" (${result.total}):`
+      : `Saved songs (${result.total}):`;
+    return {
+      text: `${heading}\n${lines.join('\n')}\nUse rvc_sing with an exact title from this list to play one; ask the person if several could fit.`,
+    };
+  }
+
+  /** 当前播放 / 准备状态；模型不用靠猜。 */
+  private playbackState(): ToolOutcome {
+    const current = this.playback;
+    if (current) {
+      const elapsed = Math.max(0, Math.floor((Date.now() - current.startedAt) / 1000));
+      const label = current.kind === 'clean' ? 'clean vocal' : 'cover';
+      const total = current.durationSec > 0 ? ` of ${clock(current.durationSec)}` : '';
+      return {
+        text: `Playing "${current.title}" (${label}), ${clock(elapsed)}${total} elapsed. Call rvc_stop to stop it.`,
+      };
+    }
+    if (this.autoSingBusy) {
+      return { text: `Preparing "${this.autoSingQuery || 'a song'}" in the background; nothing is playing yet.` };
+    }
+    return { text: 'Nothing is playing right now.' };
+  }
+
+  /** 停止当前播放，并取消还在后台准备的翻唱。 */
+  private async stopSinging(): Promise<ToolOutcome> {
+    const wasPlaying = this.playback?.title ?? '';
+    const wasPreparing = this.autoSingBusy;
+    this.singGeneration += 1;
+    this.autoSingBusy = false;
+    this.autoSingQuery = '';
+    this.stopPlayback(true);
+    if (wasPreparing) await this.interruptAutoSing();
+    if (wasPlaying) return { text: `Stopped "${wasPlaying}".` };
+    if (wasPreparing) return { text: 'Cancelled the cover that was being prepared.' };
+    return { text: 'Nothing was playing.' };
+  }
+
   /** 再次点歌时打断上一次自动翻唱：停掉 worker，别让新歌排在几分钟的推理后面。 */
   private async interruptAutoSing(): Promise<void> {
     this.autoSingBusy = false;
@@ -1711,6 +1870,7 @@ export class RvcWorld implements World {
     player: SongPlayer,
   ): void {
     this.autoSingBusy = true;
+    this.autoSingQuery = query;
     const bgm = kind === 'cover';
     const task = (async () => {
       try {
@@ -1737,12 +1897,16 @@ export class RvcWorld implements World {
           });
           return;
         }
+        const title = result.library?.title ?? query;
+        const id = this.beginPlayback(title, kind, true);
         try {
-          const { durationSec } = await player.playFile(target);
+          const { durationSec } = await player.playFile(target, { onEnded: () => this.finishPlayback(id) });
+          this.updatePlaybackDuration(id, durationSec);
           this.log?.info('桌宠点歌：自动翻唱后播放', {
-            title: result.library?.title ?? query, seconds: durationSec, savedToLibrary: !!result.library,
+            title, seconds: durationSec, savedToLibrary: !!result.library,
           });
         } catch (err) {
+          this.finishPlayback(id, 'failed to start');
           this.log?.warn('桌宠点歌：自动翻唱后播放失败', { err: err instanceof Error ? err.message : String(err) });
         }
       } finally {
@@ -1754,7 +1918,9 @@ export class RvcWorld implements World {
         this.log?.warn('桌宠点歌：自动翻唱失败', { query, err: err instanceof Error ? err.message : String(err) });
       }
     }).finally(() => {
-      if (generation === this.singGeneration) this.autoSingBusy = false;
+      if (generation !== this.singGeneration) return;
+      this.autoSingBusy = false;
+      this.autoSingQuery = '';
     });
   }
 

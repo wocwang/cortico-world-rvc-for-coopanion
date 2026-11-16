@@ -32,8 +32,14 @@ export type SpawnLike = (
 export interface SongPlayer {
   /** 停下当前歌曲（关掉播放器进程）。 */
   stop(): void;
-  /** 从头播放一个音频；播放器进程确认启动后返回。 */
-  playFile(path: string): Promise<{ durationSec: number; info: WavInfo }>;
+  /**
+   * 从头播放一个音频；播放器进程确认启动后返回。
+   * `onEnded` 在自然播完、被 stop() 或 close() 停掉时各调用一次，用来更新「播放中」状态。
+   */
+  playFile(
+    path: string,
+    hooks?: { onEnded?: () => void },
+  ): Promise<{ durationSec: number; info: WavInfo }>;
   /** 停播并释放资源。 */
   close(): void;
 }
@@ -90,6 +96,8 @@ export class FfplayPlayer implements SongPlayer {
   private child: ChildProcess | null = null;
   /** mp3 等转出来的临时 WAV 目录；停播或播完时删。 */
   private tempDir: string | null = null;
+  /** 当前这一首结束时通知 World；自然播完、stop()/close() 都会调用一次。 */
+  private endHandler: (() => void) | null = null;
 
   constructor(
     private readonly log: Logger,
@@ -106,13 +114,19 @@ export class FfplayPlayer implements SongPlayer {
     const temp = this.tempDir;
     this.tempDir = null;
     removeTemp(temp);
+    const end = this.endHandler;
+    this.endHandler = null;
+    end?.();
   }
 
   close(): void {
     this.stop();
   }
 
-  async playFile(path: string): Promise<{ durationSec: number; info: WavInfo }> {
+  async playFile(
+    path: string,
+    hooks: { onEnded?: () => void } = {},
+  ): Promise<{ durationSec: number; info: WavInfo }> {
     this.stop();
     const generation = this.generation;
     // 库里的翻唱一般是 mp3：先用 ffmpeg 转成临时 WAV，播完/停播时删掉临时目录。
@@ -173,6 +187,7 @@ export class FfplayPlayer implements SongPlayer {
     }
     this.child = child;
     this.tempDir = tempDir;
+    this.endHandler = hooks.onEnded ?? null;
     child.once('exit', (code, signal) => {
       if (this.child !== child) return;
       this.child = null;
@@ -182,6 +197,9 @@ export class FfplayPlayer implements SongPlayer {
       if (code !== null && code !== 0) {
         this.log.warn('RVC 翻唱播放中断', { code, signal, err: tailOf(stderr.text) });
       }
+      const end = this.endHandler;
+      this.endHandler = null;
+      end?.();
     });
     return { durationSec: info.durationSec, info };
   }

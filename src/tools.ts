@@ -27,4 +27,41 @@ export const RVC_TOOL_DECLS: readonly ToolSpec[] = [{
     },
     required: [],
   },
+}, {
+  name: 'rvc_find',
+  description: 'Search the local RVC cover library by keywords instead of requiring an exact title. Use it when the person asks what songs you can sing, gives a partial or fuzzy title, or asks whether a song is saved. An empty query lists the saved songs (up to limit). Returns exact titles with clean/cover labels; then call rvc_sing with one of those exact titles. If nothing matches, ask the person rather than pretending.',
+  tags: ['read'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      query: {
+        type: 'string',
+        maxLength: 200,
+        description: 'Keywords to match against saved titles; empty lists all saved songs.',
+      },
+      kind: {
+        type: 'string',
+        enum: ['clean', 'cover'],
+        description: 'Only return this kind; omit for both.',
+      },
+      limit: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 50,
+        description: 'Maximum results; default 20.',
+      },
+    },
+    required: [],
+  },
+}, {
+  name: 'rvc_status',
+  description: 'Check what the RVC singer is doing right now: playing a song, preparing a cover in the background, or idle. Use it when the person asks whether you are still singing, whether it finished, or what is playing.',
+  tags: ['read'],
+  parameters: { type: 'object', additionalProperties: false, properties: {}, required: [] },
+}, {
+  name: 'rvc_stop',
+  description: 'Stop the current RVC playback and cancel any cover that is still being prepared in the background. Use it when the person says stop singing, be quiet, or switch away. Returns whether something was playing or being prepared.',
+  tags: ['act'],
+  parameters: { type: 'object', additionalProperties: false, properties: {}, required: [] },
 }];

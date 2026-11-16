@@ -10,7 +10,7 @@
  * - 完全对不上 → 再由 World 决定去 B 站找原版。
  */
 import { readLibrary, songKey, type LibraryEntry, type LibraryKind } from './library.ts';
-import { appendedSuffix } from './match.ts';
+import { appendedSuffix, norm, tokensOf } from './match.ts';
 
 export interface SingQuery {
   /** 歌名，可带《》、扩展名；省略表示随机。 */
@@ -63,6 +63,38 @@ function closeMatches(entries: LibraryEntry[], key: string, display: string): Li
     .sort((a, b) =>
       Math.abs(a.song.length - key.length) - Math.abs(b.song.length - key.length)
       || Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
+/**
+ * 在翻唱库里找歌：空关键词列出全部；有词时按词命中数、完整包含、精确命中排序。
+ * 这是给桌宠自己找歌用的，不要求用户先报出完整标题。
+ */
+export function findSongs(
+  root: string,
+  query: string,
+  kind?: LibraryKind,
+  limit = 20,
+): { matches: LibraryEntry[]; total: number } {
+  const all = readLibrary(root).entries;
+  const filtered = kind ? all.filter((entry) => entry.kind === kind) : all;
+  const text = norm(query);
+  if (!text) {
+    const sorted = [...filtered].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    return { matches: sorted.slice(0, limit), total: filtered.length };
+  }
+  const tokens = tokensOf(query);
+  const scored = filtered
+    .map((entry) => {
+      const hay = `${norm(entry.title)}\u0000${entry.song}`;
+      let score = 0;
+      if (entry.song === text) score += 1000;
+      if (hay.includes(text)) score += 100;
+      for (const token of tokens) score += hay.includes(token) ? 10 : -6;
+      return { entry, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || Date.parse(b.entry.createdAt) - Date.parse(a.entry.createdAt));
+  return { matches: scored.slice(0, limit).map((item) => item.entry), total: scored.length };
 }
 
 export function pickSong(root: string, query: SingQuery, random: () => number = Math.random): SingPick {
