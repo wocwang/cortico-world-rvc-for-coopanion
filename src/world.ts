@@ -281,14 +281,15 @@ export class RvcWorld implements World {
       ? this.opts.createSongPlayer(host.log)
       : new FfplayPlayer(host.log);
     this.stopped = false;
-    // 「随软件自动启动」关掉时，把引擎按「用户手动停过」处理，等面板点启动。
-    this.engineHeld = this.opts.cfg.autoStart === false;
+    // 「随软件自动启动」只决定启动时是否预热；桌宠 / 面板 / 9881 的按需请求仍会拉起。
+    // 只有用户在服务页点「停止引擎」才记成 engineHeld，之后不自动覆盖这个意图。
+    this.engineHeld = false;
     this.launchDetail = '';
     this.setup();
     // 启动时顺手清一次旧会话：只动 sessions，失败不影响启动。
     try { this.gcSessions(); } catch { /* 清理失败留到下次 */ }
     // 就绪可能要十几秒；先让 World 挂上，接口立刻能答 `ready=false`。
-    this.bootEngine();
+    if (this.opts.cfg.autoStart !== false) this.bootEngine();
     // 已有的派生 venv 不必等用户点安装：后台探一次，面板直接显示就绪。
     void this.venv?.check();
     if (this.opts.cfg.httpApi) void this.startHttp();
@@ -406,22 +407,66 @@ export class RvcWorld implements World {
   }
 
   /**
-   * 回收后自动拉回：只处理「闲置停」这一种停止。
-   * 手动停止、未装依赖、启动失败都保持原来的 409/未就绪语义，不在这里偷偷重试。
+   * 按需拉回：闲置回收、内存不足停掉、或启动时没预热（`autoStart=false`）都能拉起。
+   * 手动停止（`engineHeld`）和上次启动失败（phase=error）保持原样，不在这里偷偷重试——
+   * 前者是用户意图，后者会把真正的错误原因留给调用方。
    */
-  async ensureReady(): Promise<void> {
+  async ensureReady(timeoutMs = 0): Promise<void> {
     if (this.stopped || this.engineHeld) return;
     const engine = this.engine;
     if (!engine || engine.ready()) return;
     // 正在执行闲置回收：等 stop() 结束（期间请求排队，不吃 409）。
     if (this.idleSleep) await this.idleSleep.catch(() => undefined);
     // 已经在启动中（自动启动或别的请求触发）：一起等，避免并发请求被 409 打回。
-    if (this.starting) await this.starting.catch(() => undefined);
+    if (this.starting) await this.waitStarting(timeoutMs);
     if (engine.ready()) return;
-    if (!this.idleStopped || engine.state().phase !== 'stopped') return;
+    if (engine.state().phase !== 'stopped') return;
     this.idleStopped = false;
     this.bootEngine(false);
-    await this.starting?.catch(() => undefined);
+    await this.waitStarting(timeoutMs);
+  }
+
+  /** 等引擎启动完成；`timeoutMs>0` 时超时返回错误，后台启动本身继续（下次请求可能已就绪）。 */
+  private async waitStarting(timeoutMs: number): Promise<void> {
+    const starting = this.starting;
+    if (!starting) return;
+    if (timeoutMs <= 0) {
+      await starting.catch(() => undefined);
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        starting.catch(() => undefined),
+        new Promise<void>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`引擎启动超过 ${Math.round(timeoutMs / 1000)} 秒`)), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 桌宠/接口这类调用前的「先拉起再执行」：返回可用性 + 直接可读的原因。
+   * 引擎已就绪立刻返回；停止/闲置/未预热则启动并最多等 `timeoutMs`；手动停与启动失败不重试。
+   */
+  async ensureReadyForTool(timeoutMs = 90_000): Promise<{ ok: boolean; reason?: string }> {
+    if (this.stopped) return { ok: false, reason: 'the RVC world is stopped' };
+    if (this.engineHeld) return { ok: false, reason: 'the engine was stopped manually; start it on the Service page first' };
+    const engine = this.engine;
+    if (!engine) return { ok: false, reason: 'the RVC engine is not initialized' };
+    if (engine.ready()) return { ok: true };
+    let timeout = '';
+    try {
+      await this.ensureReady(timeoutMs);
+    } catch (err) {
+      timeout = err instanceof Error ? err.message : String(err);
+    }
+    if (engine.ready()) return { ok: true };
+    const detail = engine.state().detail || this.launchDetail || timeout;
+    return { ok: false, reason: detail || '引擎没有就绪' };
   }
 
   /** 面板/接口共用：此刻引擎状态。 */
@@ -1614,13 +1659,10 @@ export class RvcWorld implements World {
         text: `I could not pick a reliable Bilibili version for "${query}" (${decision.reason}). Ask the person which one to use:\n${candidateLines(decision.candidates)}`,
       };
     }
-    const engine = this.engine;
-    if (!engine) return { text: 'The RVC engine is not available.', failed: true };
-    if (!engine.ready()) {
-      await this.ensureReady();
-      if (!engine.ready()) {
-        return { text: `The RVC engine is not ready yet (${engine.state().detail ?? 'starting'}), so I cannot make "${query}" right now. Try again in a moment.`, failed: true };
-      }
+    // 生成链路需要引擎：停着就先拉起并等就绪，最多 90 秒；拉不起来把原因直接回给模型。
+    const ready = await this.ensureReadyForTool();
+    if (!ready.ok) {
+      return { text: `I could not start the RVC engine, so I cannot make "${query}" right now: ${ready.reason}.`, failed: true };
     }
     // 先把音频下下来：下载失败要当场回原因，别让用户等几分钟后才发现没下成。
     const download = await this.downloadBiliCandidates(decision.candidates, query);
@@ -1647,7 +1689,7 @@ export class RvcWorld implements World {
     const engine = this.engine;
     if (!engine) return;
     try { await engine.stop(); } catch { /* 已经停了 */ }
-    if (this.stopped) return;
+    if (this.stopped || this.engineHeld) return;
     // 下一条请求需要能自动拉起引擎；这里主动重启，避免第一次等待更久。
     this.idleStopped = false;
     this.bootEngine(false);

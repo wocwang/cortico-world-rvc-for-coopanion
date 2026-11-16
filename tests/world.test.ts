@@ -698,6 +698,38 @@ describe('rvc_sing 桌宠点歌', () => {
     expect(player.files[0]).toContain('清唱cover');
   });
 
+  it('引擎停着时点歌先自动拉起；启动失败直接回原因', async () => {
+    const player = fakePlayer();
+    let fetched = 0;
+    const { world, invoke, dataDir } = await makeWorld({ autoStart: false }, () => player, {
+      search: async () => [{ bvid: 'BV0000000001', title: '起风了 官方MV', author: 'UP', durationSec: 200, play: 1_000_000 }],
+      fetch: async () => { fetched += 1; throw new Error('不该下载'); },
+    });
+    installUvr(dataDir);
+    const out = await call(world, { song: '起风了' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('could not start the RVC engine');
+    expect(out.text).toContain('Python 解释器不存在');
+    expect(fetched).toBe(0);
+    expect(((await invoke('state')) as { phase: string }).phase).toBe('error');
+  });
+
+  it('手动停引擎后，桌宠点歌不会偷偷拉起', async () => {
+    const player = fakePlayer();
+    let fetched = 0;
+    const { world, invoke, dataDir } = await makeWorld({ autoStart: false }, () => player, {
+      search: async () => [{ bvid: 'BV0000000001', title: '起风了 官方MV', author: 'UP', durationSec: 200, play: 1_000_000 }],
+      fetch: async () => { fetched += 1; throw new Error('不该下载'); },
+    });
+    installUvr(dataDir);
+    await invoke('stop');
+    const out = await call(world, { song: '起风了' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('stopped manually');
+    expect(fetched).toBe(0);
+    expect(((await invoke('state')) as { phase: string }).phase).toBe('stopped');
+  });
+
   it('用户拒绝相近版本后，source=bilibili 跳过库里那一版', async () => {
     const player = fakePlayer();
     const queries: string[] = [];
