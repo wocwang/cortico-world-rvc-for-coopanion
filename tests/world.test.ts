@@ -850,6 +850,7 @@ describe('点歌与翻唱默认值配置', () => {
     expect(RVC_DEFAULTS.panelKind).toBe('cover');
     expect(RVC_DEFAULTS.saveToLibrary).toBe(true);
     expect(RVC_DEFAULTS.keepSource).toBe(true);
+    expect(RVC_DEFAULTS.mouthAnimation).toBe(true);
   });
 
   it('默认值分组里四项都可改', () => {
@@ -859,6 +860,9 @@ describe('点歌与翻唱默认值配置', () => {
     expect(props['worlds.rvc.panelKind']).toMatchObject({ type: 'string', 'x-options': 'rvc:kind' });
     expect(props['worlds.rvc.saveToLibrary']).toMatchObject({ type: 'boolean' });
     expect(props['worlds.rvc.keepSource']).toMatchObject({ type: 'boolean' });
+    expect(props['worlds.rvc.mouthAnimation']).toMatchObject({ type: 'boolean' });
+    const convert = configGroups('zh').find((g) => g.id === 'world:rvc');
+    expect(convert?.schema.properties?.['worlds.rvc.voice']).toMatchObject({ 'x-options': 'rvc:voice' });
   });
 
   it('面板状态带回配置默认值', async () => {
@@ -871,5 +875,12 @@ describe('点歌与翻唱默认值配置', () => {
     expect(state.defaults).toEqual({
       singKind: 'cover', panelKind: 'clean', saveToLibrary: false, keepSource: false,
     });
+  });
+
+  it('嘴型开关写进环境变量', async () => {
+    const off = await makeWorld({ mouthAnimation: false });
+    expect(off.world!.envPromptVars()!['rvc.mouth']).toContain('已关闭');
+    const on = await makeWorld();
+    expect(on.world!.envPromptVars()!['rvc.mouth']).toContain('已开启');
   });
 });

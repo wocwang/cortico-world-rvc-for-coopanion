@@ -233,7 +233,10 @@ export class RvcWorld implements World {
       }
     } catch { /* 库读不出来时按空库说 */ }
     const defaultKind = this.singKind() === 'cover' ? '翻唱（带伴奏）' : '清唱（只留人声）';
-    return { 'rvc.state': state, 'rvc.library': library, 'rvc.defaultKind': defaultKind };
+    const mouth = this.opts.cfg.mouthAnimation === false
+      ? '已关闭：不要为了嘴型调用 pet_say，正常说话即可。'
+      : '已开启：开唱后用 pet_say 短哼一句（如「♪～」）让嘴型动起来；不要挂长气泡，唱完或切歌后让气泡自然结束。';
+    return { 'rvc.state': state, 'rvc.library': library, 'rvc.defaultKind': defaultKind, 'rvc.mouth': mouth };
   }
 
   tools(): ToolDef[] {
@@ -270,6 +273,7 @@ export class RvcWorld implements World {
           { name: 'rvc.state', description: 'RVC 引擎此刻的状态（就绪 / 启动中 / 出错 / 未启动）。' },
           { name: 'rvc.library', description: '翻唱库里保存的歌曲数量与清唱 / 翻唱分布。' },
           { name: 'rvc.defaultKind', description: '配置里的桌宠点歌默认类型（清唱 / 翻唱）。' },
+          { name: 'rvc.mouth', description: '唱歌时是否用 pet_say 带动嘴型（读配置里的「唱歌时让嘴型动起来」）。' },
         ],
       }],
       // 配置组交给框架自带的配置视图，不各占一个面板。

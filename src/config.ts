@@ -29,6 +29,8 @@ export interface RvcConfigSection {
   saveToLibrary: boolean;
   /** 默认保存原声副本，方便之后原地重跑。 */
   keepSource: boolean;
+  /** 唱歌时用一句短哼带动桌宠嘴型；关掉后不再为嘴型额外调 pet_say。 */
+  mouthAnimation: boolean;
   /** 翻唱会话保留天数；0 表示不按时间清理。 */
   sessionDays: number;
   /** 翻唱会话总容量上限（GB）；0 表示不按容量清理。 */
@@ -105,6 +107,7 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   panelKind: 'cover',
   saveToLibrary: true,
   keepSource: true,
+  mouthAnimation: true,
   sessionDays: 7,
   sessionMaxGb: 8,
   libraryMaxGb: 2,
@@ -129,6 +132,8 @@ const K = `worlds.${RVC_ID}`;
 /** `x-options` 的选项源，由定义的 `configOptions` 给出。 */
 export const TIER_OPTIONS = `${RVC_ID}:tier`;
 export const KIND_OPTIONS = `${RVC_ID}:kind`;
+/** 默认音色下拉：选项由 `listVoices` 扫音色目录现算。 */
+export const VOICE_OPTIONS = `${RVC_ID}:voice`;
 
 const TEXT = {
   zh: {
@@ -143,6 +148,7 @@ const TEXT = {
     panelKind: { title: '面板翻唱默认类型', description: '翻唱页 BGM 下拉与 B 站一键生成的初始选项；面板里仍可逐次切换。' },
     saveToLibrary: { title: '完成后默认保存到翻唱库', description: '翻唱页「完成后保存到翻唱库」的初始勾选；桌宠自动生成也按它决定是否入库。关闭后桌宠仍会播放生成结果，只是不入库。' },
     keepSource: { title: '默认保存原声副本', description: '翻唱页「保存原声副本」的初始勾选；保存后可以在「最近翻唱」里原地重跑，不必重新选文件。' },
+    mouthAnimation: { title: '唱歌时让嘴型动起来', description: '开启后，提示模型在开唱后用一句短哼（如「♪～」）带动桌宠的 pet_say 气泡，嘴型会跟着动；唱完或切歌后气泡结束、嘴自然闭上。关闭后不再为嘴型额外调 pet_say。桌面宠物的嘴只跟气泡走，所以这是插件侧能做到的动画，不是逐字音频口型。' },
     kindClean: '清唱（只留人声）',
     kindCover: '翻唱（带伴奏）',
     sessionDays: { title: '会话保留天数', description: '超过这么多天的翻唱会话会被清理；0 表示不按时间清理（仍受容量上限约束）。' },
@@ -153,7 +159,7 @@ const TEXT = {
     tierAuto: '自动',
     tierCuda: '显卡（NVIDIA）',
     tierCpu: 'CPU',
-    voice: { title: '默认音色', description: 'voices 目录里 .pth 的文件名（不含扩展名）；留空用第一个。同名 .index 有则自动带上。' },
+    voice: { title: '默认音色', description: '从音色目录里的 .pth 下拉选择；选「自动（第一个）」或留空时用目录里第一个。导入新音色后重新打开配置即可看到。同名 .index 有则自动带上。' },
     pitch: { title: '变调（半音）', description: '0 为原调；男声转女声一般 +12 左右。' },
     indexRate: { title: '索引率', description: '0..1，越高越贴近音色、但可能带出素材口音；该音色没有 .index 时忽略。' },
     protect: { title: '保护清辅音', description: '0..0.5，防止换声后齿音、吸气声被抹掉。' },
@@ -178,6 +184,7 @@ const TEXT = {
     panelKind: { title: 'Default panel cover type', description: 'Starting value for the BGM selector and Bilibili one-click generation; still switchable per run in the panel.' },
     saveToLibrary: { title: 'Save finished covers to the library by default', description: 'Starting state of the "save to cover library" checkbox and whether pet auto generation is saved. When off, the pet still plays the generated result, it just is not added to the library.' },
     keepSource: { title: 'Keep the source audio by default', description: 'Starting state of the "keep source copy" checkbox; keeping it lets you rerun a cover in place from Recent covers without picking the file again.' },
+    mouthAnimation: { title: 'Move the mouth while singing', description: 'On tells the model to start a short hum (for example "♪～") through a pet_say bubble when a song begins, so the pet mouth moves; after the song ends or switches, the bubble ends and the mouth closes. Off stops the extra pet_say call used only for mouth movement. The desktop pet mouth follows bubbles only, so this is plugin-side motion, not per-word audio lip sync.' },
     kindClean: 'Clean vocals (no backing track)',
     kindCover: 'Cover (with backing track)',
     sessionDays: { title: 'Session retention (days)', description: 'Cover sessions older than this are cleaned up; 0 disables the age rule (the size cap still applies).' },
@@ -188,7 +195,7 @@ const TEXT = {
     tierAuto: 'Auto',
     tierCuda: 'GPU (NVIDIA)',
     tierCpu: 'CPU',
-    voice: { title: 'Default voice', description: 'A .pth file name in the voices folder without the extension; empty uses the first one. A matching .index is picked up automatically.' },
+    voice: { title: 'Default voice', description: 'Pick a .pth from the voices folder; "Auto (first)" or empty uses the first one. Reopen settings after importing a voice to see it. A matching .index is picked up automatically.' },
     pitch: { title: 'Pitch (semitones)', description: '0 keeps the original key; a male voice to female is usually around +12.' },
     indexRate: { title: 'Index rate', description: '0..1; higher sticks closer to the voice but may leak the source accent. Ignored when the voice has no .index.' },
     protect: { title: 'Protect voiceless consonants', description: '0..0.5; keeps sibilants and breaths from being smeared by the conversion.' },
@@ -216,7 +223,7 @@ export function configGroups(language: Language): ConfigGroup[] {
         description: t.groupConvert.description,
         properties: {
           [`${K}.tier`]: { type: 'string', title: t.tier.title, description: t.tier.description, 'x-options': TIER_OPTIONS, 'x-hot': true },
-          [`${K}.voice`]: { type: 'string', title: t.voice.title, description: t.voice.description, 'x-hot': true },
+          [`${K}.voice`]: { type: 'string', title: t.voice.title, description: t.voice.description, 'x-options': VOICE_OPTIONS, 'x-hot': true },
           [`${K}.pitch`]: { type: 'number', title: t.pitch.title, description: t.pitch.description, minimum: PITCH_MIN, maximum: PITCH_MAX, multipleOf: 1, 'x-hot': true },
           [`${K}.indexRate`]: { type: 'number', title: t.indexRate.title, description: t.indexRate.description, minimum: 0, maximum: 1, multipleOf: 0.05, 'x-hot': true },
           [`${K}.protect`]: { type: 'number', title: t.protect.title, description: t.protect.description, minimum: 0, maximum: PROTECT_MAX, multipleOf: 0.01, 'x-hot': true },
@@ -235,6 +242,7 @@ export function configGroups(language: Language): ConfigGroup[] {
           [`${K}.panelKind`]: { type: 'string', title: t.panelKind.title, description: t.panelKind.description, 'x-options': KIND_OPTIONS, 'x-hot': true },
           [`${K}.saveToLibrary`]: { type: 'boolean', title: t.saveToLibrary.title, description: t.saveToLibrary.description, 'x-hot': true },
           [`${K}.keepSource`]: { type: 'boolean', title: t.keepSource.title, description: t.keepSource.description, 'x-hot': true },
+          [`${K}.mouthAnimation`]: { type: 'boolean', title: t.mouthAnimation.title, description: t.mouthAnimation.description, 'x-hot': true },
         },
       },
     },
