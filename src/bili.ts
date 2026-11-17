@@ -106,6 +106,27 @@ function stripTags(text: string): string {
     .replace(/&gt;/g, '>');
 }
 
+/** 视频标题里与曲名无关的制作 / 画质 / 宣传词；保留翻唱、现场、伴奏这类版本信息。 */
+const TITLE_NOISE =
+  /(?:百万录音棚|顶级录音棚|专业录音棚|录音棚|官方版|官方|动态歌词|歌词版|完整版|纯享|收藏级|超清画质|超清|高清|画质|音质|中文字幕|双语字幕|字幕|附歌词|带歌词|4k修复|ai修复|修复版|重制版|母带|正版|无损音质|无损|高音质|60帧|120帧)|\b(?:4k|8k|1080p?|720p?|2160p?|hdr|hi-?res|mv|music\s*video|60fps|120fps)\b/gi;
+
+/**
+ * 把 B 站视频标题洗成可当曲名 / 入库标题的名字：
+ * 去掉【】（）里的画质与宣传词、书名号、话题标签和常见的制作词，保留歌名、歌手与版本。
+ */
+export function songTitleFromBili(title: string): string {
+  let text = stripTags(title)
+    .replace(/[【\[（(]/g, ' ')
+    .replace(/[】\]）)]/g, ' ')
+    .replace(/[《》「」『』]/g, '')
+    .replace(/#[^\s#]+/g, ' ')
+    .replace(TITLE_NOISE, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  text = text.replace(/^[\s\-–—·|｜:：,，、_]+|[\s\-–—·|｜:：,，、_]+$/g, '').trim();
+  return text.replace(/(?:\s*[-–—·|｜:：,，、_]\s*){2,}/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 async function jsonGet<T>(url: string, extra: Record<string, string> = {}): Promise<T> {
   const res = await fetch(url, {
     headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.com/', ...extra },

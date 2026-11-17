@@ -523,6 +523,20 @@ describe('母带 / 音高 / A/B 的数据面', () => {
     expect(state.session?.segments.length).toBe(1);
     expect(readSession(dataDir, old.id)?.masters).toBeUndefined();
   });
+
+  it('没指定会话时只列清单，不自动选中最新', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const { id } = seedSession(dataDir);
+    const listOnly = (await invoke('refineState', ['', 'list'])) as {
+      session: RefineSession | null;
+      sessions: Array<{ id: string }>;
+    };
+    expect(listOnly.session).toBeNull();
+    expect(listOnly.sessions.map((s) => s.id)).toEqual([id]);
+
+    const selected = (await invoke('refineState', [id])) as { session: RefineSession | null };
+    expect(selected.session?.id).toBe(id);
+  });
 });
 
 describe('内存不足识别', () => {
@@ -1008,6 +1022,22 @@ describe('B 站一键翻唱', () => {
     expect(out.failed).toBeUndefined();
     expect(out.text).toContain('cover, with backing track');
     expect(player.files[0]).toContain('翻唱cover');
+  });
+
+  it('bvid 指定候选后直接使用，不再重新搜索', async () => {
+    const player = fakePlayer();
+    let searches = 0;
+    const { world, dataDir } = await makeWorld({ autoStart: false }, () => player, {
+      search: async () => { searches += 1; return []; },
+      fetch: async () => { throw new Error('不该下载'); },
+    });
+    installUvr(dataDir);
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    const out = await tool.handler({ song: '晴天', bvid: 'BV0000000001' }, {} as never) as ToolOutcome;
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('could not start the RVC engine');
+    expect(searches).toBe(0);
+    expect(player.files).toHaveLength(0);
   });
 });
 

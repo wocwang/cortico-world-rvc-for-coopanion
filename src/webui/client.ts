@@ -1571,11 +1571,10 @@ const coverPanel: WebUiPanel = {
       sheet.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
-    /** 会话里的「歌名」：优先原始上传文件名；老会话没有该字段，显示未命名。 */
+    /** 会话里的「歌名」：优先原始上传 / B 站视频标题；老会话的 source.* 不算名字。 */
     function songName(s: SessionSummary): string {
       const base = s.source?.name ?? '';
-      if (base) return base.replace(/\.[^.]+$/, '');
-      // 老会话的 source.file 固定是 source.wav，不能当歌名用。
+      if (base && !/^source\.[^.]+$/i.test(base)) return base.replace(/\.[^.]+$/, '');
       const copy = s.source?.file ?? '';
       return copy && !/^source\.[^.]+$/i.test(copy) ? copy.replace(/\.[^.]+$/, '') : t.unnamed;
     }
@@ -1597,12 +1596,11 @@ const coverPanel: WebUiPanel = {
         const row = ui.h('div', 'rvc-recent');
         const head = ui.h('div', 'rvc-recent-head');
         head.append(
-          ui.h('strong', '', s.voice ? t.voiceLabel(s.voice) : t.unknown),
-          ui.h('span', '', t.recentMeta(
-            new Date(s.updatedAt).toLocaleString(),
-            ui.fmt.duration(s.durationSec * 1000),
-            '',
-          )),
+          ui.h('strong', '', songName(s)),
+          ui.h('span', '', [
+            s.voice ? t.voiceLabel(s.voice) : '',
+            t.recentMeta(new Date(s.updatedAt).toLocaleString(), ui.fmt.duration(s.durationSec * 1000), ''),
+          ].filter(Boolean).join(' · ')),
         );
         const source = ui.h('div', 'rvc-detail', s.source
           ? t.recentSource(s.source.file, ui.fmt.bytes(s.source.bytes))
@@ -2045,12 +2043,15 @@ const coverPanel: WebUiPanel = {
     }
 
     function renderRefine(r: RefineState): void {
-      fillSelect(ui, sessionSelect, r.sessions.map((s) => ({
-        value: s.id,
-        label: [s.id, s.voice ? t.voiceLabel(s.voice) : '', t.sessionLine(ui.fmt.duration(s.durationSec * 1000), ui.fmt.bytes(s.bytes), s.outputs)]
-          .filter(Boolean)
-          .join(' · '),
-      })));
+      fillSelect(ui, sessionSelect, [
+        { value: '', label: t.sessionPick },
+        ...r.sessions.map((s) => ({
+          value: s.id,
+          label: [s.id, s.voice ? t.voiceLabel(s.voice) : '', t.sessionLine(ui.fmt.duration(s.durationSec * 1000), ui.fmt.bytes(s.bytes), s.outputs)]
+            .filter(Boolean)
+            .join(' · '),
+        })),
+      ]);
       const session = r.session;
       summaries = r.sessions;
       selectedId = session?.id ?? '';
@@ -2540,7 +2541,8 @@ const coverPanel: WebUiPanel = {
     async function loadRefine(id = selectedId): Promise<void> {
       const seq = ++refineSeq;
       try {
-        const r = await ctx.invoke<RefineState>('refineState', id ? [id] : []);
+        // 没选会话时只列清单，不自动挑最新一条：刷新 / 从别的页面进来时原声保持为空。
+        const r = await ctx.invoke<RefineState>('refineState', id ? [id] : ['', 'list']);
         if (seq === refineSeq) renderRefine(r);
       } catch (err) {
         if (seq === refineSeq) refineLine.textContent = errText(err);

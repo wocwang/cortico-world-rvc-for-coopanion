@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  downloadAudio, extractBvid, isBvid, pickCandidates, rankHits, type SearchHit,
+  downloadAudio, extractBvid, isBvid, pickCandidates, rankHits, songTitleFromBili, type SearchHit,
 } from '../src/bili.ts';
 
 const hit = (bvid: string, title: string, extra: Partial<SearchHit> = {}): SearchHit => ({
@@ -22,6 +22,12 @@ afterEach(() => {
 });
 
 describe('B 站候选打分', () => {
+  it('从视频标题洗出干净曲名', () => {
+    expect(songTitleFromBili('【4K】起风了 百万录音棚')).toBe('起风了');
+    expect(songTitleFromBili('《晴天》官方MV 1080P')).toBe('晴天');
+    expect(songTitleFromBili('起风了 - 买辣椒也用券 [MV]')).toBe('起风了 - 买辣椒也用券');
+  });
+
   it('认 BV 号与整条链接', () => {
     expect(isBvid('BV1xx411c7mD')).toBe(true);
     expect(isBvid('bv1xx411c7mD')).toBe(false);

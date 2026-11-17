@@ -36,7 +36,7 @@ import {
 } from './library.ts';
 import { FfplayPlayer, type SongPlayer } from './player.ts';
 import { findSongs, pickSong } from './sing.ts';
-import { defaultBiliClient, isBvid, pickCandidates, type BiliClient, type BiliPick, type SearchHit } from './bili.ts';
+import { defaultBiliClient, isBvid, pickCandidates, songTitleFromBili, type BiliClient, type BiliPick, type SearchHit } from './bili.ts';
 import { RVC_TOOL_DECLS } from './tools.ts';
 import { clock } from './wav.ts';
 
@@ -924,13 +924,14 @@ export class RvcWorld implements World {
       const dest = join(tmpDir, `bili-${randomUUID()}.m4a`);
       try {
         const audio = await this.bili.fetch(candidate.bvid, dest, MAX_BILI_BYTES);
-        return { source: dest, title: query || audio.title || candidate.title, failures };
+        const title = songTitleFromBili(audio.title || candidate.title) || songTitleFromBili(query) || query;
+        return { source: dest, title, failures };
       } catch (err) {
         failures.push(`${candidate.title || candidate.bvid}: ${err instanceof Error ? err.message : String(err)}`);
         rmSync(dest, { force: true });
       }
     }
-    return { source: '', title: query, failures };
+    return { source: '', title: songTitleFromBili(query) || query, failures };
   }
 
   /**
@@ -1420,10 +1421,14 @@ export class RvcWorld implements World {
    * 面板「结果编辑」：会话列表 + 当前会话的混音参数。
    * `files` 把成品（混音 + 母带）按时间排成一份清单，面板据此做成品选择。
    */
-  private refineState(id = ''): Record<string, unknown> {
+  private refineState(id = '', listOnly = false): Record<string, unknown> {
     const sessions = listSessions(this.opts.dataDir);
     const has = (value: string): boolean => sessions.some((s) => s.id === value);
-    const wanted = id && has(id) ? id : this.activeSession && has(this.activeSession) ? this.activeSession : sessions[0]?.id ?? '';
+    const wanted = listOnly
+      ? ''
+      : id && has(id)
+        ? id
+        : this.activeSession && has(this.activeSession) ? this.activeSession : sessions[0]?.id ?? '';
     // 面板选中的会话就是「正在用的」：清理时跳过它，避免刚调好参数就被删。
     this.activeSession = wanted || null;
     const session = wanted ? readSession(this.opts.dataDir, wanted) : null;
@@ -1712,6 +1717,8 @@ export class RvcWorld implements World {
     const kind: LibraryKind = args.kind === 'cover' ? 'cover' : args.kind === 'clean' ? 'clean' : this.singKind();
     // source=bilibili 表示用户已经否掉了库里的相近版本，明确要去找原版。
     const source = args.source === 'bilibili' ? 'bilibili' : 'library';
+    // 用户在候选表里点了具体一条：按 BV 号直接下载，不再重新搜索、不再换一首。
+    const bvid = typeof args.bvid === 'string' && isBvid(args.bvid.trim()) ? args.bvid.trim() : '';
     const player = this.songPlayer;
     // 再点歌先停上一首与上一次自动翻唱；旧任务的结果不再抢播放条。
     this.singGeneration += 1;
@@ -1720,7 +1727,7 @@ export class RvcWorld implements World {
     if (this.autoSingBusy) await this.interruptAutoSing();
     if (!player) return { text: 'Nothing played: the local player is not ready.', failed: true };
 
-    if (source === 'library') {
+    if (!bvid && source === 'library') {
       const pick = pickSong(this.libraryDir, { song, kind });
       if ('entry' in pick) {
         const full = join(this.libraryDir, pick.entry.file);
@@ -1746,7 +1753,7 @@ export class RvcWorld implements World {
       if ('ambiguous' in pick) return { text: pick.ambiguous.message };
       // 没给歌名就只能说明；给了歌名继续走 B 站兜底。
       if (!song) return { text: pick.issue.message };
-    } else if (!song) {
+    } else if (!bvid && !song) {
       return { text: 'To look for the original on Bilibili, pass the song name in "song".' };
     }
     if (this.job?.phase === 'working') {
@@ -1755,21 +1762,30 @@ export class RvcWorld implements World {
     if (!this.biliReady()) {
       return { text: `I cannot make "${song}" automatically: the vocal-separation model is not installed. Ask the person to open the RVC panel and click "install" on the Service page.`, failed: true };
     }
-    const query = song.replace(/[《》「」『』]/g, '').trim();
-    let hits: SearchHit[];
-    try {
-      hits = await this.bili.search(query, 20);
-    } catch (err) {
-      return { text: `Bilibili search for "${query}" failed: ${err instanceof Error ? err.message : String(err)}. Try again later.`, failed: true };
+    const query = song.replace(/[《》「」『』]/g, '').trim() || bvid;
+    let decision: BiliPick;
+    if (bvid) {
+      decision = {
+        confident: true,
+        reason: 'ok',
+        candidates: [{ bvid, title: song || bvid, author: '', durationSec: 0, play: 0 }],
+      };
+    } else {
+      let hits: SearchHit[];
+      try {
+        hits = await this.bili.search(query, 20);
+      } catch (err) {
+        return { text: `Bilibili search for "${query}" failed: ${err instanceof Error ? err.message : String(err)}. Try again later.`, failed: true };
+      }
+      if (generation !== this.singGeneration) return { text: 'Cancelled: another song was requested.' };
+      decision = pickCandidates(hits, query, 6);
     }
-    if (generation !== this.singGeneration) return { text: 'Cancelled: another song was requested.' };
-    const decision = pickCandidates(hits, query, 6);
     if (!decision.candidates.length) {
       return { text: `Bilibili returned no results for "${query}". Try another song name later.` };
     }
     if (!decision.confident) {
       return {
-        text: `I could not pick a reliable Bilibili version for "${query}" (${decision.reason}). Ask the person which one to use:\n${candidateLines(decision.candidates)}`,
+        text: `I could not pick a reliable Bilibili version for "${query}" (${decision.reason}). Ask the person which one to use; list them, then call rvc_sing again with bvid set to the chosen BV id:\n${candidateLines(decision.candidates)}`,
       };
     }
     // 生成链路需要引擎：停着就先拉起并等就绪，最多 90 秒；拉不起来把原因直接回给模型。
@@ -1789,9 +1805,10 @@ export class RvcWorld implements World {
       rmSync(download.source, { force: true });
       return { text: 'Cancelled: another song was requested.' };
     }
-    this.startAutoSing(generation, query, kind, download.source, player);
+    this.startAutoSing(generation, download.title || query, kind, download.source, player);
+    const spoken = download.title || query;
     return {
-      text: `I haven't sung "${query}" before. I'm going to sing it now; it usually takes 2-5 minutes, and it will play on its own when it is ready. Say another song to cancel.`,
+      text: `I haven't sung "${spoken}" before. I'm going to sing it now; it usually takes 2-5 minutes, and it will play on its own when it is ready. Say another song to cancel.`,
     };
   }
 
@@ -1917,17 +1934,17 @@ export class RvcWorld implements World {
   /** 后台跑一次自动翻唱：下载候选 → 现有翻唱链路 → 入库 → 播放。失败只记说明，不抛给模型。 */
   private startAutoSing(
     generation: number,
-    query: string,
+    title: string,
     kind: LibraryKind,
     source: string,
     player: SongPlayer,
   ): void {
     this.autoSingBusy = true;
-    this.autoSingQuery = query;
+    this.autoSingQuery = title;
     const bgm = kind === 'cover';
     const task = (async () => {
       try {
-        const result = await this.coverFromPanel([`${safeSongName(query)}.m4a`, '', {
+        const result = await this.coverFromPanel([`${safeSongName(title)}.m4a`, '', {
           path: source,
           voice: '',
           pitch: 0,
@@ -1940,23 +1957,23 @@ export class RvcWorld implements World {
           withBgm: bgm,
           // 配置里关掉「默认入库」时仍照常播放，只是不写翻唱库。
           toLibrary: this.saveToLibraryByDefault(),
-          title: query,
+          title,
         }]) as { library?: { file: string; title: string }; libraryError?: string; savedPath?: string };
         if (generation !== this.singGeneration) return;
         const target = result.library?.file ? join(this.libraryDir, result.library.file) : result.savedPath;
         if (!target) {
           this.log?.warn('桌宠点歌：生成完成但没有可播放文件', {
-            query, err: result.libraryError || 'no saved output',
+            title, err: result.libraryError || 'no saved output',
           });
           return;
         }
-        const title = result.library?.title ?? query;
-        const id = this.beginPlayback(title, kind, true);
+        const playTitle = result.library?.title ?? title;
+        const id = this.beginPlayback(playTitle, kind, true);
         try {
           const { durationSec } = await player.playFile(target, { onEnded: () => this.finishPlayback(id) });
           this.updatePlaybackDuration(id, durationSec);
           this.log?.info('桌宠点歌：自动翻唱后播放', {
-            title, seconds: durationSec, savedToLibrary: !!result.library,
+            title: playTitle, seconds: durationSec, savedToLibrary: !!result.library,
           });
         } catch (err) {
           this.finishPlayback(id, 'failed to start');
@@ -1968,7 +1985,7 @@ export class RvcWorld implements World {
     })();
     void task.catch((err: unknown) => {
       if (generation === this.singGeneration) {
-        this.log?.warn('桌宠点歌：自动翻唱失败', { query, err: err instanceof Error ? err.message : String(err) });
+        this.log?.warn('桌宠点歌：自动翻唱失败', { title, err: err instanceof Error ? err.message : String(err) });
       }
     }).finally(() => {
       if (generation !== this.singGeneration) return;
@@ -2082,7 +2099,7 @@ export class RvcWorld implements World {
     if (method === 'segmentMute' || method === 'segmentCut' || method === 'segmentMerge') {
       return this.segmentEdit(method, args);
     }
-    if (method === 'refineState') return this.refineState(String(args[0] ?? ''));
+    if (method === 'refineState') return this.refineState(String(args[0] ?? ''), args[1] === 'list');
     if (method === 'refinePeaks') return this.peaksFromPanel(String(args[0] ?? ''));
     if (method === 'exportF0') return this.f0FromPanel(String(args[0] ?? ''));
     if (method === 'refinePitch') return this.pitchFromPanel(String(args[0] ?? ''));
@@ -2528,7 +2545,7 @@ const MAX_BILI_BYTES = 200 * 1024 * 1024;
 function candidateLines(candidates: SearchHit[]): string {
   if (!candidates.length) return '(no candidates)';
   return candidates.slice(0, 6).map((hit, at) =>
-    `${at + 1}. ${hit.title} — ${hit.author || 'unknown'} · ${clock(hit.durationSec)}`).join('\n');
+    `${at + 1}. ${hit.title} — ${hit.author || 'unknown'} · ${clock(hit.durationSec)} · ${hit.bvid}`).join('\n');
 }
 
 /** 面板回传的候选：只收合法 BV 号，其余忽略。 */
