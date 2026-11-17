@@ -3309,6 +3309,25 @@ const voicesPanel: WebUiPanel = {
       msg.classList.remove('bad');
     }
 
+    /** 大索引不能一次 btoa：按 4 MB 分块传到临时文件，最后再改名为正式音色。 */
+    async function uploadVoiceFile(
+      file: File,
+      kind: 'pth' | 'index',
+      uploadId: string,
+      onProgress?: (done: number, total: number) => void,
+    ): Promise<void> {
+      if (!file.size) throw new Error(`${file.name} 是空文件`);
+      const chunkSize = 4 * 1024 * 1024;
+      const total = Math.max(1, Math.ceil(file.size / chunkSize));
+      for (let index = 0; index < total; index += 1) {
+        const slice = file.slice(index * chunkSize, (index + 1) * chunkSize);
+        const b64 = toBase64(new Uint8Array(await slice.arrayBuffer()));
+        const res = await ctx.invoke<{ error?: string }>('uploadVoiceChunk', [uploadId, kind, index, total, b64]);
+        if (res.error) throw new Error(res.error);
+        onProgress?.(index + 1, total);
+      }
+    }
+
     async function save(): Promise<void> {
       const name = fName.value.trim();
       const pth = fPth.files?.[0];
@@ -3326,16 +3345,26 @@ const voicesPanel: WebUiPanel = {
       msg.textContent = '';
       msg.classList.remove('bad');
       const busy = ui.busy(t.saveVoice, name);
+      const uploadId = typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
       try {
+        await uploadVoiceFile(pth, 'pth', uploadId, (done, total) => {
+          msg.textContent = `${pth.name} ${Math.round((done / total) * 100)}%`;
+        });
         const index = fIndex.files?.[0];
-        const pthB64 = toBase64(new Uint8Array(await pth.arrayBuffer()));
-        const indexB64 = index ? toBase64(new Uint8Array(await index.arrayBuffer())) : '';
-        const res = await ctx.invoke<ImportResp>('addVoice', [name, pth.name, pthB64, index?.name ?? '', indexB64]);
+        if (index) {
+          await uploadVoiceFile(index, 'index', uploadId, (done, total) => {
+            msg.textContent = `${index.name} ${Math.round((done / total) * 100)}%`;
+          });
+        }
+        const res = await ctx.invoke<ImportResp>('finishVoice', [name, uploadId, index ? uploadId : '']);
         if (res.error) throw new Error(res.error);
         ui.toast(t.importOk(res.name ?? name));
         closeForm();
         await load();
       } catch (err) {
+        await ctx.invoke('cancelVoiceUpload', [uploadId]).catch(() => undefined);
         msg.textContent = errText(err);
         msg.classList.add('bad');
       } finally {

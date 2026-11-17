@@ -249,6 +249,34 @@ describe('World 面板数据面', () => {
     expect(((await invoke('state')) as { defaultVoice: string }).defaultVoice).toBe('');
   });
 
+  it('分块上传大文件后安装音色，临时文件会清理', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const pthData = pth();
+    const idxData = idx();
+    const uploadId = 'test-upload-1234';
+    const half = Math.ceil(pthData.length / 2);
+    const chunks: Array<['pth' | 'index', number, number, Buffer]> = [
+      ['pth', 0, 2, pthData.subarray(0, half)],
+      ['pth', 1, 2, pthData.subarray(half)],
+      ['index', 0, 1, idxData],
+    ];
+    for (const [kind, index, total, data] of chunks) {
+      const res = (await invoke('uploadVoiceChunk', [uploadId, kind, index, total, data.toString('base64')])) as { error?: string };
+      expect(res.error).toBeUndefined();
+    }
+    const done = (await invoke('finishVoice', ['Chunk Voice', uploadId, uploadId])) as {
+      name: string;
+      voices: Array<{ name: string; index: number | null }>;
+    };
+    expect(done.name).toBe('Chunk Voice');
+    expect(done.voices[0]?.name).toBe('Chunk Voice');
+    expect(done.voices[0]?.index).toBe(idxData.length);
+    expect(existsSync(join(dataDir, 'voices', 'Chunk Voice.pth'))).toBe(true);
+    expect(existsSync(join(dataDir, 'voices', 'Chunk Voice.index'))).toBe(true);
+    expect(existsSync(join(dataDir, 'voices', `.upload-${uploadId}-pth`))).toBe(false);
+    expect(existsSync(join(dataDir, 'voices', `.upload-${uploadId}-index`))).toBe(false);
+  });
+
   it('导入 .pth 后出现在列表里，并成为默认音色', async () => {
     const { invoke } = await makeWorld();
     const res = (await invoke('import', ['my.pth', pth().toString('base64')])) as { name: string; voices: Array<{ name: string }> };

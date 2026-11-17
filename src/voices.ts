@@ -5,7 +5,7 @@
  * 与大小下限，挡住改错扩展名、下了一半的文件；真正的权重结构由推理时 `torch.load` 判定。
  */
 import { basename, join } from 'node:path';
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 
 export interface VoiceInfo {
   /** `.pth` 文件名去掉扩展名。 */
@@ -93,6 +93,32 @@ export function deleteVoice(dir: string, name: string): { name: string; removed:
   return { name: base, removed };
 }
 
+/**
+ * 从已写入磁盘的上传文件安装音色：校验文件头与大小后改名到 `<name>.pth` / `<name>.index`。
+ * 适合大索引（几百 MB）走分块上传，避免把整个文件塞进一个 base64 字符串。
+ */
+export function installVoiceFiles(
+  dir: string,
+  name: string,
+  pthPath: string,
+  indexPath?: string | null,
+): { name: string; bytes: number; index: number | null } {
+  const base = voiceBaseName(name);
+  validatePthFile(pthPath);
+  if (indexPath) validateIndexFile(indexPath);
+  mkdirSync(dir, { recursive: true });
+  const targetPth = join(dir, `${base}.pth`);
+  const targetIndex = join(dir, `${base}.index`);
+  renameSync(pthPath, targetPth);
+  if (indexPath) renameSync(indexPath, targetIndex);
+  else rmSync(targetIndex, { force: true });
+  return {
+    name: base,
+    bytes: statSync(targetPth).size,
+    index: indexPath ? statSync(targetIndex).size : null,
+  };
+}
+
 /** 音色名规范化：去路径、去 `.pth`/`.index` 扩展名、限长。 */
 export function voiceBaseName(name: string): string {
   const base = safeName(name).replace(/\.(pth|index)$/i, '').trim();
@@ -109,6 +135,29 @@ function validatePth(data: Buffer): void {
 function validateIndex(data: Buffer): void {
   if (data.length < INDEX_MIN_BYTES) throw new Error(`.index 只有 ${data.length} 字节，不像是 faiss 索引`);
   if (!looksLikeFaissIndex(data)) throw new Error('.index 文件头不是 faiss 索引');
+}
+
+function headOf(path: string): Buffer {
+  const fd = openSync(path, 'r');
+  try {
+    const head = Buffer.alloc(4);
+    readSync(fd, head, 0, 4, 0);
+    return head;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function validatePthFile(path: string): void {
+  const bytes = statSync(path).size;
+  if (bytes < PTH_MIN_BYTES) throw new Error(`.pth 只有 ${bytes} 字节，不像是训练好的权重`);
+  if (!looksLikePth(headOf(path))) throw new Error('.pth 文件头不是 torch 存档（应为 zip 或 pickle）');
+}
+
+function validateIndexFile(path: string): void {
+  const bytes = statSync(path).size;
+  if (bytes < INDEX_MIN_BYTES) throw new Error(`.index 只有 ${bytes} 字节，不像是 faiss 索引`);
+  if (!looksLikeFaissIndex(headOf(path))) throw new Error('.index 文件头不是 faiss 索引');
 }
 
 /** 去掉路径、禁止隐藏文件与超长名字；保留中文。 */

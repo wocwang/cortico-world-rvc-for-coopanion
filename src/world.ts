@@ -8,7 +8,7 @@
  * 工具 `rvc_sing` 给桌宠 / 对话页点歌：从翻唱库按歌名或随机挑一首，写进本机声卡后回执；
  * 默认清唱，只有用户明确要翻唱 / 带伴奏才用翻唱版。
  */
-import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { basename, dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +22,7 @@ import { FileSetJob, hasFile, RvcInstaller } from './install.ts';
 import { readConvertJob, startConvertServer, type ConvertDeps, type ConvertJob, type ConvertServerHandle } from './server.ts';
 import { RvcVenv } from './venv.ts';
 import { RuntimeInstall, installedTiers } from './runtime.ts';
-import { importVoiceFile, importVoicePair, listVoices, voiceBaseName, deleteVoice as removeVoiceFile } from './voices.ts';
+import { importVoiceFile, importVoicePair, installVoiceFiles, listVoices, voiceBaseName, deleteVoice as removeVoiceFile } from './voices.ts';
 import { createSession, defaultSegments, dirBytes, gcSessions, listSessions, readSession, removeSession, sessionDir, sessionsRoot, writeSession, type RefineSession } from './session.ts';
 import { analyzePitch, parseF0Csv } from './pitch.ts';
 import {
@@ -2120,7 +2120,83 @@ export class RvcWorld implements World {
     }
     if (method === 'addVoice') return this.addVoice(args);
     if (method === 'deleteVoice') return this.removeVoice(args);
+    if (method === 'uploadVoiceChunk') return this.uploadVoiceChunk(args);
+    if (method === 'finishVoice') return this.finishVoice(args);
+    if (method === 'cancelVoiceUpload') return this.cancelVoiceUpload(args);
     return { error: `unknown method: ${panel}.${method}` };
+  }
+
+  /** 大文件分块上传的临时路径；放在 voices 目录里，装完后可同盘 rename。 */
+  private uploadPath(id: string, kind: 'pth' | 'index'): string {
+    const safe = /^[a-z0-9-]{8,64}$/i.test(id) ? id : '';
+    if (!safe) throw new RvcError('param', '上传编号不合法');
+    return join(this.voicesDir, `.upload-${safe}-${kind}`);
+  }
+
+  /** 音色文件分块上传：每块 base64，index=0 时覆盖旧临时文件，之后追加。 */
+  private uploadVoiceChunk(args: unknown[]): Record<string, unknown> {
+    const id = String(args[0] ?? '');
+    const kind = args[1];
+    const index = Number(args[2]);
+    const total = Number(args[3]);
+    const b64 = typeof args[4] === 'string' ? args[4] : '';
+    if (kind !== 'pth' && kind !== 'index') return { error: '文件类型不合法' };
+    if (!Number.isInteger(index) || !Number.isInteger(total) || total < 1 || total > 4096 || index < 0 || index >= total) {
+      return { error: '分块参数不合法' };
+    }
+    if (!b64) return { error: '分块内容为空' };
+    try {
+      const path = this.uploadPath(id, kind);
+      if (index > 0 && !existsSync(path)) return { error: '分块顺序断了，请重新选择文件' };
+      const buf = Buffer.from(b64, 'base64');
+      if (buf.length > 8 * 1024 * 1024) return { error: '单个分块太大' };
+      mkdirSync(this.voicesDir, { recursive: true });
+      if (index === 0) writeFileSync(path, buf);
+      else appendFileSync(path, buf);
+      return { received: index + 1, total };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /** 分块传完后安装音色；校验头与大小后改名为 `<name>.pth` / `<name>.index`。 */
+  private finishVoice(args: unknown[]): Record<string, unknown> {
+    const name = typeof args[0] === 'string' ? args[0].trim() : '';
+    const pthId = String(args[1] ?? '');
+    const idxId = args[2] ? String(args[2]) : '';
+    if (!name) return { error: '请填写音色名称' };
+    let pthPath = '';
+    let idxPath: string | null = null;
+    try {
+      pthPath = this.uploadPath(pthId, 'pth');
+      idxPath = idxId ? this.uploadPath(idxId, 'index') : null;
+      if (!existsSync(pthPath)) return { error: '没有收到 .pth 文件，请重新选择文件' };
+      if (idxPath && !existsSync(idxPath)) return { error: '没有收到 .index 文件，请重新选择文件' };
+      const base = voiceBaseName(name);
+      if (listVoices(this.voicesDir).some((voice) => voice.name.toLowerCase() === base.toLowerCase())) {
+        return { error: `音色 ${base} 已存在；先删除再导入` };
+      }
+      const done = installVoiceFiles(this.voicesDir, base, pthPath, idxPath);
+      this.opts.cfg.voice = done.name;
+      this.log?.info('添加 RVC 音色', { name: done.name, bytes: done.bytes, index: done.index });
+      return { ...done, voices: listVoices(this.voicesDir) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      if (pthPath) rmSync(pthPath, { force: true });
+      if (idxPath) rmSync(idxPath, { force: true });
+    }
+  }
+
+  /** 取消分块上传：删掉两个临时文件。 */
+  private cancelVoiceUpload(args: unknown[]): Record<string, unknown> {
+    const id = String(args[0] ?? '');
+    try {
+      for (const kind of ['pth', 'index'] as const) rmSync(this.uploadPath(id, kind), { force: true });
+      return { ok: true };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /** 添加音色：`.pth` 必填、`.index` 可选；按音色名统一命名，保证两者同名配对。 */
