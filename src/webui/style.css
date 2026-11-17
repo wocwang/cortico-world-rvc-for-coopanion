@@ -12,7 +12,38 @@
 .rvc-grid .field, .rvc-grid input, .rvc-grid select { width: 100%; }
 .rvc-slider { display: flex; align-items: center; gap: .5em; }
 .rvc-slider input { flex: 1; }
-.rvc-slider input[type="range"] { accent-color: var(--accent, #4a9eff); }
+/* 滑杆：自己画轨道与滑块，填充比例走 --rvc-fill。
+   原生 accent-color 在 100% 时滑块右侧仍会露出一小截灰色轨道，看起来没顶满；
+   自绘轨道可以让填充一直铺到最右端。 */
+.rvc-slider input[type="range"] {
+  --rvc-fill: 0%;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 18px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  cursor: pointer;
+}
+.rvc-slider input[type="range"]::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 999px;
+  background: linear-gradient(to right,
+    var(--accent, #4a9eff) 0 var(--rvc-fill),
+    var(--bg-2, rgba(127, 127, 127, .25)) var(--rvc-fill) 100%);
+}
+.rvc-slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -5px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent, #4a9eff);
+}
 .rvc-slider-value { min-width: 2.2em; text-align: right; font-size: .85em; opacity: .7; }
 .rvc-log { max-height: 12em; overflow: auto; font-size: .8em; opacity: .8; white-space: pre-wrap; }
 .rvc-audio { width: 100%; margin: .6em 0; }

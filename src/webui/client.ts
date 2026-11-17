@@ -341,6 +341,18 @@ function fillSelect(ui: WebUi, select: HTMLSelectElement, items: Array<{ value: 
   if (items.some((o) => o.value === keep)) select.value = keep;
 }
 
+/**
+ * 自定义滑杆轨道：把已填充比例写成 CSS 变量。
+ * 原生 accent-color 在 100% 时滑块右侧还会留一截灰色轨道，看起来「没顶满」；
+ * 自己画轨道就能让填充一直铺到右端。
+ */
+function syncSliderFill(input: HTMLInputElement): void {
+  const min = Number(input.min) || 0;
+  const max = Number(input.max) || 100;
+  const value = Math.max(min, Math.min(max, Number(input.value) || 0));
+  input.style.setProperty('--rvc-fill', `${max > min ? ((value - min) / (max - min)) * 100 : 0}%`);
+}
+
 // ---------------------------------------------------------------------------
 // 服务
 // ---------------------------------------------------------------------------
@@ -382,11 +394,13 @@ const servicePanel: WebUiPanel = {
     volumeInput.step = '1';
     const volumeReadout = ui.h('span', 'rvc-slider-value', '100');
     volumeWrap.append(volumeInput, volumeReadout);
+    syncSliderFill(volumeInput);
     const volumeField = ui.field(t.rowVolume, volumeWrap);
     sheet.append(volumeField);
     let volumeTimer: number | undefined;
     volumeInput.addEventListener('input', () => {
       volumeReadout.textContent = volumeInput.value;
+      syncSliderFill(volumeInput);
       if (volumeTimer) window.clearTimeout(volumeTimer);
       volumeTimer = window.setTimeout(() => {
         volumeTimer = undefined;
@@ -533,6 +547,7 @@ const servicePanel: WebUiPanel = {
       if (s.volume != null && document.activeElement !== volumeInput) {
         volumeInput.value = String(s.volume);
         volumeReadout.textContent = String(s.volume);
+        syncSliderFill(volumeInput);
       }
       const busy = s.venv.phase === 'working' || s.install.phase === 'working';
       // 引擎
@@ -1245,7 +1260,10 @@ const coverPanel: WebUiPanel = {
       const readout = ui.h('span', 'rvc-slider-value');
       const wrap = ui.h('div', 'rvc-slider');
       wrap.append(input, readout);
-      const update = (): void => { readout.textContent = String(Number(input.value)); };
+      const update = (): void => {
+        readout.textContent = String(Number(input.value));
+        syncSliderFill(input);
+      };
       input.addEventListener('input', update);
       update();
       return { input, field: ui.field(label, wrap), update };
