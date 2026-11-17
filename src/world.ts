@@ -1719,6 +1719,11 @@ export class RvcWorld implements World {
     const source = args.source === 'bilibili' ? 'bilibili' : 'library';
     // 用户在候选表里点了具体一条：按 BV 号直接下载，不再重新搜索、不再换一首。
     const bvid = typeof args.bvid === 'string' && isBvid(args.bvid.trim()) ? args.bvid.trim() : '';
+    // 模型自己定的曲名（看过候选、或用户明确说了怎么叫）：优先于视频标题的自动清洗。
+    // 不传就沿用自动清洗结果，所以这里只在模型主动给名字时生效。
+    const wantedTitle = typeof args.title === 'string'
+      ? args.title.replace(/\s+/g, ' ').trim().slice(0, 80).trim()
+      : '';
     const player = this.songPlayer;
     // 再点歌先停上一首与上一次自动翻唱；旧任务的结果不再抢播放条。
     this.singGeneration += 1;
@@ -1805,8 +1810,9 @@ export class RvcWorld implements World {
       rmSync(download.source, { force: true });
       return { text: 'Cancelled: another song was requested.' };
     }
-    this.startAutoSing(generation, download.title || query, kind, download.source, player);
-    const spoken = download.title || query;
+    const displayTitle = wantedTitle || download.title || query;
+    this.startAutoSing(generation, displayTitle, kind, download.source, player);
+    const spoken = displayTitle;
     return {
       text: `I haven't sung "${spoken}" before. I'm going to sing it now; it usually takes 2-5 minutes, and it will play on its own when it is ready. Say another song to cancel.`,
     };
