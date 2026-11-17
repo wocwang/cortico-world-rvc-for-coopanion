@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
 import type { Logger, ToolDef, ToolOutcome, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
-import { configGroups, DEFAULT_PORT, idleDelayMs, RVC_DEFAULTS, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
+import { clampVolume, configGroups, DEFAULT_PORT, idleDelayMs, RVC_DEFAULTS, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
 import { MELBAND_FILES, UVR_MODEL_FILE } from './catalog.ts';
 import { RvcEngine, RvcError, type ConvertDone, type EngineState } from './engine.ts';
 import { FileSetJob, hasFile, RvcInstaller } from './install.ts';
@@ -220,6 +220,8 @@ export class RvcWorld implements World {
   } | null = null;
   /** 播放代次：stop / 新歌会自增，旧的 onEnded 回调不再改状态。 */
   private playbackId = 0;
+  /** 当前播放音量 0..100；配置默认值，桌宠/面板调了立即生效。 */
+  private volume = 100;
   /** 宿主事件：播完 / 开始播放时告诉模型，不靠猜。 */
   private host: WorldHost | null = null;
 
@@ -227,6 +229,7 @@ export class RvcWorld implements World {
     this.opts = opts;
     this.libraryDir = opts.libraryDir ?? defaultLibraryDir(opts.dataDir);
     this.bili = opts.bili ?? defaultBiliClient;
+    this.volume = clampVolume(opts.cfg.volume);
   }
 
   envPromptVars(): Record<string, string> | null {
@@ -256,16 +259,19 @@ export class RvcWorld implements World {
       'rvc.defaultKind': defaultKind,
       'rvc.mouth': mouth,
       'rvc.playback': this.playbackStatus(),
+      'rvc.volume': `${this.volume}%`,
     };
   }
 
   tools(): ToolDef[] {
-    const [sing, find, status, stop] = RVC_TOOL_DECLS;
+    const [sing, find, status, stop, start, volume] = RVC_TOOL_DECLS;
     return [
       { ...sing!, handler: (args) => this.rvcSing(args) },
       { ...find!, handler: async (args) => this.findLibrarySongs(args) },
       { ...status!, handler: async () => this.playbackState() },
       { ...stop!, handler: () => this.stopSinging() },
+      { ...start!, handler: () => this.startEngineForTool() },
+      { ...volume!, handler: async (args) => this.setVolumeTool(args) },
     ];
   }
 
@@ -300,6 +306,7 @@ export class RvcWorld implements World {
           { name: 'rvc.defaultKind', description: '配置里的桌宠点歌默认类型（清唱 / 翻唱）。' },
           { name: 'rvc.mouth', description: '唱歌时是否用 pet_say 带动嘴型（读配置里的「唱歌时让嘴型动起来」）。' },
           { name: 'rvc.playback', description: '当前播放状态：正在播 / 正在后台准备 / 没在播。' },
+          { name: 'rvc.volume', description: '当前播放音量（0–100%）；rvc_volume 改的就是它。' },
         ],
       }],
       // 配置组交给框架自带的配置视图，不各占一个面板。
@@ -313,6 +320,7 @@ export class RvcWorld implements World {
     this.songPlayer = this.opts.createSongPlayer
       ? this.opts.createSongPlayer(host.log)
       : new FfplayPlayer(host.log);
+    this.songPlayer.setVolume(this.volume);
     this.stopped = false;
     // 「随软件自动启动」只决定启动时是否预热；桌宠 / 面板 / 9881 的按需请求仍会拉起。
     // 只有用户在服务页点「停止引擎」才记成 engineHeld，之后不自动覆盖这个意图。
@@ -1820,19 +1828,64 @@ export class RvcWorld implements World {
 
   /** 当前播放 / 准备状态；模型不用靠猜。 */
   private playbackState(): ToolOutcome {
+    const engine = this.engine?.state();
+    const engineText = engine?.phase === 'ready'
+      ? 'ready'
+      : engine?.phase === 'starting'
+        ? 'starting'
+        : engine?.phase === 'error'
+          ? `error: ${engine.detail || this.launchDetail || 'unknown'}`
+          : 'stopped';
+    const suffix = ` Engine: ${engineText}. Volume: ${this.volume}%.`;
     const current = this.playback;
     if (current) {
       const elapsed = Math.max(0, Math.floor((Date.now() - current.startedAt) / 1000));
       const label = current.kind === 'clean' ? 'clean vocal' : 'cover';
       const total = current.durationSec > 0 ? ` of ${clock(current.durationSec)}` : '';
       return {
-        text: `Playing "${current.title}" (${label}), ${clock(elapsed)}${total} elapsed. Call rvc_stop to stop it.`,
+        text: `Playing "${current.title}" (${label}), ${clock(elapsed)}${total} elapsed. Call rvc_stop to stop it.${suffix}`,
       };
     }
     if (this.autoSingBusy) {
-      return { text: `Preparing "${this.autoSingQuery || 'a song'}" in the background; nothing is playing yet.` };
+      return { text: `Preparing "${this.autoSingQuery || 'a song'}" in the background; nothing is playing yet.${suffix}` };
     }
-    return { text: 'Nothing is playing right now.' };
+    return { text: `Nothing is playing right now.${suffix}` };
+  }
+
+  /** 桌宠点名的「启动 RVC」：清掉手动停止的印记，拉起引擎并等到就绪。 */
+  private async startEngineForTool(): Promise<ToolOutcome> {
+    if (this.stopped) return { text: 'RVC is not mounted right now.', failed: true };
+    if (this.engine?.ready()) return { text: `RVC is already running. Volume is ${this.volume}%.` };
+    this.engineHeld = false;
+    this.idleStopped = false;
+    this.launchDetail = '';
+    if (!this.engine) this.setup();
+    const ready = await this.ensureReadyForTool(90_000);
+    if (ready.ok) return { text: `RVC is ready. Volume is ${this.volume}%.` };
+    return {
+      text: `RVC did not start: ${ready.reason}. Ask the person to check the Service page in the RVC panel.`,
+      failed: true,
+    };
+  }
+
+  /** 桌宠调音量：level 绝对值优先，其次 delta 相对当前值；都不传就报当前音量。 */
+  private setVolumeTool(args: Record<string, unknown>): ToolOutcome {
+    const level = typeof args.level === 'number' ? args.level : Number.NaN;
+    const delta = typeof args.delta === 'number' ? args.delta : Number.NaN;
+    if (!Number.isFinite(level) && !Number.isFinite(delta)) {
+      return { text: `Volume is ${this.volume}%.` };
+    }
+    const next = this.applyVolume(Number.isFinite(level) ? level : this.volume + delta);
+    return { text: `Volume set to ${next}%.` };
+  }
+
+  /** 面板/桌宠共用：写回配置的活引用，并让正在播的歌立即换音量。 */
+  private applyVolume(value: number): number {
+    const next = clampVolume(value);
+    this.volume = next;
+    this.opts.cfg.volume = next;
+    this.songPlayer?.setVolume(next);
+    return next;
   }
 
   /** 停止当前播放，并取消还在后台准备的翻唱。 */
@@ -1991,12 +2044,13 @@ export class RvcWorld implements World {
   private jobResult: { mime: string; base64: string; savedPath: string | null; ms: number } | null = null;
 
   private async invoke(panel: string, method: string, args: unknown[] = []): Promise<unknown> {
-    if (method === 'state' || method === 'install' || method === 'cancel' || method === 'restart' || method === 'start' || method === 'stop' || method === 'takeResult') {
+    if (method === 'state' || method === 'install' || method === 'cancel' || method === 'restart' || method === 'start' || method === 'stop' || method === 'takeResult' || method === 'setVolume') {
       if (method === 'install') this.startSetup();
       else if (method === 'cancel') { this.runtime?.cancel(); this.installer?.cancel(); this.venv?.cancel(); }
       else if (method === 'restart') void this.restartEngine();
       else if (method === 'start') this.startEngine();
       else if (method === 'stop') await this.stopEngine();
+      else if (method === 'setVolume') this.applyVolume(Number(args[0]));
       else if (method === 'takeResult') {
         const result = this.jobResult;
         this.jobResult = null;
@@ -2221,6 +2275,7 @@ export class RvcWorld implements World {
       install: this.installer?.state() ?? { phase: 'absent', done: 0, total: 0, detail: 'World 未启动' },
       voiceCount: voices.length,
       defaultVoice: this.defaultVoice(voices),
+      volume: this.volume,
       defaults: {
         singKind: this.singKind(),
         panelKind: this.panelKind(),

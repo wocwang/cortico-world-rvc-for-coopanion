@@ -31,6 +31,8 @@ export interface RvcConfigSection {
   keepSource: boolean;
   /** 唱歌时用一句短哼带动桌宠嘴型；关掉后不再为嘴型额外调 pet_say。 */
   mouthAnimation: boolean;
+  /** 桌宠唱歌 / 自动播放的音量，0..100；调了会对正在播放的歌立即生效。 */
+  volume: number;
   /** 翻唱会话保留天数；0 表示不按时间清理。 */
   sessionDays: number;
   /** 翻唱会话总容量上限（GB）；0 表示不按容量清理。 */
@@ -88,6 +90,14 @@ export const PITCH_MIN = -24;
 export const PITCH_MAX = 24;
 export const PROTECT_MAX = 0.5;
 export const DEFAULT_PORT = 9881;
+export const VOLUME_MIN = 0;
+export const VOLUME_MAX = 100;
+
+/** 播放音量归一到 0..100 的整数；非法值按 100 处理。 */
+export function clampVolume(value: unknown): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(VOLUME_MAX, Math.max(VOLUME_MIN, Math.round(number))) : 100;
+}
 
 /** 闲置分钟转毫秒：支持小数（0.5 = 30 秒），0 / 非法值表示不回收。 */
 export function idleDelayMs(minutes: unknown): number {
@@ -108,6 +118,7 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   saveToLibrary: true,
   keepSource: true,
   mouthAnimation: true,
+  volume: 100,
   sessionDays: 7,
   sessionMaxGb: 8,
   libraryMaxGb: 2,
@@ -149,6 +160,7 @@ const TEXT = {
     saveToLibrary: { title: '完成后默认保存到翻唱库', description: '翻唱页「完成后保存到翻唱库」的初始勾选；桌宠自动生成也按它决定是否入库。关闭后桌宠仍会播放生成结果，只是不入库。' },
     keepSource: { title: '默认保存原声副本', description: '翻唱页「保存原声副本」的初始勾选；保存后可以在「最近翻唱」里原地重跑，不必重新选文件。' },
     mouthAnimation: { title: '唱歌时让嘴型动起来', description: '开启后，提示模型在开唱后用一句短哼（如「♪～」）带动桌宠的 pet_say 气泡，嘴型会跟着动；唱完或切歌后气泡结束、嘴自然闭上。关闭后不再为嘴型额外调 pet_say。桌面宠物的嘴只跟气泡走，所以这是插件侧能做到的动画，不是逐字音频口型。' },
+    volume: { title: '播放音量', description: '桌宠唱歌和自动播放的音量，0–100，默认 100。调了会对正在播放的歌立即生效：播放器会在原位置重开一下（约 0.2–0.5 秒），之后的新歌也用这个音量。面板服务页也能直接调。' },
     kindClean: '清唱（只留人声）',
     kindCover: '翻唱（带伴奏）',
     sessionDays: { title: '会话保留天数', description: '超过这么多天的翻唱会话会被清理；0 表示不按时间清理（仍受容量上限约束）。' },
@@ -185,6 +197,7 @@ const TEXT = {
     saveToLibrary: { title: 'Save finished covers to the library by default', description: 'Starting state of the "save to cover library" checkbox and whether pet auto generation is saved. When off, the pet still plays the generated result, it just is not added to the library.' },
     keepSource: { title: 'Keep the source audio by default', description: 'Starting state of the "keep source copy" checkbox; keeping it lets you rerun a cover in place from Recent covers without picking the file again.' },
     mouthAnimation: { title: 'Move the mouth while singing', description: 'On tells the model to start a short hum (for example "♪～") through a pet_say bubble when a song begins, so the pet mouth moves; after the song ends or switches, the bubble ends and the mouth closes. Off stops the extra pet_say call used only for mouth movement. The desktop pet mouth follows bubbles only, so this is plugin-side motion, not per-word audio lip sync.' },
+    volume: { title: 'Playback volume', description: 'Volume for pet singing and auto-play, 0-100, default 100. Changes apply to the current song immediately by restarting it at the same position (about 0.2-0.5 s); later songs use the new volume. The Service page has the same control.' },
     kindClean: 'Clean vocals (no backing track)',
     kindCover: 'Cover (with backing track)',
     sessionDays: { title: 'Session retention (days)', description: 'Cover sessions older than this are cleaned up; 0 disables the age rule (the size cap still applies).' },
@@ -243,6 +256,7 @@ export function configGroups(language: Language): ConfigGroup[] {
           [`${K}.saveToLibrary`]: { type: 'boolean', title: t.saveToLibrary.title, description: t.saveToLibrary.description, 'x-hot': true },
           [`${K}.keepSource`]: { type: 'boolean', title: t.keepSource.title, description: t.keepSource.description, 'x-hot': true },
           [`${K}.mouthAnimation`]: { type: 'boolean', title: t.mouthAnimation.title, description: t.mouthAnimation.description, 'x-hot': true },
+          [`${K}.volume`]: { type: 'number', title: t.volume.title, description: t.volume.description, minimum: VOLUME_MIN, maximum: VOLUME_MAX, multipleOf: 1, 'x-hot': true },
         },
       },
     },

@@ -31,6 +31,14 @@ const DESCRIBE: WorldDescribe = {
       zh: '停止当前播放，并取消还在后台准备的翻唱。',
       en: 'Stop current playback and cancel a cover still being prepared.',
     },
+    rvc_start: {
+      zh: '启动本机 RVC 引擎并等到就绪；冷启动可能要几十秒。',
+      en: 'Start the local RVC engine and wait until ready; a cold start can take tens of seconds.',
+    },
+    rvc_volume: {
+      zh: '调整或读取播放音量 0–100；正在播放的歌会立即按新音量在原位置重开。',
+      en: 'Set or read playback volume 0-100; a playing song restarts at the same position with the new volume.',
+    },
   }),
   events: [{
     type: 'rvc.playback',

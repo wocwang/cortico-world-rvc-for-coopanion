@@ -58,6 +58,7 @@ interface FakePlayer extends SongPlayer {
   cuts: number;
   files: string[];
   closed: number;
+  volume: number;
   /** 模拟这一首自然播完：触发最近一次 playFile 的 onEnded。 */
   end(): void;
 }
@@ -74,6 +75,7 @@ function fakePlayer(): FakePlayer {
     cuts: 0,
     files: [],
     closed: 0,
+    volume: 100,
     stop() {
       state.cuts += 1;
       fire();
@@ -83,6 +85,7 @@ function fakePlayer(): FakePlayer {
       onEnded = hooks?.onEnded ?? null;
       return Promise.resolve({ durationSec: 12.5, info: {} as WavInfo });
     },
+    setVolume(volume: number) { state.volume = volume; },
     close() { state.closed += 1; },
     end: fire,
   };
@@ -835,6 +838,41 @@ describe('rvc_find / rvc_status / rvc_stop', () => {
     const { world } = await makeWorld();
     const out = await call(world, 'rvc_stop');
     expect(out.text).toBe('Nothing was playing.');
+  });
+});
+
+describe('rvc_start / rvc_volume', () => {
+  const call = async (world: RvcWorld, name: string, args: Record<string, unknown> = {}): Promise<ToolOutcome> => {
+    const tool = world.tools().find((item) => item.name === name);
+    expect(tool).toBeTruthy();
+    return await tool!.handler(args, {} as never) as ToolOutcome;
+  };
+
+  it('rvc_volume 支持绝对值、相对值，并立即写进播放器', async () => {
+    const player = fakePlayer();
+    const { world, invoke } = await makeWorld({}, () => player);
+    const absolute = await call(world, 'rvc_volume', { level: 60 });
+    expect(absolute.text).toContain('60%');
+    expect(player.volume).toBe(60);
+    expect(world.envPromptVars()!['rvc.volume']).toBe('60%');
+
+    const relative = await call(world, 'rvc_volume', { delta: 15 });
+    expect(relative.text).toContain('75%');
+    expect(player.volume).toBe(75);
+    const read = await call(world, 'rvc_volume');
+    expect(read.text).toContain('75%');
+
+    const state = (await invoke('state')) as { volume: number };
+    expect(state.volume).toBe(75);
+  });
+
+  it('rvc_start 在引擎起不来时如实回原因，并清掉手动停止的印记', async () => {
+    const { world, invoke } = await makeWorld({ autoStart: false });
+    await invoke('stop');
+    const out = await call(world, 'rvc_start');
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('did not start');
+    expect(out.text).not.toContain('stopped manually');
   });
 });
 

@@ -115,6 +115,29 @@ describe('WAV 头', () => {
 });
 
 describe('ffplay 播放器', () => {
+  it('默认带 -volume 100，改音量后新歌用新值', async () => {
+    const fake = fakeSpawn();
+    const player = new FfplayPlayer(log, { spawn: fake.spawn });
+    player.setVolume(60);
+    await player.playFile(file(wav({ seconds: 0.2 })));
+    expect(fake.calls[0]?.args).toEqual(expect.arrayContaining(['-volume', '60']));
+    player.close();
+  });
+
+  it('播放中改音量：杀掉旧进程并从当前位置按新音量重开', async () => {
+    const fake = fakeSpawn();
+    const player = new FfplayPlayer(log, { spawn: fake.spawn, startGraceMs: 0 });
+    await player.playFile(file(wav({ seconds: 10 })));
+    const first = fake.last();
+    player.setVolume(30);
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    expect(first.killed).toBe(1);
+    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls[1]?.args).toEqual(expect.arrayContaining(['-volume', '30']));
+    expect(fake.calls[1]?.args).toEqual(expect.arrayContaining(['-ss']));
+    player.close();
+  });
+
   it('用外部 ffplay 打开 WAV，停止时杀掉进程', async () => {
     const fake = fakeSpawn();
     const player = new FfplayPlayer(log, { spawn: fake.spawn });

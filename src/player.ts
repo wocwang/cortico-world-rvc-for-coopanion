@@ -14,6 +14,7 @@ import { closeSync, existsSync, mkdtempSync, openSync, readSync, rmSync, statSyn
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
+import { clampVolume } from './config.ts';
 import { parseWav, type WavInfo } from './wav.ts';
 
 const STREAM_NAME = 'cortico-world-rvc';
@@ -40,6 +41,8 @@ export interface SongPlayer {
     path: string,
     hooks?: { onEnded?: () => void },
   ): Promise<{ durationSec: number; info: WavInfo }>;
+  /** 调整音量 0..100；正在播放时会在原位置重开，立即生效。 */
+  setVolume(volume: number): void;
   /** 停播并释放资源。 */
   close(): void;
 }
@@ -98,6 +101,12 @@ export class FfplayPlayer implements SongPlayer {
   private tempDir: string | null = null;
   /** 当前这一首结束时通知 World；自然播完、stop()/close() 都会调用一次。 */
   private endHandler: (() => void) | null = null;
+  /** 播放音量 0..100；ffplay 启动参数，改音量时在原位置重开。 */
+  private volume = 100;
+  /** 音量滑杆连续变化时只重开一次。 */
+  private volumeTimer: NodeJS.Timeout | undefined;
+  /** 正在播的这首歌：路径、已播时长、起点与总时长，音量变化时据此恢复。 */
+  private current: { path: string; offsetSec: number; startedAt: number; durationSec: number } | null = null;
 
   constructor(
     private readonly log: Logger,
@@ -106,6 +115,11 @@ export class FfplayPlayer implements SongPlayer {
 
   stop(): void {
     this.generation += 1;
+    if (this.volumeTimer) {
+      clearTimeout(this.volumeTimer);
+      this.volumeTimer = undefined;
+    }
+    this.current = null;
     const child = this.child;
     this.child = null;
     if (child) {
@@ -121,6 +135,51 @@ export class FfplayPlayer implements SongPlayer {
 
   close(): void {
     this.stop();
+  }
+
+  /** 音量立即生效：正在播时在原位置重开一版（约 0.2–0.5 秒），不打断播放状态。 */
+  setVolume(volume: number): void {
+    const next = clampVolume(volume);
+    if (next === this.volume) return;
+    this.volume = next;
+    if (!this.current || !this.child) return;
+    if (this.volumeTimer) clearTimeout(this.volumeTimer);
+    this.volumeTimer = setTimeout(() => {
+      this.volumeTimer = undefined;
+      void this.restartAtCurrent();
+    }, 120);
+    this.volumeTimer.unref?.();
+  }
+
+  /** 把当前歌从已播位置重新拉起来，带上新音量；旧进程的 exit 不再上报结束。 */
+  private async restartAtCurrent(): Promise<void> {
+    const current = this.current;
+    if (!current || !this.child) return;
+    const elapsed = current.offsetSec + (Date.now() - current.startedAt) / 1000;
+    if (elapsed >= current.durationSec) return;
+    const old = this.child;
+    this.child = null;
+    try { old.kill(); } catch { /* 已经退出 */ }
+    const stderr = { text: '' };
+    let child: ChildProcess;
+    try {
+      child = await this.start(current.path, stderr, elapsed);
+    } catch (err) {
+      this.log.warn('RVC 播放音量调整失败', { err: err instanceof Error ? err.message : String(err) });
+      this.current = null;
+      const end = this.endHandler;
+      this.endHandler = null;
+      end?.();
+      return;
+    }
+    if (this.current !== current) {
+      try { child.kill(); } catch { /* 已经退出 */ }
+      return;
+    }
+    this.child = child;
+    current.offsetSec = elapsed;
+    current.startedAt = Date.now();
+    this.wireExit(child, stderr);
   }
 
   async playFile(
@@ -188,11 +247,19 @@ export class FfplayPlayer implements SongPlayer {
     this.child = child;
     this.tempDir = tempDir;
     this.endHandler = hooks.onEnded ?? null;
+    this.current = { path: playPath, offsetSec: 0, startedAt: Date.now(), durationSec: info.durationSec };
+    this.wireExit(child, stderr);
+    return { durationSec: info.durationSec, info };
+  }
+
+  /** 当前这一首的进程退出：清临时目录并通知 World；被新歌/重开顶掉的旧进程不再上报。 */
+  private wireExit(child: ChildProcess, stderr: { text: string }): void {
     child.once('exit', (code, signal) => {
       if (this.child !== child) return;
       this.child = null;
       const temp = this.tempDir;
       this.tempDir = null;
+      this.current = null;
       removeTemp(temp);
       if (code !== null && code !== 0) {
         this.log.warn('RVC 翻唱播放中断', { code, signal, err: tailOf(stderr.text) });
@@ -201,16 +268,22 @@ export class FfplayPlayer implements SongPlayer {
       this.endHandler = null;
       end?.();
     });
-    return { durationSec: info.durationSec, info };
   }
 
   /** 调起 ffplay 并等它确认启动；坏文件 / 没声卡会在观察窗口内直接报错。 */
-  private start(file: string, stderr: { text: string }): Promise<ChildProcess> {
+  private start(file: string, stderr: { text: string }, offsetSec = 0): Promise<ChildProcess> {
     const spawnFn: SpawnLike = this.opts.spawn ?? (spawn as SpawnLike);
     const bin = this.opts.ffplay ?? 'ffplay';
+    const args = [
+      '-hide_banner', '-loglevel', 'error', '-nodisp', '-autoexit',
+      '-volume', String(this.volume),
+    ];
+    // 音量变化时从已播位置重开；-ss 放在 -i 前是输入 seek，WAV 上很快。
+    if (offsetSec > 0) args.push('-ss', offsetSec.toFixed(3));
+    args.push('-i', file);
     const child = spawnFn(
       bin,
-      ['-hide_banner', '-loglevel', 'error', '-nodisp', '-autoexit', '-i', file],
+      args,
       { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] },
     );
     child.stderr?.on('data', (chunk: Buffer | string) => {

@@ -64,4 +64,32 @@ export const RVC_TOOL_DECLS: readonly ToolSpec[] = [{
   description: 'Stop the current RVC playback and cancel any cover that is still being prepared in the background. Use it when the person says stop singing, be quiet, or switch away. Returns whether something was playing or being prepared.',
   tags: ['act'],
   parameters: { type: 'object', additionalProperties: false, properties: {}, required: [] },
+}, {
+  name: 'rvc_start',
+  description: 'Start the local RVC engine and wait until it is ready. Use it when the person asks you to start or open RVC, warm it up, or get ready to sing. A cold start can take tens of seconds; say you are starting it before calling. Starting is idempotent: if the engine is already ready it returns immediately. If it fails, returns the reason so you can relay it instead of pretending.',
+  tags: ['act'],
+  parameters: { type: 'object', additionalProperties: false, properties: {}, required: [] },
+}, {
+  name: 'rvc_volume',
+  description: 'Set or read the RVC playback volume (0-100). Use it when the person asks to make the song louder or quieter, or gives a volume level. Changes apply to the current song immediately by restarting it at the same position (a brief gap of a few tenths of a second) and to later songs. Pass level for an absolute value, or delta for a relative change; pass neither to read the current volume.',
+  tags: ['act'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      level: {
+        type: 'integer',
+        minimum: 0,
+        maximum: 100,
+        description: 'Absolute volume 0-100. Takes priority over delta.',
+      },
+      delta: {
+        type: 'integer',
+        minimum: -100,
+        maximum: 100,
+        description: 'Relative change from the current volume, for example -20 for quieter or 15 for louder.',
+      },
+    },
+    required: [],
+  },
 }];

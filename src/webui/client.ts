@@ -217,6 +217,8 @@ interface PanelState {
   install: JobState;
   voiceCount: number;
   defaultVoice: string;
+  /** 当前播放音量 0–100；老版本 World 可能没有这个字段。 */
+  volume?: number;
   /** 配置里的初始值；老版本 World 可能没有这个字段。 */
   defaults?: {
     singKind: 'clean' | 'cover';
@@ -357,6 +359,34 @@ const servicePanel: WebUiPanel = {
     const voiceRow = row(sheet, ui, t.rowVoice);
     const apiRow = row(sheet, ui, t.rowApi);
 
+    // 播放音量：滑杆直接调 World，正在播的歌会在原位置按新音量重开。
+    const volumeWrap = ui.h('div', 'rvc-slider');
+    const volumeInput = ui.input({ value: '100' });
+    volumeInput.type = 'range';
+    volumeInput.min = '0';
+    volumeInput.max = '100';
+    volumeInput.step = '1';
+    const volumeReadout = ui.h('span', 'rvc-slider-value', '100');
+    volumeWrap.append(volumeInput, volumeReadout);
+    const volumeField = ui.field(t.rowVolume, volumeWrap);
+    sheet.append(volumeField);
+    let volumeTimer: number | undefined;
+    volumeInput.addEventListener('input', () => {
+      volumeReadout.textContent = volumeInput.value;
+      if (volumeTimer) window.clearTimeout(volumeTimer);
+      volumeTimer = window.setTimeout(() => {
+        volumeTimer = undefined;
+        void (async () => {
+          try {
+            render(await ctx.invoke<PanelState>('setVolume', [Number(volumeInput.value)]));
+          } catch (err) {
+            msg.textContent = errText(err);
+            msg.classList.add('bad');
+          }
+        })();
+      }, 150);
+    });
+
     // 高质量分离档：和默认模型一样有下载 / 取消 / 卸载与进度。
     let melArmed = false;
     const melbandDownload = ui.button(t.sepDownload, { size: 'sm', onClick: () => void call('downloadSeparator') });
@@ -486,6 +516,10 @@ const servicePanel: WebUiPanel = {
 
     function render(s: PanelState): void {
       state = s;
+      if (s.volume != null && document.activeElement !== volumeInput) {
+        volumeInput.value = String(s.volume);
+        volumeReadout.textContent = String(s.volume);
+      }
       const busy = s.venv.phase === 'working' || s.install.phase === 'working';
       // 引擎
       const running = s.phase === 'ready' || s.phase === 'starting';
