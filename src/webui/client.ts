@@ -265,6 +265,8 @@ interface VoicesResp {
 interface ImportResp {
   error?: string;
   name?: string;
+  voices?: VoiceRow[];
+  removed?: string[];
 }
 
 type Tone = 'on' | 'off' | 'warn' | 'bad';
@@ -3255,32 +3257,83 @@ const voicesPanel: WebUiPanel = {
     const msg = ui.msgline();
     let voices: VoiceRow[] = [];
     let defaultVoice = '';
+    let armedDelete = '';
 
     const sheet = ui.section(t.voicesTitle, t.voicesHint);
     const list = ui.h('div');
-    const importInput = ui.input({});
-    importInput.type = 'file';
-    importInput.accept = '.pth,.index';
-    const importBtn = ui.button(t.importFile, { variant: 'primary', size: 'sm', onClick: () => void doImport() });
+    const addBtn = ui.button(t.addVoice, { variant: 'primary', size: 'sm', onClick: () => openForm() });
     const refreshBtn = ui.button(t.voiceRefresh, { size: 'sm', onClick: () => void load() });
     const acts = ui.actions();
-    acts.append(importBtn, refreshBtn);
-    sheet.append(list, acts, ui.h('div', 'rvc-detail', t.voiceHint), importInput);
+    acts.append(addBtn, refreshBtn);
 
+    const form = ui.h('div');
+    form.hidden = true;
+    const fName = ui.input({ placeholder: t.voiceNamePh });
+    const fPth = ui.input({});
+    fPth.type = 'file';
+    fPth.accept = '.pth';
+    const fIndex = ui.input({});
+    fIndex.type = 'file';
+    fIndex.accept = '.index';
+    const saveBtn = ui.button(t.saveVoice, { variant: 'primary', size: 'sm', onClick: () => void save() });
+    const cancelBtn = ui.button(t.cancelAdd, { size: 'sm', onClick: () => closeForm() });
+    const formActs = ui.actions();
+    formActs.append(saveBtn, cancelBtn);
+    form.append(
+      ui.h('div', 'rvc-detail', t.voiceFormHint),
+      ui.field(t.voiceName, fName),
+      ui.field(t.pthFile, fPth),
+      ui.field(t.indexFile, fIndex),
+      formActs,
+    );
+
+    sheet.append(list, acts, ui.h('div', 'rvc-detail', t.voiceHint), form);
     ctx.root.append(sheet, msg);
 
-    async function doImport(): Promise<void> {
-      const file = importInput.files?.[0];
-      if (!file) { msg.textContent = t.importFile; msg.classList.add('bad'); return; }
+    function openForm(): void {
+      fName.value = '';
+      fPth.value = '';
+      fIndex.value = '';
+      form.hidden = false;
+      addBtn.hidden = true;
       msg.textContent = '';
       msg.classList.remove('bad');
-      const busy = ui.busy(t.importFile, file.name);
+    }
+
+    function closeForm(): void {
+      form.hidden = true;
+      addBtn.hidden = false;
+      fPth.value = '';
+      fIndex.value = '';
+      msg.textContent = '';
+      msg.classList.remove('bad');
+    }
+
+    async function save(): Promise<void> {
+      const name = fName.value.trim();
+      const pth = fPth.files?.[0];
+      if (!name || !pth) {
+        msg.textContent = t.voiceFormHint;
+        msg.classList.add('bad');
+        return;
+      }
+      const normalized = name.replace(/\.(pth|index)$/i, '').trim().toLowerCase();
+      if (voices.some((voice) => voice.name.toLowerCase() === normalized)) {
+        msg.textContent = t.voiceExists;
+        msg.classList.add('bad');
+        return;
+      }
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      const busy = ui.busy(t.saveVoice, name);
       try {
-        const base64 = toBase64(new Uint8Array(await file.arrayBuffer()));
-        const res = await ctx.invoke<ImportResp>('import', [file.name, base64]);
+        const index = fIndex.files?.[0];
+        const pthB64 = toBase64(new Uint8Array(await pth.arrayBuffer()));
+        const indexB64 = index ? toBase64(new Uint8Array(await index.arrayBuffer())) : '';
+        const res = await ctx.invoke<ImportResp>('addVoice', [name, pth.name, pthB64, index?.name ?? '', indexB64]);
         if (res.error) throw new Error(res.error);
-        ui.toast(t.importOk(res.name ?? file.name));
-        importInput.value = '';
+        ui.toast(t.importOk(res.name ?? name));
+        closeForm();
         await load();
       } catch (err) {
         msg.textContent = errText(err);
@@ -3301,6 +3354,26 @@ const voicesPanel: WebUiPanel = {
       }
     }
 
+    async function remove(name: string): Promise<void> {
+      if (armedDelete !== name) {
+        armedDelete = name;
+        msg.textContent = t.confirmDelete;
+        msg.classList.remove('bad');
+        render();
+        return;
+      }
+      armedDelete = '';
+      try {
+        const res = await ctx.invoke<ImportResp>('deleteVoice', [name]);
+        if (res.error) throw new Error(res.error);
+        ui.toast(t.voiceDeleted(res.name ?? name));
+        await load();
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      }
+    }
+
     function render(): void {
       list.textContent = '';
       if (!voices.length) { list.append(ui.h('div', 'rvc-detail', t.noVoiceHint)); return; }
@@ -3310,6 +3383,10 @@ const voicesPanel: WebUiPanel = {
         setPill(line.pill, using ? t.using : '', using ? 'on' : 'off');
         line.detail.textContent = [ui.fmt.bytes(v.bytes), v.index ? t.indexHas(ui.fmt.bytes(v.index)) : t.indexNone].join(' · ');
         if (!using) line.acts.append(ui.button(t.setDefault, { size: 'sm', onClick: () => void useVoice(v.name) }));
+        line.acts.append(ui.button(armedDelete === v.name ? t.confirmDelete : t.deleteVoice, {
+          size: 'sm',
+          onClick: () => void remove(v.name),
+        }));
       }
     }
 

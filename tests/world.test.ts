@@ -116,6 +116,13 @@ function pth(): Buffer {
   return data;
 }
 
+/** 造一个「看起来像」的 faiss 索引：IxFl 头 + 64 KB。 */
+function idx(): Buffer {
+  const data = Buffer.alloc((64 << 10) + 16, 0x22);
+  data.write('IxFl', 0, 'ascii');
+  return data;
+}
+
 interface State {
   phase: string;
   ready: boolean;
@@ -218,6 +225,28 @@ describe('World 面板数据面', () => {
     vi.stubEnv('WINDIR', nope);
     const { invoke } = await makeWorld();
     await expect(invoke('libraryOpen', [])).rejects.toThrow('找不到资源管理器');
+  });
+
+  it('按音色名成对添加 .pth/.index，可删除；重名会拒绝', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const add = (await invoke('addVoice', [
+      'My Voice', 'whatever.pth', pth().toString('base64'), 'whatever.index', idx().toString('base64'),
+    ])) as { name: string; voices: Array<{ name: string; index: number | null }> };
+    expect(add.name).toBe('My Voice');
+    expect(add.voices.map((v) => v.name)).toEqual(['My Voice']);
+    expect(add.voices[0]?.index).toBeGreaterThan(0);
+    expect(existsSync(join(dataDir, 'voices', 'My Voice.pth'))).toBe(true);
+    expect(existsSync(join(dataDir, 'voices', 'My Voice.index'))).toBe(true);
+    expect(((await invoke('state')) as { defaultVoice: string }).defaultVoice).toBe('My Voice');
+
+    const dup = (await invoke('addVoice', ['My Voice', 'x.pth', pth().toString('base64')])) as { error?: string };
+    expect(dup.error).toContain('已存在');
+
+    const del = (await invoke('deleteVoice', ['My Voice'])) as { removed: string[]; voices: unknown[] };
+    expect(del.voices).toEqual([]);
+    expect(existsSync(join(dataDir, 'voices', 'My Voice.pth'))).toBe(false);
+    expect(existsSync(join(dataDir, 'voices', 'My Voice.index'))).toBe(false);
+    expect(((await invoke('state')) as { defaultVoice: string }).defaultVoice).toBe('');
   });
 
   it('导入 .pth 后出现在列表里，并成为默认音色', async () => {

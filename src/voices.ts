@@ -5,7 +5,7 @@
  * 与大小下限，挡住改错扩展名、下了一半的文件；真正的权重结构由推理时 `torch.load` 判定。
  */
 import { basename, join } from 'node:path';
-import { mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 
 export interface VoiceInfo {
   /** `.pth` 文件名去掉扩展名。 */
@@ -50,16 +50,65 @@ export function importVoiceFile(dir: string, fileName: string, data: Buffer): { 
   const lower = name.toLowerCase();
   const kind = lower.endsWith('.index') ? 'index' : lower.endsWith('.pth') ? 'pth' : null;
   if (!kind) throw new Error('只接受 .pth 或 .index 文件');
-  if (kind === 'pth') {
-    if (data.length < PTH_MIN_BYTES) throw new Error(`.pth 只有 ${data.length} 字节，不像是训练好的权重`);
-    if (!looksLikePth(data)) throw new Error('.pth 文件头不是 torch 存档（应为 zip 或 pickle）');
-  } else {
-    if (data.length < INDEX_MIN_BYTES) throw new Error(`.index 只有 ${data.length} 字节，不像是 faiss 索引`);
-    if (!looksLikeFaissIndex(data)) throw new Error('.index 文件头不是 faiss 索引');
-  }
+  if (kind === 'pth') validatePth(data);
+  else validateIndex(data);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, name), data);
   return { name, kind, bytes: data.length };
+}
+
+/**
+ * 添加一个音色：`.pth` 必填，`.index` 可选。
+ * 按用户填的音色名统一命名，保证 `<name>.pth` 与 `<name>.index` 一定成对；
+ * 同名音色已存在时由调用方先确认，这里不静默覆盖。
+ */
+export function importVoicePair(
+  dir: string,
+  name: string,
+  pth: Buffer,
+  index?: Buffer | null,
+): { name: string; bytes: number; index: number | null } {
+  const base = voiceBaseName(name);
+  validatePth(pth);
+  if (index?.length) validateIndex(index);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${base}.pth`), pth);
+  const indexPath = join(dir, `${base}.index`);
+  if (index?.length) writeFileSync(indexPath, index);
+  else rmSync(indexPath, { force: true });
+  return { name: base, bytes: pth.length, index: index?.length ?? null };
+}
+
+/** 删除一个音色：`.pth` 与同名 `.index` 一起删；找不到 `.pth` 时报错。 */
+export function deleteVoice(dir: string, name: string): { name: string; removed: string[] } {
+  const base = voiceBaseName(name);
+  const removed: string[] = [];
+  for (const ext of ['.pth', '.index']) {
+    const path = join(dir, `${base}${ext}`);
+    if (!existsSync(path)) continue;
+    rmSync(path, { force: true });
+    removed.push(`${base}${ext}`);
+  }
+  if (!removed.some((file) => file.endsWith('.pth'))) throw new Error(`找不到音色：${base}`);
+  return { name: base, removed };
+}
+
+/** 音色名规范化：去路径、去 `.pth`/`.index` 扩展名、限长。 */
+export function voiceBaseName(name: string): string {
+  const base = safeName(name).replace(/\.(pth|index)$/i, '').trim();
+  if (!base) throw new Error('音色名称不能为空');
+  if (base.length > 64) throw new Error('音色名称最长 64 个字符');
+  return base;
+}
+
+function validatePth(data: Buffer): void {
+  if (data.length < PTH_MIN_BYTES) throw new Error(`.pth 只有 ${data.length} 字节，不像是训练好的权重`);
+  if (!looksLikePth(data)) throw new Error('.pth 文件头不是 torch 存档（应为 zip 或 pickle）');
+}
+
+function validateIndex(data: Buffer): void {
+  if (data.length < INDEX_MIN_BYTES) throw new Error(`.index 只有 ${data.length} 字节，不像是 faiss 索引`);
+  if (!looksLikeFaissIndex(data)) throw new Error('.index 文件头不是 faiss 索引');
 }
 
 /** 去掉路径、禁止隐藏文件与超长名字；保留中文。 */

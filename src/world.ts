@@ -22,7 +22,7 @@ import { FileSetJob, hasFile, RvcInstaller } from './install.ts';
 import { readConvertJob, startConvertServer, type ConvertDeps, type ConvertJob, type ConvertServerHandle } from './server.ts';
 import { RvcVenv } from './venv.ts';
 import { RuntimeInstall, installedTiers } from './runtime.ts';
-import { importVoiceFile, listVoices } from './voices.ts';
+import { importVoiceFile, importVoicePair, listVoices, voiceBaseName, deleteVoice as removeVoiceFile } from './voices.ts';
 import { createSession, defaultSegments, dirBytes, gcSessions, listSessions, readSession, removeSession, sessionDir, sessionsRoot, writeSession, type RefineSession } from './session.ts';
 import { analyzePitch, parseF0Csv } from './pitch.ts';
 import {
@@ -2118,7 +2118,49 @@ export class RvcWorld implements World {
         return { error: err instanceof Error ? err.message : String(err) };
       }
     }
+    if (method === 'addVoice') return this.addVoice(args);
+    if (method === 'deleteVoice') return this.removeVoice(args);
     return { error: `unknown method: ${panel}.${method}` };
+  }
+
+  /** 添加音色：`.pth` 必填、`.index` 可选；按音色名统一命名，保证两者同名配对。 */
+  private addVoice(args: unknown[]): Record<string, unknown> {
+    const name = typeof args[0] === 'string' ? args[0].trim() : '';
+    const pthB64 = typeof args[2] === 'string' ? args[2] : '';
+    const idxB64 = typeof args[4] === 'string' ? args[4] : '';
+    if (!name) return { error: '请填写音色名称' };
+    if (!pthB64) return { error: '请选择 .pth 模型文件' };
+    try {
+      const base = voiceBaseName(name);
+      if (listVoices(this.voicesDir).some((voice) => voice.name.toLowerCase() === base.toLowerCase())) {
+        return { error: `音色 ${base} 已存在；先删除再导入` };
+      }
+      const done = importVoicePair(
+        this.voicesDir,
+        base,
+        Buffer.from(pthB64, 'base64'),
+        idxB64 ? Buffer.from(idxB64, 'base64') : null,
+      );
+      // 与 GPT-SoVITS 的「添加音色」一致：新音色直接设为当前默认。
+      this.opts.cfg.voice = done.name;
+      this.log?.info('添加 RVC 音色', { name: done.name, bytes: done.bytes, index: done.index });
+      return { ...done, voices: listVoices(this.voicesDir) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /** 删除音色：`.pth` 与同名 `.index` 一起删；删的是当前默认音色时回退到目录里第一个。 */
+  private removeVoice(args: unknown[]): Record<string, unknown> {
+    const name = typeof args[0] === 'string' ? args[0] : '';
+    try {
+      const done = removeVoiceFile(this.voicesDir, name);
+      if (this.opts.cfg.voice.trim() === done.name) this.opts.cfg.voice = '';
+      this.log?.info('删除 RVC 音色', done);
+      return { ...done, voices: listVoices(this.voicesDir) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /** 占用统计：只报 id 与字节数，名字由面板翻。`shared` 的项不归 RVC 管，不能在这里删。 */
