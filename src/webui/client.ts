@@ -280,6 +280,15 @@ function toBase64(buf: Uint8Array): string {
   return btoa(bin);
 }
 
+/** 面板里选过的音色；刷新/切页后仍然保留。空串表示「默认」。 */
+const PANEL_VOICE_KEY = 'rvc.panel.voice';
+function savedPanelVoice(): string | null {
+  try { return localStorage.getItem(PANEL_VOICE_KEY); } catch { return null; }
+}
+function savePanelVoice(value: string): void {
+  try { localStorage.setItem(PANEL_VOICE_KEY, value); } catch { /* 隐私模式等忽略 */ }
+}
+
 const toneOf = (phase: string): Tone =>
   phase === 'ready' ? 'on' : phase === 'working' || phase === 'starting' ? 'warn' : phase === 'error' ? 'bad' : 'off';
 
@@ -317,7 +326,10 @@ function setPill(el: HTMLSpanElement, text: string, tone: Tone): void {
 
 /** 按 value 重建下拉；值没变时不动，避免每次轮询把用户的选择重置。 */
 function fillSelect(ui: WebUi, select: HTMLSelectElement, items: Array<{ value: string; label: string }>): void {
-  const same = select.options.length === items.length && items.every((o, i) => select.options[i]?.value === o.value);
+  const same = select.options.length === items.length && items.every((o, i) => {
+    const option = select.options[i];
+    return option?.value === o.value && option?.textContent === o.label;
+  });
   if (same) return;
   const keep = select.value;
   select.textContent = '';
@@ -610,6 +622,9 @@ const convertPanel: WebUiPanel = {
     let state: PanelState | null = null;
     let file: File | null = null;
     let url: string | null = null;
+    /** 面板选过的音色；首次渲染时套用，之后不覆盖用户当前选择。 */
+    let voiceInitialized = false;
+    const preferredVoice = savedPanelVoice();
     ctx.own(disposable(() => { if (url) URL.revokeObjectURL(url); }));
 
     const sheet = ui.section(t.convertTitle, t.convertHint);
@@ -617,6 +632,7 @@ const convertPanel: WebUiPanel = {
     fileInput.type = 'file';
     fileInput.accept = 'audio/*,.wav,.flac,.mp3,.ogg,.m4a';
     const voiceSelect = ui.select({ options: [] });
+    voiceSelect.addEventListener('change', () => savePanelVoice(voiceSelect.value));
 
     const pitch = ui.input({ type: 'number', value: '0' });
     pitch.min = '-24';
@@ -678,6 +694,14 @@ const convertPanel: WebUiPanel = {
       // 「默认」是跟随配置/目录第一个的动态项，把实际音色带上，免得和下面的显式项看起来一样。
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
       fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
+      if (!voiceInitialized) {
+        voiceInitialized = true;
+        voiceSelect.value = preferredVoice != null && (preferredVoice === '' || voices.some((v) => v.name === preferredVoice))
+          ? preferredVoice
+          : '';
+      } else if (voiceSelect.value !== '' && !voices.some((v) => v.name === voiceSelect.value)) {
+        voiceSelect.value = '';
+      }
       convertBtn.disabled = !s.ready || s.job?.phase === 'working';
       if (!s.ready && s.detail) msg.textContent = s.detail;
     }
@@ -802,6 +826,7 @@ const coverPanel: WebUiPanel = {
     toLibrary.checked = true;
     const sourceLine = ui.h('div', 'rvc-detail');
     const voiceSelect = ui.select({ options: [] });
+    voiceSelect.addEventListener('change', () => savePanelVoice(voiceSelect.value));
 
     // B 站一键生成：歌名 → 搜索 → 下载 → 走现有按路径翻唱。
     const biliQuery = ui.input({ value: '' });
@@ -909,6 +934,9 @@ const coverPanel: WebUiPanel = {
 
     // 结果编辑：只列会话元数据，不读音频；选中的会话决定「重新混音」的素材。
     let selectedId = '';
+    /** 面板选过的音色；首次渲染时套用，之后不覆盖用户当前选择。 */
+    let voiceInitialized = false;
+    const preferredVoice = savedPanelVoice();
     let mixKey = '';
     let settledKey = '';
     /** 上次生效的翻唱参数与它对应的会话：按钮文案与动作都按这两组的 dirty 决定。 */
@@ -1390,7 +1418,8 @@ const coverPanel: WebUiPanel = {
         pickedOutput = '';
         outputLoadKey = '';
         outputSeq += 1;
-        autoPickOutput = false;
+        // 不清 autoPickOutput：刚跑完任务时 settle() 会把它置 true，随后这里要落到最新成品。
+        // 手动切会话时 chooseSession() 已经置 false，不会误选。
         clearOutputPlayer();
       }
       outputFiles = files;
@@ -2560,6 +2589,14 @@ const coverPanel: WebUiPanel = {
       }
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
       fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
+      if (!voiceInitialized) {
+        voiceInitialized = true;
+        voiceSelect.value = preferredVoice != null && (preferredVoice === '' || voices.some((v) => v.name === preferredVoice))
+          ? preferredVoice
+          : '';
+      } else if (voiceSelect.value !== '' && !voices.some((v) => v.name === voiceSelect.value)) {
+        voiceSelect.value = '';
+      }
       updateCoverButton();
       sepTier.value = s.highSeparator ? 'high' : 'fast';
       const mb = s.melband;
