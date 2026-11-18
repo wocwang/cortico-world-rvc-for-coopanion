@@ -1056,7 +1056,7 @@ export class RvcWorld implements World {
     let output: string;
     let rel: string | null = null;
     if (record) {
-      // 编号取已有最大值 +1：成品数量被裁到 3 个后，仍不会覆盖同名文件。
+      // 编号取已有最大值 +1：成品全部保留后，仍不会覆盖同名文件。
       const prefix = opts.withBgm ? 'mix' : 'clean';
       const next = session.outputs.reduce((max, item) => {
         const match = new RegExp(`^out/${prefix}-(\\d+)\\.`).exec(item.path);
@@ -1094,11 +1094,8 @@ export class RvcWorld implements World {
         format, path: rel, at: session.updatedAt,
         kind: opts.withBgm ? 'cover' : 'clean',
       });
-      // 只留最近 3 个成品，避免反复试听把磁盘撑大。
-      while (session.outputs.length > 3) {
-        const old = session.outputs.shift();
-        if (old) rmSync(join(dir, old.path), { force: true });
-      }
+      // 成品全部保留：面板「结果编辑」要能对任意一条重混/对比，不再只留最近 3 条。
+      // 磁盘占用跟着会话目录，删会话时一并清掉。
       writeSession(this.opts.dataDir, id, session);
     }
     this.activeSession = id;
@@ -1235,7 +1232,7 @@ export class RvcWorld implements World {
       if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
     }
 
-    // 编号取已有最大值 +1：母带记录裁到 3 条后，也不会覆盖同名文件。
+    // 编号取已有最大值 +1：母带全部保留后，也不会覆盖同名文件。
     const next = (session.masters ?? []).reduce((max, item) => {
       const match = /^out\/master-(\d+)\./.exec(item.path);
       return match ? Math.max(max, Number(match[1])) : max;
@@ -1253,10 +1250,7 @@ export class RvcWorld implements World {
     const audio = readFileSync(output);
     const now = new Date().toISOString();
     session.masters = [...(session.masters ?? []), { format, path: rel, at: now, ...done.loudness }];
-    while (session.masters.length > 3) {
-      const old = session.masters.shift();
-      if (old) rmSync(join(dir, old.path), { force: true });
-    }
+    // 母带也全部保留，供结果编辑里逐条对比。
     session.updatedAt = now;
     writeSession(this.opts.dataDir, id, session);
     this.activeSession = id;
