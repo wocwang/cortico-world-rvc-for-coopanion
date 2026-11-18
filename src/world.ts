@@ -365,6 +365,7 @@ export class RvcWorld implements World {
       scriptPath: WORKER_SCRIPT,
       voice: this.opts.cfg.voice.trim() || firstVoice(paths.voicesDir),
       runtimeDir: paths.runtimeDir || undefined,
+      silenceGate: this.opts.cfg.silenceGate !== false,
       log: this.log ?? undefined,
     });
   }

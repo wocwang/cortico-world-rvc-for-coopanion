@@ -78,6 +78,8 @@ export interface RvcConfigSection {
   indexRate: number;
   /** 保护清辅音，0..0.5。 */
   protect: number;
+  /** 静音门：把「本来没人声」的段压成数字静音，去掉分离残留被放大后的嘶声；默认开。 */
+  silenceGate: boolean;
   /** 对其他插件开放本机 HTTP 接口：只监听 127.0.0.1。 */
   httpApi: boolean;
   /** HTTP 接口端口；默认 9881。改端口要重挂扩展（重启 World）才生效。 */
@@ -133,6 +135,7 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   pitch: 0,
   indexRate: 0.3,
   protect: 0.33,
+  silenceGate: true,
   httpApi: true,
   httpPort: DEFAULT_PORT,
   httpToken: '',
@@ -175,6 +178,7 @@ const TEXT = {
     pitch: { title: '变调（半音）', description: '0 为原调；男声转女声一般 +12 左右。' },
     indexRate: { title: '索引率', description: '0..1，越高越贴近音色、但可能带出素材口音；该音色没有 .index 时忽略。' },
     protect: { title: '保护清辅音', description: '0..0.5，防止换声后齿音、吸气声被抹掉。' },
+    silenceGate: { title: '静音门（去掉嘶声）', description: '按原干声的包络，把本来没人声的段（前奏、间奏、尾音）压成数字静音。RVC 会把分离残留放大 20 dB 以上，听起来就是沙沙声；关掉则原样输出。改完要重启引擎才生效。' },
     codeDir: { title: '推理代码目录', description: 'RVC 源码目录；留空用扩展包自带的 vendor/rvc（只含代码，不含权重）。' },
     assetsDir: { title: '模型资产目录', description: 'hubert_base 与 rmvpe 所在目录；留空为插件数据目录下的 assets。约 587 MB，首次使用在面板里安装，不随包分发。' },
     pythonPath: { title: '派生 venv 的 python.exe', description: '留空为插件数据目录下的 venv\\Scripts\\python.exe。派生 venv 以 gpt-sovits 运行时为 base，不复制整套运行时。' },
@@ -212,6 +216,7 @@ const TEXT = {
     pitch: { title: 'Pitch (semitones)', description: '0 keeps the original key; a male voice to female is usually around +12.' },
     indexRate: { title: 'Index rate', description: '0..1; higher sticks closer to the voice but may leak the source accent. Ignored when the voice has no .index.' },
     protect: { title: 'Protect voiceless consonants', description: '0..0.5; keeps sibilants and breaths from being smeared by the conversion.' },
+    silenceGate: { title: 'Silence gate (removes hiss)', description: 'Uses the source envelope to zero out stretches where nobody is singing (intro, interludes, tails). RVC lifts separation residue by 20+ dB, which is heard as hiss; turn it off to keep the raw output. Takes effect after the engine restarts.' },
     codeDir: { title: 'Inference code folder', description: 'RVC source folder; empty uses the bundled vendor/rvc (code only, no weights).' },
     assetsDir: { title: 'Model assets folder', description: 'Where hubert_base and rmvpe live; empty uses assets under the plugin data folder. About 587 MB, installed from the panel on first use; not shipped in the package.' },
     pythonPath: { title: 'Derived venv python.exe', description: 'Empty uses venv\\Scripts\\python.exe under the plugin data folder. The venv is based on the gpt-sovits runtime instead of copying it.' },
@@ -240,6 +245,7 @@ export function configGroups(language: Language): ConfigGroup[] {
           [`${K}.pitch`]: { type: 'number', title: t.pitch.title, description: t.pitch.description, minimum: PITCH_MIN, maximum: PITCH_MAX, multipleOf: 1, 'x-hot': true },
           [`${K}.indexRate`]: { type: 'number', title: t.indexRate.title, description: t.indexRate.description, minimum: 0, maximum: 1, multipleOf: 0.05, 'x-hot': true },
           [`${K}.protect`]: { type: 'number', title: t.protect.title, description: t.protect.description, minimum: 0, maximum: PROTECT_MAX, multipleOf: 0.01, 'x-hot': true },
+          [`${K}.silenceGate`]: { type: 'boolean', title: t.silenceGate.title, description: t.silenceGate.description, 'x-hot': true },
         },
       },
     },
