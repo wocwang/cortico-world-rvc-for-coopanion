@@ -179,5 +179,18 @@ pnpm exec tsx scripts/smoke.mts
 
 ## 许可
 
-MIT，见 `LICENSE`。第三方声明见 `vendor/uvr/NOTICE.md`：分离代码来自 python-audio-separator 0.9.0（MIT）
-与 Ultimate Vocal Remover（MIT），分离模型由 UVR 项目训练、另行下载、不随包分发。
+**AGPL-3.0-or-later**，见 `LICENSE`（含版权人声明头）。选择 `-or-later` 是因为它允许接收方按 FSF
+后续发布的版本使用，兼容性更好。
+
+外部贡献需签署 `CLA.md`：贡献者保留著作权，但同时授予维护者按任意条款（含商业许可）再许可的权利，
+这样协议调整或商业授权不会因个别 PR 而被卡住。
+
+第三方组件保留各自许可（均为 MIT，与本项目兼容，不改变其归属）：
+
+- `vendor/rvc/LICENSE`：RVC 推理/训练代码，© liujing04、源文雨、Ftps；
+- `vendor/uvr/NOTICE.md`：分离代码移植自 python-audio-separator 0.9.0 与 Ultimate Vocal Remover，
+  分离模型由 UVR 项目训练、另行下载、不随包分发；
+- `vendor/audify/LICENSE`：音频 IO。
+
+示例音色（如 `daifeiyu`）为音源作者的**个人非商业**授权，不属于本项目许可范围。
+0.4.42–0.4.44 等**已发布**版本仍按其发布时的 MIT 条款有效（已发出的授权不可撤回）。
