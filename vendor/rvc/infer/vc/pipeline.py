@@ -19,6 +19,36 @@ from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
 
 bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=16000)
 
+# ── hy2 混合跟踪参数（可用环境变量覆盖；默认值由 25 条宽音域素材 + 音频级复测调出） ──
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+HY2_MIN_PM_HZ = _env_float("RVC_HY2_MIN_PM_HZ", 600.0)  # pm 低于此频率一律不采信
+HY2_RATIO_LO = _env_float("RVC_HY2_RATIO_LO", 1.22)  # pm/rmvpe 下界，约 3.5 半音
+HY2_RATIO_HI = _env_float("RVC_HY2_RATIO_HI", 2.4)  # 上界，略高于一个八度
+HY2_MEDIAN = int(_env_float("RVC_HY2_MEDIAN", 5))  # 有声区中值滤波窗（帧，10 ms/帧）
+
+
+def _median_filter_voiced(f0, win):
+    """对有声帧做 log 域中值滤波，清音位置保持不变；win<=1 时原样返回。"""
+    if win <= 1 or f0.size == 0:
+        return f0
+    half = win // 2
+    pad = np.concatenate([np.zeros(half), f0, np.zeros(half)])
+    log = np.where(pad > 0, np.log2(np.maximum(pad, 1e-9)), np.nan)
+    out = np.zeros_like(f0)
+    for i in range(f0.size):
+        window = log[i : i + win]
+        voiced = window[np.isfinite(window)]
+        out[i] = 2 ** np.median(voiced) if voiced.size else 0.0
+    return out
+
 
 def change_rms(data1, sr1, data2, sr2, rate):  # 1是输入音频，2是输出音频,rate是2的占比
     # print(data1.max(),data2.max())
@@ -77,8 +107,9 @@ class Pipeline(object):
         f0_mel_max = 1127 * np.log(1 + f0_max / 700)
         if f0_method == "hy2":
             # 混合跟踪：rmvpe 打底（中低音稳），只在高音区且呈八度上跳
-            # （pm 为 rmvpe 的 1.18~2.3 倍且 >= 600 Hz）时采用 pm。
+            # （pm 为 rmvpe 的 1.22~2.4 倍且 >= 600 Hz）时采用 pm。
             # 这样既修掉 rmvpe 的高音掉八度，又避免 pm 在低音/气声段乱跳。
+            # 最后对有声区做 5 帧（50 ms）中值滤波，去掉单帧毛刺。
             f0_r = self.get_f0(x, p_len, 0, "rmvpe")[1]
             f0_p = self.get_f0(x, p_len, 0, "pm")[1]
             n = min(len(f0_r), len(f0_p), p_len)
@@ -86,9 +117,13 @@ class Pipeline(object):
             f0_p = np.asarray(f0_p, dtype=np.float64)[:n]
             ratio = np.divide(f0_p, np.maximum(f0_r, 1e-9))
             use_pm = (
-                (f0_p > 0) & (f0_r > 0) & (f0_p >= 600.0) & (ratio >= 1.18) & (ratio <= 2.3)
+                (f0_p > 0)
+                & (f0_r > 0)
+                & (f0_p >= HY2_MIN_PM_HZ)
+                & (ratio >= HY2_RATIO_LO)
+                & (ratio <= HY2_RATIO_HI)
             )
-            f0 = np.where(use_pm, f0_p, f0_r)
+            f0 = _median_filter_voiced(np.where(use_pm, f0_p, f0_r), HY2_MEDIAN)
         elif f0_method == "pm":
             f0 = (
                 parselmouth.Sound(x, self.sr)
