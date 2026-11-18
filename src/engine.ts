@@ -552,6 +552,8 @@ export class RvcEngine {
         RVC_UVR_MODEL: this.opts.uvrModel ?? '',
         // f0 跟踪器：默认 hy2（rmvpe 打底 + 高音区 pm 修八度），用户无需配置；RVC_F0_METHOD=rmvpe / pm 可回退。
         RVC_F0_METHOD: process.env.RVC_F0_METHOD ?? 'hy2',
+        // 静音门：默认把「本来没人声」的段压成静音（分离残留/气口不再变成嘶声）；RVC_SILENCE_GATE=0 关闭。
+        RVC_SILENCE_GATE: process.env.RVC_SILENCE_GATE ?? '1',
         PATH: this.searchPath(),
       },
     });

@@ -650,6 +650,63 @@ def main() -> int:
         g = gcd(int(sample_rate), 44100)
         return resample_poly(audio, 44100 // g, int(sample_rate) // g, axis=-1).astype(np.float32)
 
+    # 静音门：RVC 会把分离残留、气口、尾音放大成嘶声，所以按「同一份干声」的 RMS 包络生成
+    # 掩码，把本来就没人的段压成数字静音。阈值取 max(-55 dBFS, 有声段 99 分位 - 45 dB)，
+    # 掩码扩边 80 ms（不切断起音）、40 ms 平滑（不出咔哒）。默认开；要原样输出设
+    # RVC_SILENCE_GATE=0。
+    GATE_ENABLED = (os.environ.get("RVC_SILENCE_GATE") or "1").strip().lower() not in ("0", "off", "false", "no")
+
+    def gate_mask(src, src_sr, out_len, out_sr, floor_db=-55.0, rel_db=45.0,
+                  hop_ms=10.0, expand_ms=80.0, fade_ms=40.0):
+        """按干声 RMS 包络生成 0..1 掩码：有声≈1，静音/残留≈0，长度对齐到输出采样率。"""
+        import numpy as np
+
+        hop = max(1, int(round(src_sr * hop_ms / 1000.0)))
+        src = np.asarray(src, dtype=np.float32).reshape(-1)
+        n_frames = max(1, int(np.ceil(src.size / float(hop))))
+        padded = np.zeros(n_frames * hop, dtype=np.float32)
+        padded[: src.size] = np.abs(src[: n_frames * hop])
+        rms = np.sqrt(np.mean(padded.reshape(n_frames, hop) ** 2, axis=1) + 1e-12)
+        db = 20.0 * np.log10(rms + 1e-9)
+        loud = db[db > -70.0]
+        ref = float(np.percentile(loud, 99)) if loud.size else -20.0
+        threshold = max(float(floor_db), ref - float(rel_db))
+        mask = (db > threshold).astype(np.float32)
+        grow = int(round(expand_ms / hop_ms))
+        if grow > 0:
+            grown = mask.copy()
+            for i in range(1, grow + 1):
+                grown[i:] = np.maximum(grown[i:], mask[:-i])
+                grown[:-i] = np.maximum(grown[:-i], mask[i:])
+            mask = grown
+        fade = int(round(fade_ms / hop_ms))
+        if fade > 1:
+            window = np.hanning(fade + 2)[1:-1].astype(np.float32)
+            mask = np.convolve(mask, window / window.sum(), mode="same")
+        centre = (np.arange(n_frames, dtype=np.float64) + 0.5) * hop / float(src_sr)
+        ticks = np.arange(max(1, int(out_len)), dtype=np.float64) / float(out_sr)
+        return np.interp(ticks, centre, mask).astype(np.float32)
+
+    def gate_vocal(conv, src, src_sr, conv_sr):
+        """静音门后处理：conv 是 RVC 输出（int16 或 float），src 是同一段干声。"""
+        import numpy as np
+
+        if not GATE_ENABLED:
+            return conv
+        try:
+            data = np.asarray(conv)
+            integer = np.issubdtype(data.dtype, np.integer)
+            scale = 32768.0 if integer else 1.0
+            data = data.astype(np.float32) / scale
+            mask = gate_mask(src, src_sr, data.size, conv_sr)
+            gated = data * mask
+            if integer:
+                return (np.clip(gated, -1.0, 1.0) * 32767.0).astype(np.int16)
+            return gated
+        except Exception as error:
+            print("[rvc] 静音门跳过：%s" % error, file=sys.stderr)
+            return conv
+
     def convert(req: dict) -> None:
         req_id = req.get("id")
         target = (req.get("voice") or "").strip() or default_voice
@@ -667,7 +724,7 @@ def main() -> int:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到输入音频：%s" % source})
             return
         try:
-            load_audio(source, 16000)  # 先单独解码一次，解码失败按 400 报，不算推理失败
+            src_mono = load_audio(source, 16000)  # 先单独解码一次，解码失败按 400 报，不算推理失败
         except Exception as error:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "解码失败：%s" % error})
             return
@@ -686,6 +743,8 @@ def main() -> int:
         if not result or result[0] is None or result[1] is None:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": _last_line(result[0] if result else "没有可转换的音频")})
             return
+        # 静音门：按输入包络把「本来没人的段」压回静音，避免分离残留被放大成嘶声。
+        result = (result[0], gate_vocal(result[1], src_mono, 16000, int(result[0])))
         try:
             write_audio(req.get("output") or "", result[1], int(result[0]), fmt)
         except Exception:
@@ -874,13 +933,16 @@ def main() -> int:
             conv = resample_to_44100(conv, conv_sr)
             n = instrumental.shape[1]
             conv = conv[:n] if conv.size >= n else np.pad(conv, (0, n - conv.size))
+            # 电平比例按「未门控」的 RMS 算，否则静音被压掉会让整首歌人声变大。
+            rms_conv_raw = float(np.sqrt(np.mean(conv.astype(np.float64) ** 2)))
+            conv = gate_vocal(conv, vocals.mean(axis=0), 44100, 44100)
             if stem_dir:
                 conv_path = os.path.join(stem_dir, "vocals", "conv.wav")
                 os.makedirs(os.path.dirname(os.path.abspath(conv_path)), exist_ok=True)
                 sf.write(conv_path, conv, 44100, subtype="FLOAT")
             # 电平对齐：RVC 输出被峰值归一化过，直接叠会盖过伴奏；按原人声的 RMS 比例把音量拉回来。
             rms_vocal = float(np.sqrt(np.mean(vocals ** 2)))
-            rms_conv = float(np.sqrt(np.mean(conv ** 2)))
+            rms_conv = rms_conv_raw
             ratio = 1.0 if rms_vocal < 1e-5 or rms_conv < 1e-5 else min(4.0, max(0.25, rms_vocal / rms_conv))
             gain = ratio * (10 ** (float(req.get("vocalGain") or 0) / 20.0))
             with_bgm = bool(req.get("withBgm", True))
@@ -1010,6 +1072,14 @@ def main() -> int:
             })
             return
         conv = conv[:inst_frames] if conv.size >= inst_frames else np.pad(conv, (0, inst_frames - conv.size))
+        _rms_raw = float(np.sqrt(np.mean(conv.astype(np.float64) ** 2)))
+        try:
+            _stem, _ = sf.read(stem, dtype="float32", always_2d=False)
+            if getattr(_stem, "ndim", 1) > 1:
+                _stem = _stem.mean(axis=1)
+            conv = gate_vocal(conv, np.asarray(_stem, dtype=np.float32), 44100, 44100)
+        except Exception:
+            pass
 
         backup_path = (req.get("backup") or "").strip() or os.path.join(os.path.dirname(os.path.abspath(conv_path)), "conv.bak.wav")
         tmp_path = conv_path + ".new.wav"
@@ -1031,7 +1101,7 @@ def main() -> int:
             if getattr(vocal, "ndim", 1) > 1:
                 vocal = vocal.mean(axis=1)
             rms_vocal = float(np.sqrt(np.mean(np.asarray(vocal, dtype=np.float64) ** 2)))
-            rms_conv = float(np.sqrt(np.mean(conv.astype(np.float64) ** 2)))
+            rms_conv = _rms_raw
             ratio = 1.0 if rms_vocal < 1e-5 or rms_conv < 1e-5 else min(4.0, max(0.25, rms_vocal / rms_conv))
         except Exception:
             ratio = 1.0
