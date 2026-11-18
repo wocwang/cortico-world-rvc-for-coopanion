@@ -82,7 +82,9 @@ class Pipeline(object):
                     time_step=time_step / 1000,
                     voicing_threshold=0.6,
                     pitch_floor=f0_min,
-                    pitch_ceiling=f0_max,
+                    # 追踪上限只影响 pm 的检测范围（宽音域素材能到 1500 Hz）；
+                    # 下面的分箱映射仍按 50–1100 Hz，保持与训练权重一致。
+                    pitch_ceiling=max(f0_max, 2400),
                 )
                 .selected_array["frequency"]
             )

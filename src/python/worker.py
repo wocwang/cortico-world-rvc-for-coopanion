@@ -355,6 +355,13 @@ def main() -> int:
     vc = VC(config)
     current = {"voice": "", "index": ""}
 
+    # f0 跟踪器：pm（Praat 自相关）在 900 Hz 以上不会把音高读低一个八度，作为默认；
+    # 想要上游旧行为（RMVPE）时设 RVC_F0_METHOD=rmvpe。两条路径的分箱映射完全一致。
+    f0_method = (os.environ.get("RVC_F0_METHOD") or "pm").strip().lower()
+    if f0_method not in ("pm", "rmvpe"):
+        f0_method = "pm"
+    print("[rvc] f0 跟踪器：%s" % f0_method, file=sys.stderr)
+
     def voice_path(name: str) -> str:
         base = name if name.lower().endswith(".pth") else name + ".pth"
         return os.path.join(voices, base)
@@ -406,7 +413,7 @@ def main() -> int:
             warm_dir = tempfile.mkdtemp(prefix="rvc-warmup-")
             warm = os.path.join(warm_dir, "warmup.wav")
             sf.write(warm, (0.1 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32), sr)
-            status, result = vc.vc_single(0, warm, 0, "rmvpe", current["index"], 0.3, 0, 1.0, 0.33)
+            status, result = vc.vc_single(0, warm, 0, f0_method, current["index"], 0.3, 0, 1.0, 0.33)
             if not result or result[1] is None:
                 warn = "预热失败（仍按就绪处理）：%s" % str(status).splitlines()[-1][:200]
                 print("[rvc] %s" % warn, file=sys.stderr)
@@ -474,7 +481,7 @@ def main() -> int:
             # vc_single 返回 (状态文本, (采样率, 波形))。直接透传会让调用方把状态文本
             # 当成采样率（`int("【单次推理】…")` → ValueError），短于 20 秒必现；
             # 变声（convert）与翻唱（cover）都走这里，改的时候两条路径一起看。
-            status, result = vc.vc_single(0, path, pitch, "rmvpe", current["index"], index_rate, 0, 1.0, protect)
+            status, result = vc.vc_single(0, path, pitch, f0_method, current["index"], index_rate, 0, 1.0, protect)
             if not result or result[0] is None or result[1] is None:
                 return status, None
             return result
@@ -494,7 +501,7 @@ def main() -> int:
                 segment = audio[start:end]
                 sf.write(tmp, segment, 16000, subtype="FLOAT")
                 print("[rvc] 切片 %d/%d：%.1f 秒" % (index, total_chunks, len(segment) / 16000.0), file=sys.stderr)
-                status, result = vc.vc_single(0, tmp, pitch, "rmvpe", current["index"], index_rate, 0, 1.0, protect)
+                status, result = vc.vc_single(0, tmp, pitch, f0_method, current["index"], index_rate, 0, 1.0, protect)
                 if not result or result[0] is None or result[1] is None:
                     return status, None
                 sample_rate = int(result[0])
