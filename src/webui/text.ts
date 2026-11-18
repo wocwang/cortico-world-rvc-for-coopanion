@@ -266,6 +266,8 @@ const TEXT = {
     rangeRunning: '重跑选段中…',
     rangeDone: (ms: string, size: string, start: string, end: string, path: string) =>
       `${ms} · ${size} · 重跑 ${start} – ${end}${path ? ` · 已存到 ${path}` : ''}`,
+    rangeRevert: '还原',
+    rangeRevertNone: '这次会话还没有重跑过选段，没有可还原的内容。',
     rangeAudition: '试听这段',
     previewing: '生成试听中…',
     rangeSelectFirst: '先在波形上拖选一段。',
@@ -617,6 +619,8 @@ const TEXT = {
     rangeRunning: 'Re-running span…',
     rangeDone: (ms: string, size: string, start: string, end: string, path: string) =>
       `${ms} · ${size} · re-ran ${start} – ${end}${path ? ` · saved to ${path}` : ''}`,
+    rangeRevert: 'Revert',
+    rangeRevertNone: 'No span has been re-run in this session yet, nothing to revert.',
     rangeAudition: 'Audition this span',
     previewing: 'Rendering preview…',
     rangeSelectFirst: 'Drag a span on the waveform first.',

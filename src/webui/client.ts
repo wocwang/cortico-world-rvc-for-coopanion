@@ -962,6 +962,10 @@ const coverPanel: WebUiPanel = {
     const preferredVoice = savedPanelVoice();
     let mixKey = '';
     let settledKey = '';
+    /** 最近一次选段重跑生成的段 id：选段卡片里的「还原」退回到重跑之前的样本。 */
+    let lastRangeSegId = '';
+    /** 已经还原过的段 id：还原保留备份且幂等，但按钮不该一直亮着。 */
+    const revertedRanges = new Set<string>();
     /** 上次生效的翻唱参数与它对应的会话：按钮文案与动作都按这两组的 dirty 决定。 */
     let applied: CoverParams | null = null;
     let appliedSessionId = '';
@@ -1042,10 +1046,12 @@ const coverPanel: WebUiPanel = {
     const rangeKnobs = ui.h('div', 'rvc-grid');
     rangeKnobs.append(ui.field(t.pitch, rangePitch), ui.field(t.indexRate, rangeIndex), ui.field(t.protect, rangeProtect));
     const rerunRangeBtn = ui.button(t.rangeRerun, { variant: 'primary', size: 'sm', onClick: () => void runRange() });
+    const rangeRevertBtn = ui.button(t.rangeRevert, { size: 'sm', onClick: () => void revertLastRange() });
+    rangeRevertBtn.disabled = true;
     const auditionBtn = ui.button(t.rangeAudition, { size: 'sm', onClick: () => void auditionRange() });
     const f0Btn = ui.button(t.exportF0, { size: 'sm', onClick: () => void exportF0() });
     const rangeActs = ui.actions();
-    rangeActs.append(rerunRangeBtn, auditionBtn, f0Btn);
+    rangeActs.append(rerunRangeBtn, rangeRevertBtn, auditionBtn, f0Btn);
     // 音高体检：曲线与热力条画在同一个波形画布上，下面只列跑调区间。
     const pitchLine = ui.h('div', 'rvc-detail', t.pitchHint);
     const pitchList = ui.h('div', 'rvc-pitch-regions');
@@ -2116,6 +2122,12 @@ const coverPanel: WebUiPanel = {
       const session = r.session;
       summaries = r.sessions;
       selectedId = session?.id ?? '';
+      // 选段重跑留下的 range 段带着「重跑前」备份：把它接到卡片里的「还原」上。
+      const revertible = (session?.segments ?? []).filter(
+        (item) => item.kind === 'range' && item.backup && !revertedRanges.has(item.id),
+      );
+      lastRangeSegId = revertible.length ? revertible[revertible.length - 1].id : '';
+      rangeRevertBtn.disabled = !lastRangeSegId || !state?.ready;
       // 先定 selectedId 再刷音源，避免轮询时控件还停在上一个会话。
       bindSource();
       sessionSelect.value = selectedId;
@@ -2981,6 +2993,29 @@ const coverPanel: WebUiPanel = {
     window.addEventListener('resize', drawWave);
     ctx.own(disposable(() => { window.removeEventListener('resize', drawWave); }));
 
+    /** 还原上一次选段重跑：有备份就逐样本写回，没有就提示先重跑。 */
+    async function revertLastRange(): Promise<void> {
+      msg.textContent = '';
+      msg.classList.remove('bad');
+      if (!state?.ready) { msg.textContent = t.notReady; msg.classList.add('bad'); return; }
+      if (!selectedId) { msg.textContent = t.noSession; msg.classList.add('bad'); return; }
+      if (!lastRangeSegId) { msg.textContent = t.rangeRevertNone; msg.classList.add('bad'); return; }
+      settledKey = '';
+      mixLine.textContent = '';
+      msg.textContent = t.rangeRevert;
+      rangeRevertBtn.disabled = true;
+      try {
+        await ctx.invoke('segmentRevert', [selectedId, { segmentId: lastRangeSegId, format: mixFormat.value }]);
+        revertedRanges.add(lastRangeSegId);
+        lastRangeSegId = '';
+        msg.textContent = t.rangeRevert;
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+        rangeRevertBtn.disabled = !lastRangeSegId;
+      }
+    }
+
     async function runRange(): Promise<void> {
       msg.textContent = '';
       msg.classList.remove('bad');
@@ -2991,6 +3026,7 @@ const coverPanel: WebUiPanel = {
       mixLine.textContent = '';
       msg.textContent = t.rangeRunning;
       rerunRangeBtn.disabled = true;
+      rangeRevertBtn.disabled = true;
       try {
         await ctx.invoke('rangeConvert', [selectedId, {
           startSec: selStart,
@@ -3000,6 +3036,7 @@ const coverPanel: WebUiPanel = {
           protect: Number(rangeProtect.value),
           format: mixFormat.value,
         }]);
+        // 任务跑完后 settle() 会重读会话，届时这一段带 backup，「还原」自动亮起。
       } catch (err) {
         msg.textContent = errText(err);
         msg.classList.add('bad');

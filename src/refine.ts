@@ -203,9 +203,15 @@ export async function rerunRange(
   rangeSamples(clampedStart, clampedEnd, session.converted.sampleRate);
 
   const params = clampParams(session.converted.defaults, opts);
-  const done = await convertSpan(engine, dir, session, clampedStart, clampedEnd, params);
+  // 选段重跑也留一份「重跑前」的备份：和段落重做同一个机制，还原时逐样本写回，
+  // 这样在选段卡片里点「还原」就能退回重跑之前，而不是按默认参数再跑一遍。
+  const backupRel = `segments/range-${Date.now().toString(36)}.bak.wav`;
+  const done = await convertSpan(
+    engine, dir, session, clampedStart, clampedEnd, params, join(dir, backupRel),
+  );
 
   const segment = appendSegment(session, clampedStart, clampedEnd, params);
+  segment.backup = backupRel;
   writeSession(dataDir, id, session);
   return { id, session, segment, done };
 }

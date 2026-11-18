@@ -1,10 +1,10 @@
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   MIN_RANGE_SEC, appendSegment, ensureSegments, mergeSegmentWithNext, mutedRanges, rangeSamples,
-  rerunSession, splitSegmentIn, type CoverEngineAdapter,
+  rerunRange, rerunSession, splitSegmentIn, type CoverEngineAdapter, type EngineAdapter,
 } from '../src/refine.ts';
 import { createSession, defaultSegments, readSession, writeSession } from '../src/session.ts';
 import type { RefineSession, RefineSegment } from '../src/session.ts';
@@ -258,6 +258,42 @@ describe('原地重新翻唱', () => {
         reconvert: async () => { throw new Error('不该调用'); },
       };
       await expect(rerunSession(data, engine, id)).rejects.toThrow(/会话缺少 stems\/vocals\.wav/);
+    } finally {
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+});
+describe('选段重跑留备份', () => {
+  it('重跑前的样本写进 segments/range-*.bak.wav，并记在段上供「还原」使用', async () => {
+    const data = mkdtempSync(join(tmpdir(), 'rvc-range-'));
+    try {
+      const { id, dir } = createSession(data);
+      const rec = record();
+      rec.id = id;
+      rec.source.file = 'source.wav';
+      writeSession(data, id, rec);
+
+      let seen: Record<string, unknown> | null = null;
+      const engine: EngineAdapter = {
+        peaks: async () => { throw new Error('不该调用'); },
+        convertRange: async (req) => {
+          seen = req as unknown as Record<string, unknown>;
+          return { ms: 100, sampleRate: 44100, channels: 1, spliced: { start: 44100, end: 88200, expected: 44100 } };
+        },
+        restoreRange: async () => { throw new Error('不该调用'); },
+      };
+
+      const result = await rerunRange(data, engine, id, { startSec: 1, endSec: 2, pitch: 3 });
+      expect(seen).toMatchObject({ startSec: 1, endSec: 2, pitch: 3, protect: 0.33 });
+      const req = seen as unknown as { backupPath?: string } | null;
+      const backupAbs = String(req?.backupPath ?? '');
+      expect(backupAbs.startsWith(join(dir, 'segments'))).toBe(true);
+      expect(backupAbs).toMatch(/range-[a-z0-9]+\.bak\.wav$/);
+      const backupRel = backupAbs.slice(dir.length + 1).split(sep).join('/');
+      expect(result.segment.backup).toBe(backupRel);
+      expect(result.segment.kind).toBe('range');
+      const stored = readSession(data, id)?.segments.find((item) => item.id === result.segment.id);
+      expect(stored?.backup).toBe(backupRel);
     } finally {
       rmSync(data, { recursive: true, force: true });
     }
