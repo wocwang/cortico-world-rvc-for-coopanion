@@ -90,6 +90,14 @@ class Pipeline(object):
         self.t_center = self.sr * self.x_center  # 查询切点位置
         self.t_max = self.sr * self.x_max  # 免查询时长阈值
         self.device = config.device
+        # 音高 coarse 分箱：上游默认 256 bin 覆盖 50–1100 Hz；360 bin 权重载入时由 VC 改写。
+        self.f0_bin = 256
+        self.f0_max = 1100.0
+
+    def set_f0_bins(self, f0_bin, f0_max):
+        """按权重实际行数设定 coarse 音高分箱；256 bin 权重等价于上游默认行为。"""
+        self.f0_bin = max(16, int(f0_bin))
+        self.f0_max = float(f0_max) if f0_max and f0_max > 0 else 1100.0
 
     def get_f0(
         self,
@@ -102,7 +110,8 @@ class Pipeline(object):
             raise ValueError(f"Unsupported F0 method: {f0_method}")
         time_step = self.window / self.sr * 1000
         f0_min = 50
-        f0_max = 1100
+        f0_max = float(getattr(self, "f0_max", 1100.0) or 1100.0)
+        f0_bin = max(16, int(getattr(self, "f0_bin", 256) or 256))
         f0_mel_min = 1127 * np.log(1 + f0_min / 700)
         f0_mel_max = 1127 * np.log(1 + f0_max / 700)
         if f0_method == "hy2":
@@ -132,7 +141,7 @@ class Pipeline(object):
                     voicing_threshold=0.6,
                     pitch_floor=f0_min,
                     # 追踪上限只影响 pm 的检测范围（宽音域素材能到 1500 Hz）；
-                    # 下面的分箱映射仍按 50–1100 Hz，保持与训练权重一致。
+                    # 分箱映射按权重自己的 f0_max 走（256 bin→1100，360 bin→1600）。
                     pitch_ceiling=max(f0_max, 2400),
                 )
                 .selected_array["frequency"]
@@ -181,11 +190,11 @@ class Pipeline(object):
         f0 *= pow(2, f0_up_key / 12)
         f0bak = f0.copy()
         f0_mel = 1127 * np.log(1 + f0 / 700)
-        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * 254 / (
+        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * (f0_bin - 2) / (
             f0_mel_max - f0_mel_min
         ) + 1
         f0_mel[f0_mel <= 1] = 1
-        f0_mel[f0_mel > 255] = 255
+        f0_mel[f0_mel > f0_bin - 1] = f0_bin - 1
         f0_coarse = np.rint(f0_mel).astype(np.int32)
         return f0_coarse, f0bak  # 1-0
 

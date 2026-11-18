@@ -176,6 +176,21 @@ class VC:
         self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]  # n_spk
         self.if_f0 = self.cpt.get("f0", 1)
         self.version = self.cpt.get("version", "v1")
+        # 音高 embedding 行数：256 是上游默认，360 是放宽 1100 Hz 饱和的自建权重；
+        # 权重里存了多少行就按多少行建，否则 load_state_dict 会 size mismatch。
+        _weight = self.cpt["weight"]
+        _pitch_key = next(
+            (k for k in ("enc_p.emb_pitch.weight", "emb_pitch.weight") if k in _weight),
+            "",
+        )
+        self.f0_bin = int(_weight[_pitch_key].shape[0]) if _pitch_key else 256
+        # 注意：训练脚本把 info 写成字符串（如 '30epoch'），只有自建 360 bin 权重才写字典。
+        _info = self.cpt.get("info")
+        if not isinstance(_info, dict):
+            _info = {}
+        self.f0_max = float(
+            _info.get("f0_max") or (1600.0 if self.f0_bin >= 360 else 1100.0)
+)
 
         synthesizer_class = {
             ("v1", 1): SynthesizerTrnMs256NSFsid,
@@ -190,6 +205,18 @@ class VC:
 
         del self.net_g.enc_q
 
+        # 360 bin 权重的 emb_pitch 比内置模型多，先按权重重建这一层再载入。
+        _enc = getattr(self.net_g, "enc_p", None)
+        _emb = getattr(_enc, "emb_pitch", None)
+        if _emb is None:
+            _emb = getattr(self.net_g, "emb_pitch", None)
+        if _emb is not None and _emb.num_embeddings != self.f0_bin:
+            _new_emb = torch.nn.Embedding(self.f0_bin, _emb.embedding_dim)
+            if getattr(_enc, "emb_pitch", None) is _emb:
+                _enc.emb_pitch = _new_emb
+            else:
+                self.net_g.emb_pitch = _new_emb
+
         self.net_g.load_state_dict(self.cpt["weight"], strict=False)
         self.net_g.eval().to(self.config.device)
         if self.config.is_half:
@@ -198,6 +225,7 @@ class VC:
             self.net_g = self.net_g.float()
 
         self.pipeline = Pipeline(self.tgt_sr, self.config)
+        self.pipeline.set_f0_bins(self.f0_bin, self.f0_max)
         n_spk = self.cpt["config"][-3]
         speaker_info = normalized_speaker_info(self.cpt, n_spk)
         speaker_slider_update, speaker_dropdown_update = speaker_selector_updates(

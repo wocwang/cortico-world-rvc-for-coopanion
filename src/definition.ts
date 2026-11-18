@@ -63,12 +63,15 @@ let live: { cfg: RvcConfigSection; dataDir: string } | null = null;
 
 function voiceOptions(language: Language): Array<{ value: string; label: string }> {
   const auto = language === 'zh' ? '自动（第一个）' : 'Auto (first)';
-  let names: string[] = [];
+  let voices: Array<{ name: string; bin: number | null }> = [];
   if (live) {
     const dir = live.cfg.voicesDir.trim() || join(live.dataDir, 'voices');
-    names = listVoices(dir).map((voice) => voice.name);
+    voices = listVoices(dir).map((voice) => ({ name: voice.name, bin: voice.bin }));
   }
-  return [{ value: '', label: auto }, ...names.map((name) => ({ value: name, label: name }))];
+  return [
+    { value: '', label: auto },
+    ...voices.map((v) => ({ value: v.name, label: v.bin ? `${v.name}（${v.bin} bin）` : v.name })),
+  ];
 }
 
 export const RVC: WorldDefinition<RvcConfigSection> = {

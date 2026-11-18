@@ -368,6 +368,21 @@ def main() -> int:
         base = name if name.lower().endswith(".pth") else name + ".pth"
         return os.path.join(voices, base)
 
+    def write_bin_meta(base: str) -> None:
+        """把权重的音高分箱（256/360 bin 与上限 Hz）写到 sidecar，供面板标注。"""
+        try:
+            meta = {
+                "voice": base,
+                "f0Bin": int(getattr(vc, "f0_bin", 256)),
+                "f0Max": float(getattr(vc, "f0_max", 1100.0)),
+            }
+            with open(
+                os.path.join(voices, base + ".binmeta.json"), "w", encoding="utf-8"
+            ) as fh:
+                json.dump(meta, fh, ensure_ascii=False, indent=1)
+        except Exception as error:  # noqa: BLE001 - 标注失败不影响转换
+            print("[rvc] 写分箱信息失败：%s" % error, file=sys.stderr)
+
     def load_voice(name: str) -> None:
         """换音色（含同名 .index）；同名音色不重复载入。"""
         name = (name or "").strip()
@@ -383,7 +398,12 @@ def main() -> int:
         index = os.path.join(voices, base + ".index")
         current["voice"] = base
         current["index"] = index if os.path.isfile(index) else ""
-        print("[rvc] 已载入音色 %s（index: %s）" % (base, current["index"] or "无"), file=sys.stderr)
+        print(
+            "[rvc] 已载入音色 %s（index: %s，%d bin / %.0f Hz）"
+            % (base, current["index"] or "无", vc.f0_bin, vc.f0_max),
+            file=sys.stderr,
+        )
+        write_bin_meta(base)
 
     default_voice = (os.environ.get("RVC_DEFAULT_VOICE") or "").strip()
     if not default_voice:

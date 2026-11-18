@@ -35,14 +35,14 @@ describe('音色导入与列表', () => {
     const dir = tempDir();
     const got = importVoiceFile(dir, 'my-voice.pth', pth());
     expect(got).toEqual({ name: 'my-voice.pth', kind: 'pth', bytes: (1 << 20) + 32 });
-    expect(listVoices(dir)).toEqual([{ name: 'my-voice', bytes: (1 << 20) + 32, index: null }]);
+    expect(listVoices(dir)).toEqual([{ name: 'my-voice', bytes: (1 << 20) + 32, index: null, bin: null, f0Max: null }]);
   });
 
   it('同名 .index 与 .pth 配对，列表报索引字节数', () => {
     const dir = tempDir();
     importVoiceFile(dir, 'my-voice.pth', pth());
     importVoiceFile(dir, 'my-voice.index', index());
-    expect(listVoices(dir)).toEqual([{ name: 'my-voice', bytes: (1 << 20) + 32, index: 64 << 10 }]);
+    expect(listVoices(dir)).toEqual([{ name: 'my-voice', bytes: (1 << 20) + 32, index: 64 << 10, bin: null, f0Max: null }]);
   });
 
   it('上传路径只取文件名，不会写到目录外', () => {
@@ -90,5 +90,16 @@ describe('音色导入与列表', () => {
     writeFileSync(join(dir, 'broken.pth'), '');
     expect(statSync(join(dir, 'broken.pth')).size).toBe(0);
     expect(listVoices(dir).map((v) => v.name)).toEqual(['a', 'b']);
+  });
+
+  it('载入时写下的分箱 sidecar 会出现在列表里', () => {
+    const dir = tempDir();
+    importVoiceFile(dir, 'wide360.pth', pth());
+    writeFileSync(join(dir, 'wide360.binmeta.json'), JSON.stringify({ voice: 'wide360', f0Bin: 360, f0Max: 1600 }));
+    writeFileSync(join(dir, 'broken.binmeta.json'), '{ not json');
+    importVoiceFile(dir, 'broken.pth', pth());
+    const list = listVoices(dir);
+    expect(list[0]).toEqual({ name: 'broken', bytes: (1 << 20) + 32, index: null, bin: null, f0Max: null });
+    expect(list[1]).toEqual({ name: 'wide360', bytes: (1 << 20) + 32, index: null, bin: 360, f0Max: 1600 });
   });
 });

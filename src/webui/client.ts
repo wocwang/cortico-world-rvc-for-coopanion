@@ -258,7 +258,14 @@ interface VoiceRow {
   name: string;
   bytes: number;
   index: number | null;
+  /** 权重自带的音高分箱行数；sidecar 未生成时为 null。 */
+  bin?: number | null;
+  /** 分箱音高上限 Hz；未知为 null。 */
+  f0Max?: number | null;
 }
+
+/** 权重类型标签：360 bin 权重比上游默认的 256 bin 覆盖更高音域。 */
+const binTag = (v: VoiceRow): string => (v.bin ? ` · ${v.bin} bin` : '');
 interface VoicesResp {
   voices: VoiceRow[];
 }
@@ -708,7 +715,7 @@ const convertPanel: WebUiPanel = {
       state = s;
       // 「默认」是跟随配置/目录第一个的动态项，把实际音色带上，免得和下面的显式项看起来一样。
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
-      fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
+      fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) + binTag(v) }))]);
       if (!voiceInitialized) {
         voiceInitialized = true;
         voiceSelect.value = preferredVoice != null && (preferredVoice === '' || voices.some((v) => v.name === preferredVoice))
@@ -935,6 +942,7 @@ const coverPanel: WebUiPanel = {
       sepLine,
       ui.h('div', 'rvc-detail', t.coverInferHint),
       inferKnobs,
+      ui.h('div', 'rvc-detail', t.inferHint),
       acts,
       dirtyLine,
       mixBlock,
@@ -996,7 +1004,8 @@ const coverPanel: WebUiPanel = {
     let abLabelA = '';
     let abLabelB = '';
 
-    const refineSheet = ui.section(t.refineTitle, t.refineHint);
+    // 后期工具收进折叠卡：主卡上只留一次翻唱要用的东西，编辑/重跑/母带按需展开。
+    const refineSheet = ui.foldSheet('rvc-post-refine', { title: t.refineTitle, desc: t.refineHint, defaultOpen: true });
     const sessionSelect = ui.select({
       options: [],
       onChange: (value) => chooseSession(value),
@@ -1012,7 +1021,7 @@ const coverPanel: WebUiPanel = {
     outputLine.hidden = true;
 
     // 选段重跑：波形上拖出 [a,b)，只重渲这一段，区间外样本保持不变。
-    const waveSheet = ui.section(t.rangeTitle, t.rangeHint);
+    const waveSheet = ui.foldSheet('rvc-post-range', { title: t.rangeTitle, desc: t.rangeHint, defaultOpen: false });
     const canvas = ui.h('canvas', 'rvc-wave');
     const rangeLine = ui.h('div', 'rvc-detail');
     const rangePitch = ui.input({ value: '0' });
@@ -1040,10 +1049,10 @@ const coverPanel: WebUiPanel = {
     // 音高体检：曲线与热力条画在同一个波形画布上，下面只列跑调区间。
     const pitchLine = ui.h('div', 'rvc-detail', t.pitchHint);
     const pitchList = ui.h('div', 'rvc-pitch-regions');
-    waveSheet.append(canvas, rangeLine, pitchLine, pitchList, rangeKnobs, rangeActs);
+    waveSheet.body.append(canvas, rangeLine, pitchLine, pitchList, rangeKnobs, rangeActs);
 
     // 一键母带：另存，不覆盖最近一次混音。
-    const masterSheet = ui.section(t.masterTitle, t.masterHint);
+    const masterSheet = ui.foldSheet('rvc-post-master', { title: t.masterTitle, desc: t.masterHint, defaultOpen: false });
     const masterPreset = ui.select({
       value: '-14',
       options: [
@@ -1057,7 +1066,7 @@ const coverPanel: WebUiPanel = {
     const masterActs = ui.actions();
     masterActs.append(masterBtn);
     const masterLine = ui.h('div', 'rvc-detail');
-    masterSheet.append(ui.field(t.masterPreset, masterPreset), ui.field(t.format, masterFormat), masterActs, masterLine);
+    masterSheet.body.append(ui.field(t.masterPreset, masterPreset), ui.field(t.format, masterFormat), masterActs, masterLine);
 
     // 「重新混音」已经并到上面的主按钮（按 dirty 决定只重混还是先重跑变声），这里只留会话与清理。
     const deleteBtn = ui.button(t.sessionDelete, { size: 'sm', onClick: () => void deleteCurrent() });
@@ -1068,7 +1077,7 @@ const coverPanel: WebUiPanel = {
     const refineDisk = ui.h('div', 'rvc-detail');
     const refineLine = ui.h('div', 'rvc-detail');
     const mixLine = ui.h('div', 'rvc-detail');
-    refineSheet.append(
+    refineSheet.body.append(
       ui.field(t.session, sessionSelect),
       outputRow,
       outputLine,
@@ -1184,13 +1193,13 @@ const coverPanel: WebUiPanel = {
     });
 
     // 段落级参数：默认 20 秒网格，每段独立重做/静音/还原/切分/合并。
-    const segmentSheet = ui.section(t.segmentTitle, t.segmentHint);
+    const segmentSheet = ui.foldSheet('rvc-post-segment', { title: t.segmentTitle, desc: t.segmentHint, defaultOpen: false });
     const segmentList = ui.h('div', 'rvc-segments');
     const segmentLine = ui.h('div', 'rvc-detail', t.segmentCutHint);
-    segmentSheet.append(segmentList, segmentLine);
+    segmentSheet.body.append(segmentList, segmentLine);
 
     // A/B 试听：两个隐藏 audio，各自持有一条成品；切换只搬 currentTime。
-    const abSheet = ui.section(t.abTitle, t.abHint);
+    const abSheet = ui.foldSheet('rvc-post-ab', { title: t.abTitle, desc: t.abHint, defaultOpen: false });
     const abLine = ui.h('div', 'rvc-detail', t.abNeedTwo);
     const abABtn = ui.button('A', { size: 'sm', onClick: () => void abPlay('A') });
     const abBBtn = ui.button('B', { variant: 'primary', size: 'sm', onClick: () => void abPlay('B') });
@@ -1202,9 +1211,14 @@ const coverPanel: WebUiPanel = {
     const abAudioB = document.createElement('audio');
     abAudioA.hidden = true;
     abAudioB.hidden = true;
-    abSheet.append(abActs, abLine);
+    abSheet.body.append(abActs, abLine);
 
-    ctx.root.append(recentSheet.el, librarySheet.el, sheet, audio, resultLine, dl, refineSheet, waveSheet, masterSheet, segmentSheet, abSheet, abAudioA, abAudioB, libraryAudio, msg);
+    ctx.root.append(
+      recentSheet.el, sheet, audio, resultLine, dl,
+      refineSheet.el, waveSheet.el, masterSheet.el, segmentSheet.el, abSheet.el,
+      librarySheet.el,
+      abAudioA, abAudioB, libraryAudio, msg,
+    );
     ctx.own(disposable(() => {
       stopPreview();
       stopAB();
@@ -2362,7 +2376,9 @@ const coverPanel: WebUiPanel = {
       updateRangeLine();
       drawWave();
       msg.textContent = t.pitchJump;
-      waveSheet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // 折叠卡默认收起：先展开再滚过去，否则滚到的是一个看不见内容的标题。
+      (waveSheet.el as HTMLDetailsElement).open = true;
+      waveSheet.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
 
     // ---- A/B 试听 ----------------------------------------------------------
@@ -2606,7 +2622,7 @@ const coverPanel: WebUiPanel = {
         bgmMode.value = s.defaults.panelKind === 'clean' ? 'clean' : 'bgm';
       }
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
-      fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) }))]);
+      fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) + binTag(v) }))]);
       if (!voiceInitialized) {
         voiceInitialized = true;
         voiceSelect.value = preferredVoice != null && (preferredVoice === '' || voices.some((v) => v.name === preferredVoice))
@@ -3464,10 +3480,13 @@ const voicesPanel: WebUiPanel = {
       list.textContent = '';
       if (!voices.length) { list.append(ui.h('div', 'rvc-detail', t.noVoiceHint)); return; }
       for (const v of voices) {
-        const line = row(list, ui, t.voiceLabel(v.name));
+        const line = row(list, ui, t.voiceLabel(v.name) + binTag(v));
         const using = v.name === defaultVoice;
         setPill(line.pill, using ? t.using : '', using ? 'on' : 'off');
-        line.detail.textContent = [ui.fmt.bytes(v.bytes), v.index ? t.indexHas(ui.fmt.bytes(v.index)) : t.indexNone].join(' · ');
+        const binText = v.bin
+          ? `${t.binLabel} ${v.bin} bin${v.f0Max ? ` · ≤${Math.round(v.f0Max)} Hz` : ''}`
+          : t.binUnknown;
+        line.detail.textContent = [binText, ui.fmt.bytes(v.bytes), v.index ? t.indexHas(ui.fmt.bytes(v.index)) : t.indexNone].join(' · ');
         if (!using) line.acts.append(ui.button(t.setDefault, { size: 'sm', onClick: () => void useVoice(v.name) }));
         line.acts.append(ui.button(armedDelete === v.name ? t.confirmDelete : t.deleteVoice, {
           size: 'sm',
@@ -3495,10 +3514,10 @@ const voicesPanel: WebUiPanel = {
 
 const bundle: WebUiClientBundle = {
   panels: {
-    service: servicePanel,
-    convert: convertPanel,
     cover: coverPanel,
+    convert: convertPanel,
     voices: voicesPanel,
+    service: servicePanel,
   },
 };
 export default bundle;

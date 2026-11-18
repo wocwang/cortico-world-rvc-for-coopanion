@@ -5,7 +5,7 @@
  * 与大小下限，挡住改错扩展名、下了一半的文件；真正的权重结构由推理时 `torch.load` 判定。
  */
 import { basename, join } from 'node:path';
-import { closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 
 export interface VoiceInfo {
   /** `.pth` 文件名去掉扩展名。 */
@@ -14,6 +14,10 @@ export interface VoiceInfo {
   bytes: number;
   /** 同名 `.index` 的字节数；没有为 null。 */
   index: number | null;
+  /** 权重自带的音高分箱行数（256/360）；sidecar 还没写出来时为 null。 */
+  bin: number | null;
+  /** 分箱覆盖的音高上限 Hz；未知为 null。 */
+  f0Max: number | null;
 }
 
 /** `.pth` 下限 1 MB；`.index` 下限 64 KB —— 都比正常文件小一个数量级以上。 */
@@ -30,7 +34,24 @@ function looksLikeFaissIndex(data: Buffer): boolean {
   return data.length >= 4 && data[0] === 0x49 && (data[1] === 0x77 || data[1] === 0x78);
 }
 
-/** 列表：按 `.pth` 收集，同名 `.index` 顺带报字节数。 */
+/** 读权重载入时写下的分箱标注（`<name>.binmeta.json`）；没有或坏了都当未知。 */
+function readBinMeta(dir: string, base: string): { bin: number | null; f0Max: number | null } {
+  const path = join(dir, `${base}.binmeta.json`);
+  if (!existsSync(path)) return { bin: null, f0Max: null };
+  try {
+    const meta = JSON.parse(readFileSync(path, 'utf8')) as { f0Bin?: number; f0Max?: number };
+    const bin = Number(meta.f0Bin);
+    const f0Max = Number(meta.f0Max);
+    return {
+      bin: Number.isFinite(bin) && bin > 0 ? bin : null,
+      f0Max: Number.isFinite(f0Max) && f0Max > 0 ? f0Max : null,
+    };
+  } catch {
+    return { bin: null, f0Max: null };
+  }
+}
+
+/** 列表：按 `.pth` 收集，同名 `.index` 顺带报字节数，分箱标注若已生成一并报出。 */
 export function listVoices(dir: string): VoiceInfo[] {
   let names: string[] = [];
   try { names = readdirSync(dir); } catch { return []; }
@@ -38,8 +59,10 @@ export function listVoices(dir: string): VoiceInfo[] {
   for (const file of names.filter((n) => n.toLowerCase().endsWith('.pth')).sort()) {
     const bytes = sizeOf(join(dir, file));
     if (!bytes) continue;
-    const indexBytes = sizeOf(join(dir, `${file.slice(0, -4)}.index`));
-    out.push({ name: file.slice(0, -4), bytes, index: indexBytes || null });
+    const base = file.slice(0, -4);
+    const indexBytes = sizeOf(join(dir, `${base}.index`));
+    const meta = readBinMeta(dir, base);
+    out.push({ name: base, bytes, index: indexBytes || null, bin: meta.bin, f0Max: meta.f0Max });
   }
   return out;
 }
