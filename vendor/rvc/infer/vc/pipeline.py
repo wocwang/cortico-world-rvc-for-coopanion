@@ -33,6 +33,7 @@ HY2_MIN_PM_HZ = _env_float("RVC_HY2_MIN_PM_HZ", 600.0)  # pm 低于此频率一�
 HY2_RATIO_LO = _env_float("RVC_HY2_RATIO_LO", 1.22)  # pm/rmvpe 下界，约 3.5 半音
 HY2_RATIO_HI = _env_float("RVC_HY2_RATIO_HI", 2.4)  # 上界，略高于一个八度
 HY2_MEDIAN = int(_env_float("RVC_HY2_MEDIAN", 5))  # 有声区中值滤波窗（帧，10 ms/帧）
+HOP_SWIFT = 256  # SwiftF0 帧移（16 kHz / 256 = 16 ms）
 
 
 def _median_filter_voiced(f0, win):
@@ -93,11 +94,33 @@ class Pipeline(object):
         # 音高 coarse 分箱：上游默认 256 bin 覆盖 50–1100 Hz；360 bin 权重载入时由 VC 改写。
         self.f0_bin = 256
         self.f0_max = 1100.0
+        self.model_swift = None
 
     def set_f0_bins(self, f0_bin, f0_max):
         """按权重实际行数设定 coarse 音高分箱；256 bin 权重等价于上游默认行为。"""
         self.f0_bin = max(16, int(f0_bin))
         self.f0_max = float(f0_max) if f0_max and f0_max > 0 else 1100.0
+
+    def _swift_f0_curve(self, x, p_len):
+        """SwiftF0（16 ms 帧）映射到本 pipeline 的 10 ms 帧网格；置信度 <0.5 记清音。"""
+        if self.model_swift is None:
+            from infer.swift_f0 import SwiftF0
+
+            logger.info("Loading swift f0 model")
+            self.model_swift = SwiftF0()
+        y = np.asarray(x, dtype=np.float32)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        pitch, confidence = self.model_swift.detect(y, 60.0, 1600.0)
+        pitch = np.where(np.asarray(confidence) >= 0.5, np.asarray(pitch, dtype=np.float64), 0.0)
+        if pitch.size < 2:
+            return np.zeros(p_len)
+        step = self.window / self.sr  # 0.01 s
+        grid = np.arange(p_len) * step
+        idx = np.clip(np.rint(grid / (HOP_SWIFT / 16000.0)).astype(int), 0, pitch.size - 1)
+        out = pitch[idx]
+        out[grid > (pitch.size - 1) * (HOP_SWIFT / 16000.0)] = 0.0
+        return out[:p_len]
 
     def get_f0(
         self,
@@ -106,7 +129,7 @@ class Pipeline(object):
         f0_up_key,
         f0_method,
     ):
-        if f0_method not in ("pm", "rmvpe", "fcpe", "hy2"):
+        if f0_method not in ("pm", "rmvpe", "fcpe", "hy2", "swift", "sw2"):
             raise ValueError(f"Unsupported F0 method: {f0_method}")
         time_step = self.window / self.sr * 1000
         f0_min = 50
@@ -114,7 +137,29 @@ class Pipeline(object):
         f0_bin = max(16, int(getattr(self, "f0_bin", 256) or 256))
         f0_mel_min = 1127 * np.log(1 + f0_min / 700)
         f0_mel_max = 1127 * np.log(1 + f0_max / 700)
-        if f0_method == "hy2":
+        if f0_method in ("swift", "sw2"):
+            # SwiftF0 打底（公开基准里精度最高、八度错最少）；sw2 再叠加 pm 八度守卫：
+            # 只有 pm 为 swift 的 1.22~2.4 倍且 >= 600 Hz 时才采用 pm，
+            # 最后对有声区做 5 帧（50 ms）中值滤波去单帧毛刺。
+            f0_s = self._swift_f0_curve(x, p_len)
+            n = min(len(f0_s), p_len)
+            f0_s = np.asarray(f0_s, dtype=np.float64)[:n]
+            if f0_method == "sw2":
+                f0_p = self.get_f0(x, p_len, 0, "pm")[1]
+                n = min(len(f0_s), len(f0_p), p_len)
+                f0_s = f0_s[:n]
+                f0_p = np.asarray(f0_p, dtype=np.float64)[:n]
+                ratio = np.divide(f0_p, np.maximum(f0_s, 1e-9))
+                use_pm = (
+                    (f0_p > 0)
+                    & (f0_s > 0)
+                    & (f0_p >= HY2_MIN_PM_HZ)
+                    & (ratio >= HY2_RATIO_LO)
+                    & (ratio <= HY2_RATIO_HI)
+                )
+                f0_s = np.where(use_pm, f0_p, f0_s)
+            f0 = _median_filter_voiced(f0_s, HY2_MEDIAN)
+        elif f0_method == "hy2":
             # 混合跟踪：rmvpe 打底（中低音稳），只在高音区且呈八度上跳
             # （pm 为 rmvpe 的 1.22~2.4 倍且 >= 600 Hz）时采用 pm。
             # 这样既修掉 rmvpe 的高音掉八度，又避免 pm 在低音/气声段乱跳。
