@@ -366,6 +366,7 @@ export class RvcWorld implements World {
       voice: this.opts.cfg.voice.trim() || firstVoice(paths.voicesDir),
       runtimeDir: paths.runtimeDir || undefined,
       silenceGate: this.opts.cfg.silenceGate !== false,
+      breathGuard: this.opts.cfg.breathGuard !== false,
       log: this.log ?? undefined,
     });
   }

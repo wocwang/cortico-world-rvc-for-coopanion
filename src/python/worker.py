@@ -707,6 +707,101 @@ def main() -> int:
             print("[rvc] 静音门跳过：%s" % error, file=sys.stderr)
             return conv
 
+    # 气声保护：模型遇到气声/轻声（干声几乎没有谐波结构）时会自己「编」一段低频嗡鸣，音量还比
+    # 干声高 15–25 dB，听感像被压低喉咙唱出来。这里按「干声谐噪比低 + 输出明显比干声更响」反推
+    # 这些帧，把干声原样混回去（20 ms 交叉淡化）。正常演唱段几乎不动（实测整曲 4.5% 帧）。
+    # 默认开；要原样输出设 RVC_BREATH_GUARD=0。阈值可用 RVC_BREATH_HNR / RVC_BREATH_OVER_DB 调。
+    BREATH_ENABLED = (os.environ.get("RVC_BREATH_GUARD") or "1").strip().lower() not in ("0", "off", "false", "no")
+    BREATH_HNR_MAX = float(os.environ.get("RVC_BREATH_HNR") or 6.0)
+    BREATH_OVER_DB = float(os.environ.get("RVC_BREATH_OVER_DB") or 6.0)
+
+    def breath_weights(src, src_sr, conv, conv_sr, hop_ms=10.0, hnr_max=None, over_db=None,
+                       floor_db=-50.0, min_run_ms=50.0, fade_ms=20.0):
+        """返回「该用干声」的权重曲线（0..1，采样点对齐到 conv）；算不出来返回 None。"""
+        import numpy as np
+
+        try:
+            import parselmouth
+        except Exception:
+            return None
+        hnr_max = BREATH_HNR_MAX if hnr_max is None else float(hnr_max)
+        over_db = BREATH_OVER_DB if over_db is None else float(over_db)
+        src = np.asarray(src, dtype=np.float32).reshape(-1)
+        conv = np.asarray(conv, dtype=np.float32).reshape(-1)
+        if src.size < int(src_sr * 0.05) or conv.size < 2:
+            return None
+        # 干声逐帧 RMS
+        hop = max(1, int(round(src_sr * hop_ms / 1000.0)))
+        n_frames = max(1, int(np.ceil(src.size / float(hop))))
+        padded = np.zeros(n_frames * hop, dtype=np.float32)
+        padded[: src.size] = src[: n_frames * hop]
+        src_rms = np.sqrt(np.mean(padded.reshape(n_frames, hop) ** 2, axis=1) + 1e-12)
+        src_db = 20.0 * np.log10(src_rms + 1e-9)
+        # 输出逐帧 RMS（按时间对齐到干声帧）
+        ratio = float(conv_sr) / float(src_sr)
+        conv_hop = max(1, int(round(hop * ratio)))
+        n_conv = max(1, int(np.ceil(conv.size / float(conv_hop))))
+        cp = np.zeros(n_conv * conv_hop, dtype=np.float32)
+        cp[: conv.size] = conv[: n_conv * conv_hop]
+        conv_rms = np.sqrt(np.mean(cp.reshape(n_conv, conv_hop) ** 2, axis=1) + 1e-12)
+        conv_db_full = 20.0 * np.log10(conv_rms + 1e-9)
+        src_ticks = (np.arange(n_frames, dtype=np.float64) + 0.5) * hop / float(src_sr)
+        conv_ticks = (np.arange(n_conv, dtype=np.float64) + 0.5) * conv_hop / float(conv_sr)
+        conv_db = np.interp(src_ticks, conv_ticks, conv_db_full)
+        # 干声谐噪比（parselmouth，10 ms 帧；无声/无周期帧会给 -200 之类的低值）
+        try:
+            sound = parselmouth.Sound(np.asarray(src, dtype=np.float64), sampling_frequency=int(src_sr))
+            harms = sound.to_harmonicity_cc(time_step=hop_ms / 1000.0, minimum_pitch=70.0, silence_threshold=0.03)
+            hnr = np.asarray(harms.values[0], dtype=np.float64)
+        except Exception:
+            return None
+        hnr = np.pad(hnr, (0, max(0, n_frames - hnr.size)), mode="edge")[:n_frames]
+        mask = (hnr < hnr_max) & (src_db > float(floor_db)) & ((conv_db - src_db) > over_db)
+        # 只保留 >= min_run_ms 的连续段（避免把单个清辅音全换掉），两端各外扩 2 帧
+        keep = np.zeros(n_frames, dtype=bool)
+        min_run = max(1, int(round(min_run_ms / hop_ms)))
+        edges = np.flatnonzero(np.diff(np.r_[0, mask.astype(np.int8), 0]))
+        for start, end in zip(edges[::2], edges[1::2]):
+            if end - start >= min_run:
+                keep[max(0, start - 2): min(n_frames, end + 2)] = True
+        fade = max(1, int(round(fade_ms / hop_ms)))
+        window = np.hanning(fade + 2)[1:-1] if fade > 2 else np.array([1.0])
+        weights = np.convolve(keep.astype(np.float64), window / window.sum(), mode="same") if window.sum() > 0 else keep.astype(np.float64)
+        out_ticks = np.arange(conv.size, dtype=np.float64) / float(conv_sr)
+        return np.interp(out_ticks, src_ticks, weights).astype(np.float32)
+
+    def breath_guard(conv, src, src_sr, conv_sr):
+        """气声保护后处理：conv 是 RVC 输出（int16 或 float），src 是同一段干声。"""
+        import numpy as np
+
+        if not BREATH_ENABLED:
+            return conv
+        try:
+            data = np.asarray(conv)
+            integer = np.issubdtype(data.dtype, np.integer)
+            scale = 32768.0 if integer else 1.0
+            data = data.astype(np.float32) / scale
+            weights = breath_weights(src, src_sr, data, conv_sr)
+            if weights is None:
+                return conv
+            from math import gcd
+            from scipy.signal import resample_poly
+
+            dry = np.asarray(src, dtype=np.float32).reshape(-1)
+            if int(src_sr) != int(conv_sr):
+                g = gcd(int(src_sr), int(conv_sr))
+                dry = resample_poly(dry, int(conv_sr) // g, int(src_sr) // g).astype(np.float32)
+            mixed = data.copy()
+            n = min(mixed.size, dry.size)
+            if n > 0:
+                mixed[:n] = data[:n] * (1.0 - weights[:n]) + dry[:n] * weights[:n]
+            if integer:
+                return (np.clip(mixed, -1.0, 1.0) * 32767.0).astype(np.int16)
+            return mixed
+        except Exception as error:
+            print("[rvc] 气声保护跳过：%s" % error, file=sys.stderr)
+            return conv
+
     def convert(req: dict) -> None:
         req_id = req.get("id")
         target = (req.get("voice") or "").strip() or default_voice
@@ -743,7 +838,8 @@ def main() -> int:
         if not result or result[0] is None or result[1] is None:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": _last_line(result[0] if result else "没有可转换的音频")})
             return
-        # 静音门：按输入包络把「本来没人的段」压回静音，避免分离残留被放大成嘶声。
+        # 气声保护：把模型在气声/轻声段「编」出来的低频嗡鸣换回干声；再做静音门，把本来没人的段压回静音。
+        result = (result[0], breath_guard(result[1], src_mono, 16000, int(result[0])))
         result = (result[0], gate_vocal(result[1], src_mono, 16000, int(result[0])))
         try:
             write_audio(req.get("output") or "", result[1], int(result[0]), fmt)
@@ -934,6 +1030,7 @@ def main() -> int:
             n = instrumental.shape[1]
             conv = conv[:n] if conv.size >= n else np.pad(conv, (0, n - conv.size))
             # 电平比例按「未门控」的 RMS 算，否则静音被压掉会让整首歌人声变大。
+            conv = breath_guard(conv, vocals.mean(axis=0), 44100, 44100)
             rms_conv_raw = float(np.sqrt(np.mean(conv.astype(np.float64) ** 2)))
             conv = gate_vocal(conv, vocals.mean(axis=0), 44100, 44100)
             if stem_dir:
@@ -1077,6 +1174,7 @@ def main() -> int:
             _stem, _ = sf.read(stem, dtype="float32", always_2d=False)
             if getattr(_stem, "ndim", 1) > 1:
                 _stem = _stem.mean(axis=1)
+            conv = breath_guard(conv, np.asarray(_stem, dtype=np.float32), 44100, 44100)
             conv = gate_vocal(conv, np.asarray(_stem, dtype=np.float32), 44100, 44100)
         except Exception:
             pass
@@ -1474,6 +1572,11 @@ def main() -> int:
         if model_sr != out_sr:
             g = gcd(model_sr, out_sr)
             piece = resample_poly(piece, out_sr // g, model_sr // g).astype(np.float32)
+        # 选段重跑也走气声保护（干声窗口与输出窗口同起点、同采样率）。
+        try:
+            piece = breath_guard(piece, mono, out_sr, out_sr)
+        except Exception as error:
+            print("[rvc] 选段气声保护跳过：%s" % error, file=sys.stderr)
         piece = piece[offset:offset + expected] if piece.size > offset else np.zeros(0, dtype=np.float32)
         if piece.size < expected:
             piece = np.pad(piece, (0, expected - piece.size))

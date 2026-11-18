@@ -50,6 +50,8 @@ export interface EngineOptions {
   startTimeoutMs?: number;
   /** 静音门：默认开；false 时 worker 原样输出（等于 RVC_SILENCE_GATE=0）。 */
   silenceGate?: boolean;
+  /** 气声保护：默认开；false 时 worker 原样输出（等于 RVC_BREATH_GUARD=0）。 */
+  breathGuard?: boolean;
   log?: Logger;
 }
 
@@ -556,6 +558,8 @@ export class RvcEngine {
         RVC_F0_METHOD: process.env.RVC_F0_METHOD ?? 'hy2',
         // 静音门：默认把「本来没人声」的段压成静音（分离残留/气口不再变成嘶声）；RVC_SILENCE_GATE=0 关闭。
         RVC_SILENCE_GATE: process.env.RVC_SILENCE_GATE ?? (this.opts.silenceGate === false ? '0' : '1'),
+        // 气声保护：气声/轻声段换回干声，避免模型「编」出低频嗡鸣；RVC_BREATH_GUARD=0 关闭。
+        RVC_BREATH_GUARD: process.env.RVC_BREATH_GUARD ?? (this.opts.breathGuard === false ? '0' : '1'),
         PATH: this.searchPath(),
       },
     });
