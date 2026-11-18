@@ -68,14 +68,28 @@ class Pipeline(object):
         f0_up_key,
         f0_method,
     ):
-        if f0_method not in ("pm", "rmvpe", "fcpe"):
+        if f0_method not in ("pm", "rmvpe", "fcpe", "hy2"):
             raise ValueError(f"Unsupported F0 method: {f0_method}")
         time_step = self.window / self.sr * 1000
         f0_min = 50
         f0_max = 1100
         f0_mel_min = 1127 * np.log(1 + f0_min / 700)
         f0_mel_max = 1127 * np.log(1 + f0_max / 700)
-        if f0_method == "pm":
+        if f0_method == "hy2":
+            # 混合跟踪：rmvpe 打底（中低音稳），只在高音区且呈八度上跳
+            # （pm 为 rmvpe 的 1.18~2.3 倍且 >= 600 Hz）时采用 pm。
+            # 这样既修掉 rmvpe 的高音掉八度，又避免 pm 在低音/气声段乱跳。
+            f0_r = self.get_f0(x, p_len, 0, "rmvpe")[1]
+            f0_p = self.get_f0(x, p_len, 0, "pm")[1]
+            n = min(len(f0_r), len(f0_p), p_len)
+            f0_r = np.asarray(f0_r, dtype=np.float64)[:n]
+            f0_p = np.asarray(f0_p, dtype=np.float64)[:n]
+            ratio = np.divide(f0_p, np.maximum(f0_r, 1e-9))
+            use_pm = (
+                (f0_p > 0) & (f0_r > 0) & (f0_p >= 600.0) & (ratio >= 1.18) & (ratio <= 2.3)
+            )
+            f0 = np.where(use_pm, f0_p, f0_r)
+        elif f0_method == "pm":
             f0 = (
                 parselmouth.Sound(x, self.sr)
                 .to_pitch_ac(

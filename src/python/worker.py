@@ -355,11 +355,13 @@ def main() -> int:
     vc = VC(config)
     current = {"voice": "", "index": ""}
 
-    # f0 跟踪器：pm（Praat 自相关）在 900 Hz 以上不会把音高读低一个八度，作为默认；
-    # 想要上游旧行为（RMVPE）时设 RVC_F0_METHOD=rmvpe。两条路径的分箱映射完全一致。
-    f0_method = (os.environ.get("RVC_F0_METHOD") or "pm").strip().lower()
-    if f0_method not in ("pm", "rmvpe"):
-        f0_method = "pm"
+    # f0 跟踪器：hy2 = rmvpe 打底、只在高音区用 pm 修八度上跳，作为默认；
+    #   pm    = 纯 Praat 自相关（高音准，但低音/气声段容易乱跳、把音量打空）
+    #   rmvpe = 上游旧默认（中低音稳，900 Hz 以上容易掉八度）
+    # 需要旧行为时设环境变量 RVC_F0_METHOD=rmvpe。分箱映射在三条路径上完全一致。
+    f0_method = (os.environ.get("RVC_F0_METHOD") or "hy2").strip().lower()
+    if f0_method not in ("pm", "rmvpe", "hy2"):
+        f0_method = "hy2"
     print("[rvc] f0 跟踪器：%s" % f0_method, file=sys.stderr)
 
     def voice_path(name: str) -> str:

@@ -550,8 +550,8 @@ export class RvcEngine {
         PYTHONDONTWRITEBYTECODE: '1',
         RVC_DEFAULT_VOICE: this.opts.voice ?? '',
         RVC_UVR_MODEL: this.opts.uvrModel ?? '',
-        // f0 跟踪器：默认 pm，900 Hz 以上不掉八度，用户无需配置；设 RVC_F0_METHOD=rmvpe 可回退。
-        RVC_F0_METHOD: process.env.RVC_F0_METHOD ?? 'pm',
+        // f0 跟踪器：默认 hy2（rmvpe 打底 + 高音区 pm 修八度），用户无需配置；RVC_F0_METHOD=rmvpe / pm 可回退。
+        RVC_F0_METHOD: process.env.RVC_F0_METHOD ?? 'hy2',
         PATH: this.searchPath(),
       },
     });
