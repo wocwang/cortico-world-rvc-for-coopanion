@@ -122,8 +122,11 @@ const TEXT = {
     biliSearching: '正在 B 站搜索…',
     biliNoResult: 'B 站没搜到结果，换个歌名或稍后再试。',
     biliNeedSong: '先填歌名。',
-    biliLowConfidence: (reason: string) => `没找到足够确定的版本（${reason === 'no-result' ? '没有结果' : reason === 'weak-match' ? '标题匹配度不高' : reason === 'ambiguous' ? '同名版本太多' : reason === 'version' ? '像是翻唱 / 伴奏 / 片段' : reason}）。从下面选一首再生成：`,
-    biliCandidateMeta: (author: string, play: string) => `${author} · ${play} 播放`,
+    biliLowConfidence: (reason: string) => `没找到足够确定的版本（${reason === 'no-result' ? '没有结果' : reason === 'weak-match' ? '标题匹配度不高' : reason === 'partial' ? '标题只是包含这个词，不是同名歌曲' : reason === 'ambiguous' ? '同名版本太多' : reason === 'version' ? '像是翻唱 / 伴奏 / 片段' : reason}）。从下面选一首再生成：`,
+    biliCandidateMeta: (author: string, play: string, artist = '') => artist
+      ? `${artist} · ${author} · ${play} 播放`
+      : `${author} · ${play} 播放`,
+    biliPartialTag: '只是标题里包含这个词，不是同名歌曲',
     biliUse: '用这首生成',
     biliGenerating: (title: string) => `正在用「${title}」生成翻唱，一首歌要几分钟…`,
     sourcePicked: (name: string, size: string) => `当前音源：新文件 ${name} · ${size}（会新建一次翻唱，不覆盖当前工程）`,
@@ -481,8 +484,11 @@ const TEXT = {
     biliSearching: 'Searching Bilibili…',
     biliNoResult: 'No Bilibili results. Try another song name or retry later.',
     biliNeedSong: 'Enter a song name first.',
-    biliLowConfidence: (reason: string) => `No reliable match (${reason === 'no-result' ? 'no results' : reason === 'weak-match' ? 'title match is weak' : reason === 'ambiguous' ? 'too many versions' : reason === 'version' ? 'looks like a cover / instrumental / clip' : reason}). Pick one below:`,
-    biliCandidateMeta: (author: string, play: string) => `${author} · ${play} plays`,
+    biliLowConfidence: (reason: string) => `No reliable match (${reason === 'no-result' ? 'no results' : reason === 'weak-match' ? 'title match is weak' : reason === 'partial' ? 'the title only contains that word, it is not this song' : reason === 'ambiguous' ? 'too many versions' : reason === 'version' ? 'looks like a cover / instrumental / clip' : reason}). Pick one below:`,
+    biliCandidateMeta: (author: string, play: string, artist = '') => artist
+      ? `${artist} · ${author} · ${play} plays`
+      : `${author} · ${play} plays`,
+    biliPartialTag: 'The title only contains that word — not this song',
     biliUse: 'Generate with this',
     biliGenerating: (title: string) => `Generating a cover from "${title}" — a song takes a few minutes…`,
     sourcePicked: (name: string, size: string) => `Source: new file ${name} · ${size} (starts a new cover, does not overwrite this project)`,

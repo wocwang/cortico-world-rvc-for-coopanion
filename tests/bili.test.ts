@@ -205,3 +205,49 @@ describe('B 站下载重试', () => {
     expect(readFileSync(dest).length).toBe(audio.length);
   });
 });
+
+describe('歌名级匹配：标题里只是包含这个词不算翻唱目标', () => {
+  it('单字 remember 只命中 Always Remember Us This Way 时列候选，不硬跑', () => {
+    const pick = pickCandidates([
+      hit('BV1JG4y1d7SE', '【高音质收藏向】Always Remember Us This Way,Ladygaga,一个明星的诞生,嘎嘎经典演绎。', { play: 900_000 }),
+    ], 'Remember');
+    expect(pick.confident).toBe(false);
+    expect(pick.reason).toBe('partial');
+    expect(pick.candidates).toHaveLength(1);
+    expect(pick.candidates[0]!.matchLevel).toBe('partial');
+  });
+
+  it('同时有同名曲和只是包含这个词的标题时，选同名曲', () => {
+    const pick = pickCandidates([
+      hit('BV1JG4y1d7SE', '【高音质收藏向】Always Remember Us This Way,Ladygaga', { play: 9_000_000 }),
+      hit('BV1oD4y1o76D', 'Remember - Innovataz', { play: 1_000_000 }),
+    ], 'Remember');
+    expect(pick.confident).toBe(true);
+    expect(pick.reason).toBe('ok');
+    expect(pick.candidates[0]!.bvid).toBe('BV1oD4y1o76D');
+  });
+
+  it('整名查询（多词歌名）仍然算同名', () => {
+    const pick = pickCandidates([
+      hit('BV1JG4y1d7SE', '【高音质收藏向】Always Remember Us This Way,Ladygaga,一个明星的诞生'),
+    ], 'Always Remember Us This Way');
+    expect(pick.confident).toBe(true);
+    expect(pick.reason).toBe('ok');
+  });
+
+  it('中文单字只命中别的歌名时也算 partial', () => {
+    const pick = pickCandidates([hit('BV1', '雨天 孙燕姿')], '雨');
+    expect(pick.confident).toBe(false);
+    expect(pick.reason).toBe('partial');
+  });
+
+  it('同名不同歌手：让用户按歌手选，不替他猜', () => {
+    const pick = pickCandidates([
+      hit('BV1', '晴天 周杰伦 官方MV', { play: 9_000_000 }),
+      hit('BV2', '晴天 某某某 官方MV', { play: 8_000_000 }),
+    ], '晴天');
+    expect(pick.confident).toBe(false);
+    expect(pick.reason).toBe('ambiguous');
+    expect(pick.candidates.map((item) => item.artist)).toEqual(['周杰伦', '某某某']);
+  });
+});

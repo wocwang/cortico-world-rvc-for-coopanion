@@ -53,6 +53,10 @@ interface BiliCandidate {
   durationSec: number;
   play: number;
   score?: number;
+  /** 标题与歌名的匹配级别；partial 表示标题只是包含这个词。 */
+  matchLevel?: 'exact' | 'suffix' | 'partial' | 'none';
+  /** 标题里认出来的歌手，用来区分同名曲。 */
+  artist?: string;
 }
 interface BiliPickResp {
   confident: boolean;
@@ -1542,7 +1546,11 @@ const coverPanel: WebUiPanel = {
         const meta = ui.h('div', 'rvc-detail', t.biliCandidateMeta(
           cand.author || '—',
           Math.max(0, cand.play).toLocaleString(),
+          cand.artist || '',
         ));
+        if (cand.matchLevel === 'partial') {
+          meta.append(ui.h('div', 'rvc-detail', t.biliPartialTag));
+        }
         const acts = ui.actions();
         // 带上后面的候选：用户选的那条失效/412 时还能自动换下一条。
         acts.append(ui.button(t.biliUse, { size: 'sm', onClick: () => void runBili(pick.candidates.slice(index)) }));

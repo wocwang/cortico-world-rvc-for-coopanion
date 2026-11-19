@@ -42,6 +42,16 @@ function normWithMap(text: string): { value: string; map: number[] } {
   return { value, map };
 }
 
+/** 去掉 B 站标题里的高亮标签与 HTML 实体。 */
+export function stripTags(text: string): string {
+  return String(text || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
 export function tokensOf(query: string): string[] {
   return String(query || '')
     .toLowerCase()
@@ -146,6 +156,90 @@ export function appendedSuffix(shortText: string, longText: string): AppendedSuf
       && !KEEP_CHAR.test(String(longText)[last + 1]!);
   }
   return { at, extra, boundary, suffix: isAppendedSuffix(extra, boundary) };
+}
+
+/** 汉字姓名 / 团体名：2-8 个字，不带版本词。 */
+const ARTIST_CJK = /^[\u3400-\u9fff]{2,8}$/;
+
+/**
+ * 去掉【】[]（）() 包裹段：画质、宣传语、版本标注常常整段写在括号里，
+ * 但它们不是歌名的一部分。书名号里的歌名保留。
+ */
+export function stripBracketSegments(text: string): string {
+  return String(text || '')
+    .replace(/【[^】]*】/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/（[^）]*）/g, ' ')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** 标题里参与「歌名」比较的那一段：去标签、去括号段；整个歌名都在括号里时退回括号内内容。 */
+export function songCoreText(title: string): string {
+  const tagged = stripTags(title);
+  const bare = stripBracketSegments(tagged);
+  if (norm(bare)) return bare;
+  return tagged.replace(/[【】\[\]（）()]/g, ' ');
+}
+
+/**
+ * 歌名之后多出来的那一截，是否像「歌手 / 版本」之类的后缀。
+ * 与 {@link isAppendedSuffix} 的区别：**不接受任意多词尾巴**，所以
+ * 「Remember」+「Us This Way」不会被当成同名前缀，只算标题里包含这个词。
+ */
+export function looksLikeVersionTail(extra: string): boolean {
+  const raw = String(extra || '').trim();
+  if (!raw) return false;
+  if (isSuffixMarker(raw)) return true;
+  const parts = raw.split(/[^\p{L}\p{N}]+/u).filter((part) => part.length > 0);
+  if (!parts.length || parts.length > 3) return false;
+  // 纯拉丁的尾巴：只接受单个首字母大写的人名 / 团体名；两三个拉丁词多半是歌名续写
+  // （Always Remember Us This Way 里的 Remember Us This Way），不能当歌手。
+  const latin = parts.filter((part) => /^[A-Za-z0-9.&']+$/.test(part));
+  if (latin.length > 1) return false;
+  return parts.every((part) => {
+    const plain = norm(part);
+    if (!plain) return true;
+    if (isSuffixMarker(part)) return true;
+    if (ARTIST_CJK.test(plain)) return true;
+    return /^[A-Z][A-Za-z0-9]{0,14}$/.test(part);
+  });
+}
+
+export type SongMatchLevel = 'exact' | 'suffix' | 'partial' | 'none';
+
+/**
+ * 歌名级匹配：exact 整名相同；suffix 歌名 + 歌手/版本尾巴；partial 只是标题里包含这个词
+ * （如「Always Remember Us This Way」里的 remember）；none 完全没出现。
+ * partial 永远不能自动开跑 —— 那是另一首歌。
+ */
+export function songMatchLevel(title: string, query: string): SongMatchLevel {
+  const q = norm(query);
+  if (!q) return 'none';
+  const core = songCoreText(title);
+  const plain = norm(core);
+  if (!plain) return 'none';
+  if (plain === q) return 'exact';
+  if (plain.startsWith(q)) {
+    const { map } = normWithMap(core);
+    const end = map[q.length - 1];
+    if (end === undefined) return 'partial';
+    return looksLikeVersionTail(core.slice(end + 1)) ? 'suffix' : 'partial';
+  }
+  return plain.includes(q) ? 'partial' : 'none';
+}
+
+/** 文本里歌名之后的原文尾巴（按规范化后的首次命中），用来猜歌手；没有命中返回空串。 */
+export function tailAfter(text: string, query: string): string {
+  const q = norm(query);
+  if (!q) return '';
+  const raw = String(text || '');
+  const { value, map } = normWithMap(raw);
+  const at = value.indexOf(q);
+  if (at < 0) return '';
+  const end = map[at + q.length - 1];
+  return end === undefined ? '' : raw.slice(end + 1);
 }
 
 export interface QueryParts {

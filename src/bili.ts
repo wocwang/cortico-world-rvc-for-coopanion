@@ -30,7 +30,10 @@
  * （内容一般是 audio/mp4）。不需要登录。
  */
 import { writeFile } from 'node:fs/promises';
-import { isRendition, norm, renditionKinds, splitQuery } from './match.ts';
+import {
+  isRendition, isSuffixMarker, norm, renditionKinds, songMatchLevel, splitQuery, stripTags, tailAfter,
+  type SongMatchLevel,
+} from './match.ts';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
@@ -42,6 +45,10 @@ export interface SearchHit {
   durationSec: number;
   play: number;
   score?: number;
+  /** 标题与歌名的匹配级别：partial 只表示「标题里包含这个词」，不是同一首歌。 */
+  matchLevel?: SongMatchLevel;
+  /** 标题里的歌手 / 团体名（从歌名之后的尾巴里认）；认不出就是空串。 */
+  artist?: string;
 }
 
 /** 标题里出现就重罚的词：教程、伴奏、合集、直播回放…… */
@@ -51,7 +58,7 @@ const GOOD_TITLE = /官方|mv|原唱|原版|纯享|收藏级|高音质|无损|�
 /** 标题党：自称「这才是原版」的搬运，不能靠 GOOD_TITLE 加分压过真目标。 */
 const CLICKBAIT_TITLE = /这才是|不是原版|伪原版|盗版|搬运|补档|全网首发|震惊/;
 
-export type BiliReason = 'ok' | 'no-result' | 'weak-match' | 'version' | 'ambiguous';
+export type BiliReason = 'ok' | 'no-result' | 'weak-match' | 'partial' | 'version' | 'ambiguous';
 
 export interface BiliPick {
   /** 是否足够确定：不确定就把候选交给用户选，别硬跑几分钟。 */
@@ -95,15 +102,6 @@ function durationToSec(text: string): number {
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
   return parts[0] || 0;
-}
-
-function stripTags(text: string): string {
-  return String(text || '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>');
 }
 
 /** 视频标题里与曲名无关的制作 / 画质 / 宣传词；保留翻唱、现场、伴奏这类版本信息。 */
@@ -196,6 +194,32 @@ function corpusOf(hit: SearchHit): string {
   return `${norm(hit.title)}\u0000${norm(hit.author)}`;
 }
 
+/** 歌手名里不该出现的词：画质、音质、版本、演绎标记。 */
+const ARTIST_NOISE =
+  /画质|音质|高清|超清|无损|完整|纯享|收藏|字幕|修复|母带|正版|原版|官方|录音棚|动态|歌词|hi-?res|4k|8k|1080p?|720p?|60帧|120帧|original|mix|remix|instrumental|inst|karaoke|cover|live|acoustic|feat|ft|mv|demo|ver/i;
+
+/**
+ * 从标题里猜歌手：歌名之后第一个像人名的片段（2-8 个汉字，或单个首字母大写的拉丁词）。
+ * 用来在「同名不同歌手」时让用户靠歌手区分；认不出就是空串，绝不用 UP 主名冒充。
+ */
+export function artistOf(title: string, base: string, query = ''): string {
+  const tail = tailAfter(title, base);
+  if (!tail) return '';
+  const queryPlain = norm(query);
+  // 引号里多半是歌词 / 专辑名，不是歌手，整段丢掉。
+  const plainTail = tail.replace(/“[^”]*”|‘[^’]*’|「[^」]*」|『[^』]*』|《[^》]*》/gu, ' ');
+  const parts = plainTail.split(/[^\p{L}\p{N}]+/u).filter((part) => part.length > 0);
+  for (const part of parts) {
+    const plain = norm(part);
+    if (!plain || plain.length < 2 || isSuffixMarker(part) || ARTIST_NOISE.test(part)) continue;
+    // 查询本身的词不算歌手：查「Always Remember Us This Way」时尾巴里的 Remember 是歌名。
+    if (queryPlain.includes(plain)) continue;
+    if (/^[\u3400-\u9fff]{2,8}$/.test(plain)) return part;
+    if (/^[A-Z][A-Za-z0-9]{2,14}$/.test(part)) return part;
+  }
+  return '';
+}
+
 /**
  * 相关性打分。为什么需要：只看第一条经常挑到教程、合集、伴奏、甚至不是那首歌的翻弹。
  *
@@ -205,8 +229,30 @@ function corpusOf(hit: SearchHit): string {
  * 这类否定直接重罚；完整关键词短语再 +12。播放量仍封顶 4，避免大 UP 的无关
  * 视频靠粉数压过准确度。
  */
+const LEVEL_RANK: Record<SongMatchLevel, number> = { exact: 3, suffix: 2, partial: 1, none: 0 };
+
+/**
+ * 歌名级匹配取「对歌名」和「对整条查询」中更好的那个：整名查询（Remember me）也要算同名。
+ * 歌名部分也一起返回：猜歌手时要用真正命中的那一段，否则「Always Remember Us This Way」
+ * 会从歌名后面的 Remember 里猜出个假歌手。
+ */
+function matchOf(title: string, base: string, full: string): { level: SongMatchLevel; name: string } {
+  const levelBase = songMatchLevel(title, base);
+  const levelWhole = full && full !== base ? songMatchLevel(title, full) : 'none';
+  const better = LEVEL_RANK[levelWhole] > LEVEL_RANK[levelBase];
+  const level = better ? levelWhole : levelBase;
+  const baseFailed = levelBase === 'partial' || levelBase === 'none';
+  const name = baseFailed && (levelWhole === 'exact' || levelWhole === 'suffix') ? full : base;
+  return { level, name };
+}
+
+/** 歌名级命中才有歌手；只是包含某个词的行不要显示假歌手。 */
+function songLevel(level: SongMatchLevel): boolean {
+  return level === 'exact' || level === 'suffix';
+}
+
 export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''): SearchHit[] {
-  const { tokens, qualifiers, full: fullPhrase, suffixIntent } = splitQuery(keyword);
+  const { tokens, qualifiers, full: fullPhrase, suffixIntent, base } = splitQuery(keyword);
   const extraBad = excludeWords
     .split(/[,，、]+/)
     .map((w) => w.trim().toLowerCase())
@@ -217,13 +263,18 @@ export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''):
       const plain = norm(hit.title);
       const author = norm(hit.author);
       const corpus = corpusOf(hit);
+      const match = matchOf(hit.title, base, fullPhrase);
+      const level = match.level;
       let score = 0;
       let hitCount = 0;
       for (const t of tokens) {
         if (corpus.includes(t)) hitCount += 1;
       }
       score += hitCount * 8 - (tokens.length - hitCount) * 10;
-      if (fullPhrase && (plain.includes(fullPhrase) || author.includes(fullPhrase))) score += 12;
+      // 整名相同才算短语命中；「标题里包含这个词」是另一首歌，反而要扣分。
+      if (fullPhrase && (level === 'exact' || level === 'suffix')
+        && (plain.includes(fullPhrase) || author.includes(fullPhrase))) score += 12;
+      if (level === 'partial') score -= 6;
       if (qualifiers.length) {
         const have = qualifiers.filter((t) => corpus.includes(t)).length;
         score += have * 10 - (qualifiers.length - have) * 14;
@@ -241,7 +292,8 @@ export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''):
       // 原始名次只做很轻的决胜，避免完全无视 B 站的相关度。
       score += Math.max(0, 1 - index * 0.05);
       if (hit.durationSec >= 90 && hit.durationSec <= 600) score += 2;
-      return { ...hit, score: Math.round(score * 10) / 10 };
+      const artist = songLevel(level) ? artistOf(hit.title, match.name, fullPhrase || base) : '';
+      return { ...hit, score: Math.round(score * 10) / 10, matchLevel: level, artist };
     })
     .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 }
@@ -252,17 +304,25 @@ export function rankHits(hits: SearchHit[], keyword: string, excludeWords = ''):
  */
 export function pickCandidates(hits: SearchHit[], keyword: string, limit = 6): BiliPick {
   const ranked = rankHits(hits, keyword);
-  const { tokens, qualifiers, full: fullPhrase, suffixIntent } = splitQuery(keyword);
+  const { tokens, qualifiers, full: fullPhrase, suffixIntent, base } = splitQuery(keyword);
+  const levelOf = (hit: SearchHit): SongMatchLevel => hit.matchLevel ?? matchOf(hit.title, base, fullPhrase).level;
   const hasAll = (hit: SearchHit, want: string[]): boolean => {
     const corpus = corpusOf(hit);
     return want.length > 0 && want.every((t) => corpus.includes(t));
   };
   const negatesQualifier = (hit: SearchHit): boolean => qualifiers.some((t) =>
     new RegExp(`(?:不是|并非|非|没有|无)${escapeRe(t)}`).test(norm(hit.title)));
-  const matched = ranked.filter((hit) => hasAll(hit, tokens) && !negatesQualifier(hit));
+  // 只有歌名级命中（同名，或同名 + 歌手/版本尾巴）才可能是用户点的那首。只是标题里
+  // 包含这个词（Remember 之于 Always Remember Us This Way）是另一首歌，绝不自动开跑。
+  const matched = ranked.filter((hit) => {
+    const level = levelOf(hit);
+    return (level === 'exact' || level === 'suffix') && hasAll(hit, tokens) && !negatesQualifier(hit);
+  });
   // 一条都没匹配到：把最接近的几条列出来，让用户自己判断。
   if (!matched.length) {
-    return { confident: false, reason: ranked.length ? 'weak-match' : 'no-result', candidates: ranked.slice(0, limit) };
+    if (!ranked.length) return { confident: false, reason: 'no-result', candidates: [] };
+    const partial = ranked.some((hit) => levelOf(hit) === 'partial' && !negatesQualifier(hit));
+    return { confident: false, reason: partial ? 'partial' : 'weak-match', candidates: ranked.slice(0, limit) };
   }
   // 附加片段是硬条件：有带片段的候选时，明显不符的候选不进首选。
   const strict = qualifiers.length ? matched.filter((hit) => hasAll(hit, qualifiers)) : matched;
@@ -282,10 +342,15 @@ export function pickCandidates(hits: SearchHit[], keyword: string, limit = 6): B
   if ((top.score ?? 0) < 8 && !topFull) {
     return { confident: false, reason: 'weak-match', candidates: pool.slice(0, limit) };
   }
-  // 同名的多个上传分数接近：如果都是「原版 / 无损 / Hi-res」这种同一录音的不同搬运，
-  // 可以确定；只有现场 / 翻唱 / remix 等不同演绎才需要问用户。
+  // 同名曲的多个版本：同一录音的不同搬运（原版 / 无损 / Hi-res）可以确定；
+  // 不同歌手、或不同演绎（现场 / 翻唱 / remix）要问用户。
   if (second && !BAD_TITLE.test(second.title.toLowerCase())) {
     const gap = (top.score ?? 0) - (second.score ?? 0);
+    const topArtist = top.artist ?? artistOf(top.title, base, fullPhrase || base);
+    const secondArtist = second.artist ?? artistOf(second.title, base, fullPhrase || base);
+    if (topArtist && secondArtist && topArtist !== secondArtist) {
+      return { confident: false, reason: 'ambiguous', candidates: pool.slice(0, limit) };
+    }
     if (gap < 3 && renditionKinds(top.title) !== renditionKinds(second.title)) {
       return { confident: false, reason: 'ambiguous', candidates: pool.slice(0, limit) };
     }
