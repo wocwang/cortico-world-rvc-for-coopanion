@@ -1107,12 +1107,32 @@ const coverPanel: WebUiPanel = {
       size: 'sm', onClick: () => void saveRetention(),
     });
     const retentionLine = ui.h('div', 'rvc-detail');
+    // 「打开最近翻唱目录」：所有会话都在这个目录下，方便手动找文件 / 备份。
+    const recentOpenLine = ui.h('div', 'rvc-detail');
+    const recentOpenActs = ui.actions();
+    recentOpenActs.append(ui.button(t.recentOpenFolder, {
+      size: 'sm',
+      onClick: () => {
+        void (async () => {
+          try {
+            const r = await ctx.invoke<{ dir: string }>('sessionsOpen');
+            recentOpenLine.textContent = t.recentOpenDone(r.dir);
+            recentOpenLine.classList.remove('bad');
+          } catch (err) {
+            recentOpenLine.textContent = errText(err);
+            recentOpenLine.classList.add('bad');
+          }
+        })();
+      },
+    }));
     const retentionRow = ui.h('div', 'rvc-grid');
     retentionRow.append(ui.field(t.retentionDays, daysInput), ui.field(t.retentionGb, gbInput));
     const retentionActs = ui.actions();
     retentionActs.append(retentionSave);
     recentSheet.body.append(
       recentList,
+      recentOpenActs,
+      recentOpenLine,
       ui.h('div', 'rvc-detail', t.retentionHint),
       retentionRow,
       retentionActs,
@@ -1677,10 +1697,29 @@ const coverPanel: WebUiPanel = {
           ? t.recentOutput(last.path.replace(/^out\//, ''), ui.fmt.bytes(last.bytes))
           : t.recentNoOutput);
         const acts = ui.actions();
+        // 「打开文件夹」：直接在资源管理器里打开这个会话目录（原声、分轨、成品都在里面）。
+        let rowOpenLine: HTMLElement | null = null;
         acts.append(
           ui.button(t.recentResume, { size: 'sm', onClick: () => chooseSession(s.id) }),
           ui.button(t.recentExport, { size: 'sm', onClick: () => toggleExport(row, s) }),
           ui.button(t.librarySave, { size: 'sm', onClick: () => toggleLibrary(row, s) }),
+          ui.button(t.recentRowOpen, {
+            size: 'sm',
+            onClick: () => {
+              void (async () => {
+                rowOpenLine ??= ui.h('div', 'rvc-detail');
+                if (!rowOpenLine.isConnected) row.append(rowOpenLine);
+                try {
+                  const r = await ctx.invoke<{ dir: string }>('sessionOpen', [s.id]);
+                  rowOpenLine.textContent = t.recentRowOpenDone(r.dir);
+                  rowOpenLine.classList.remove('bad');
+                } catch (err) {
+                  rowOpenLine.textContent = errText(err);
+                  rowOpenLine.classList.add('bad');
+                }
+              })();
+            },
+          }),
           ui.button(t.sessionDelete, { size: 'sm', onClick: () => void deleteById(s.id) }),
         );
         if (s.id === selectedId) {

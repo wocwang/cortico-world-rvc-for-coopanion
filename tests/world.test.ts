@@ -227,6 +227,19 @@ describe('World 面板数据面', () => {
     await expect(invoke('libraryOpen', [])).rejects.toThrow('找不到资源管理器');
   });
 
+  it('最近翻唱能打开会话目录与总目录；找不到会话时明确报错', async () => {
+    const { invoke, dataDir } = await makeWorld();
+    const { id } = seedSession(dataDir);
+    const nope = join(tmpdir(), `no-explorer-${Date.now()}`);
+    vi.stubEnv('SystemRoot', nope);
+    vi.stubEnv('WINDIR', nope);
+    // 会话目录解析通过后才会去找资源管理器，所以这两条报「找不到资源管理器」= 路径已定位。
+    await expect(invoke('sessionOpen', [id])).rejects.toThrow('找不到资源管理器');
+    await expect(invoke('sessionsOpen', [])).rejects.toThrow('找不到资源管理器');
+    await expect(invoke('sessionOpen', [''])).rejects.toThrow('找不到会话');
+    await expect(invoke('sessionOpen', ['nope'])).rejects.toThrow('找不到会话');
+  });
+
   it('按音色名成对添加 .pth/.index，可删除；重名会拒绝', async () => {
     const { invoke, dataDir } = await makeWorld();
     const add = (await invoke('addVoice', [

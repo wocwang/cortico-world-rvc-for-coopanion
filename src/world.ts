@@ -1570,15 +1570,13 @@ export class RvcWorld implements World {
   }
 
   /**
-   * 打开库所在文件夹（Windows 资源管理器；不新增 HTTP 路由）。
+   * 在资源管理器里打开一个目录（不新增 HTTP 路由）。
    *
    * 之前用 `execFile('explorer.exe', …)` 且把回调里的错误吞了：宿主进程的 PATH 被裁过或
    * 资源管理器启动失败时，面板只会显示「已打开」，实际什么都不发生。这里改用
    * `%SystemRoot%\explorer.exe` 的绝对路径，并把 spawn 失败抛回面板。
    */
-  private libraryOpen(): Promise<{ dir: string }> {
-    mkdirSync(this.libraryDir, { recursive: true });
-    const dir = this.libraryDir;
+  private openDir(dir: string, what: string): Promise<{ dir: string }> {
     if (process.platform !== 'win32') {
       const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
       return new Promise((resolve, reject) => {
@@ -1598,16 +1596,38 @@ export class RvcWorld implements World {
           settled = true;
           reject(new RvcError('param', `打开资源管理器失败：${err.message}`));
         } else {
-          this.log?.warn('打开翻唱库后资源管理器报错', { err: err.message });
+          this.log?.warn(`${what}打开后资源管理器报错`, { err: err.message });
         }
       });
       child.once('spawn', () => {
         settled = true;
         child.unref();
-        this.log?.info('打开翻唱库', { dir });
+        this.log?.info(`打开${what}`, { dir });
         resolve({ dir });
       });
     });
+  }
+
+  /** 打开翻唱库所在文件夹。 */
+  private libraryOpen(): Promise<{ dir: string }> {
+    mkdirSync(this.libraryDir, { recursive: true });
+    return this.openDir(this.libraryDir, '翻唱库');
+  }
+
+  /** 打开某个翻唱会话的文件夹（最近翻唱列表里每行的「打开文件夹」）。 */
+  private sessionOpen(id: string): Promise<{ dir: string }> {
+    const dir = sessionDir(this.opts.dataDir, id);
+    if (!dir || !readSession(this.opts.dataDir, id)) {
+      throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    }
+    return this.openDir(dir, '翻唱会话');
+  }
+
+  /** 打开最近翻唱的总目录（所有会话都在这里）。 */
+  private sessionsOpen(): Promise<{ dir: string }> {
+    const root = sessionsRoot(this.opts.dataDir);
+    mkdirSync(root, { recursive: true });
+    return this.openDir(root, '最近翻唱目录');
   }
 
   /** 开始下载高质量分离权重（面板切到高质量时调用）；进度走 state.melband。 */
@@ -2113,6 +2133,8 @@ export class RvcWorld implements World {
     }
     if (method === 'sessionDelete') return this.deleteSession(String(args[0] ?? ''));
     if (method === 'sessionFiles') return this.sessionFiles(String(args[0] ?? ''));
+    if (method === 'sessionOpen') return this.sessionOpen(String(args[0] ?? ''));
+    if (method === 'sessionsOpen') return this.sessionsOpen();
     if (method === 'sessionFile') return this.sessionFile(args);
     if (method === 'librarySave') return this.librarySave(args);
     if (method === 'libraryState') return this.libraryState();
