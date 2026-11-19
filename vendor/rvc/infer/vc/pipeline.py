@@ -111,7 +111,11 @@ class Pipeline(object):
         y = np.asarray(x, dtype=np.float32)
         if y.ndim > 1:
             y = y.mean(axis=1)
-        pitch, confidence = self.model_swift.detect(y, 60.0, 1600.0)
+        # 检测上限跟着权重自己的 f0_max 走（至少覆盖上游 1600）：写死 1600 会让
+        # 1700/1900 分箱的权重在 1600 Hz 以上只剩饱和值，和训练侧标签对不上。
+        ceiling = max(float(getattr(self, "f0_max", 1100.0) or 1100.0), 1600.0)
+        ceiling = _env_float("RVC_F0_SWIFT_MAX", ceiling)
+        pitch, confidence = self.model_swift.detect(y, 60.0, ceiling)
         pitch = np.where(np.asarray(confidence) >= 0.5, np.asarray(pitch, dtype=np.float64), 0.0)
         if pitch.size < 2:
             return np.zeros(p_len)
