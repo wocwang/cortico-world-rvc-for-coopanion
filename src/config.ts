@@ -136,6 +136,8 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   runtimeDir: '',
   voicesDir: '',
   voice: '',
+  // 这三个只留在配置对象里兼容旧配置文件，运行时不读；变调/索引率/保护清辅音
+  // 由「变声」面板逐次设置，接口与桌宠点歌用内置默认值（见 server.ts、world.ts）。
   pitch: 0,
   indexRate: 0.3,
   protect: 0.33,
@@ -158,7 +160,7 @@ export const VOICE_OPTIONS = `${RVC_ID}:voice`;
 const TEXT = {
   zh: {
     title: 'RVC 变声',
-    groupConvert: { title: '变声参数', description: '推理档、默认音色与三个推理参数；面板上传时还可以逐次覆盖。' },
+    groupConvert: { title: '变声参数', description: '推理档、默认音色与静音门/气声保护/高音保护三个开关。变调、索引率、保护清辅音在「变声」面板里按每次上传设置；接口与桌宠点歌用内置默认值（0 / 0.3 / 0.33）。' },
     groupDefaults: { title: '点歌与翻唱默认值', description: '桌宠点歌、面板翻唱和两个勾选项的初始值；只影响没明确指定的情况，面板里仍可逐次改。' },
     groupService: { title: '运行与接口', description: '推理代码、派生 venv 与音色目录，以及给其他插件用的本机 HTTP 接口。' },
     autoStart: { title: '随软件自动启动', description: '开启后 Coopanion 启动时就预热 RVC 引擎（约 0.7 GB 显存 / 2.5 GB 内存）；关闭后启动时不预热，但桌宠点歌、面板生成和 9881 请求仍会按需拉起。手动点「停止引擎」后不会被自动拉起。' },
@@ -198,7 +200,7 @@ const TEXT = {
   },
   en: {
     title: 'RVC Voice Changer',
-    groupConvert: { title: 'Conversion', description: 'Inference tier, default voice and the three inference knobs; the panel can override them per upload.' },
+    groupConvert: { title: 'Conversion', description: 'Inference tier, default voice and the three post-processing switches (silence gate, breath guard, high guard). Pitch, index rate and protect are set per upload in the Voice change panel; the HTTP API and pet song requests use built-in defaults (0 / 0.3 / 0.33).' },
     groupDefaults: { title: 'Singing defaults', description: 'Starting values for pet song requests, panel covers and the two checkboxes; they only apply when nothing is specified and can still be changed per run.' },
     groupService: { title: 'Runtime and API', description: 'Inference code, derived venv, voices folder, and the loopback HTTP endpoint for other plugins.' },
     autoStart: { title: 'Warm up on launch', description: 'When on, the RVC engine is warmed up when Coopanion launches (about 0.7 GB VRAM / 2.5 GB RAM). When off, it is not warmed up, but pet song requests, panel generations and 9881 requests still start it on demand. A manual Stop engine is never overridden.' },
@@ -252,9 +254,6 @@ export function configGroups(language: Language): ConfigGroup[] {
         properties: {
           [`${K}.tier`]: { type: 'string', title: t.tier.title, description: t.tier.description, 'x-options': TIER_OPTIONS, 'x-hot': true },
           [`${K}.voice`]: { type: 'string', title: t.voice.title, description: t.voice.description, 'x-options': VOICE_OPTIONS, 'x-hot': true },
-          [`${K}.pitch`]: { type: 'number', title: t.pitch.title, description: t.pitch.description, minimum: PITCH_MIN, maximum: PITCH_MAX, multipleOf: 1, 'x-hot': true },
-          [`${K}.indexRate`]: { type: 'number', title: t.indexRate.title, description: t.indexRate.description, minimum: 0, maximum: 1, multipleOf: 0.05, 'x-hot': true },
-          [`${K}.protect`]: { type: 'number', title: t.protect.title, description: t.protect.description, minimum: 0, maximum: PROTECT_MAX, multipleOf: 0.01, 'x-hot': true },
           [`${K}.silenceGate`]: { type: 'boolean', title: t.silenceGate.title, description: t.silenceGate.description, 'x-hot': true },
           [`${K}.breathGuard`]: { type: 'boolean', title: t.breathGuard.title, description: t.breathGuard.description, 'x-hot': true },
           [`${K}.highGuard`]: { type: 'boolean', title: t.highGuard.title, description: t.highGuard.description, 'x-hot': true },
