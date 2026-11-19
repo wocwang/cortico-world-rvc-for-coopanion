@@ -367,6 +367,7 @@ export class RvcWorld implements World {
       runtimeDir: paths.runtimeDir || undefined,
       silenceGate: this.opts.cfg.silenceGate !== false,
       breathGuard: this.opts.cfg.breathGuard !== false,
+      highGuard: this.opts.cfg.highGuard !== false,
       log: this.log ?? undefined,
     });
   }

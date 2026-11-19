@@ -805,6 +805,143 @@ def main() -> int:
             print("[rvc] 气声保护跳过：%s" % error, file=sys.stderr)
             return conv
 
+    # 高音幻觉保护：干声里根本没有高音内容时，模型偶尔会凭空「唱」出一个高八度的音
+    # （1300–1600 Hz、谐噪比只有 2–4 dB 的噪声帧），听感像突然尖叫或整句移调。这里把干声与
+    # 输出的 f0 都测出来，凡是输出比「干声 × 变调比」高出 ratio（默认 1.35 倍 ≈ 5.2 个半音）、
+    # 并且本身高于 floor（默认 800 Hz）的帧，就把该帧换回干声（与气声保护同一套混合机制）。
+    # 默认开；要原样输出设 RVC_HIGH_GUARD=0。阈值可用 RVC_HIGH_RATIO / RVC_HIGH_FLOOR 调。
+    HIGH_ENABLED = (os.environ.get("RVC_HIGH_GUARD") or "1").strip().lower() not in ("0", "off", "false", "no")
+    HIGH_RATIO = float(os.environ.get("RVC_HIGH_RATIO") or 1.35)
+    HIGH_FLOOR_HZ = float(os.environ.get("RVC_HIGH_FLOOR") or 800.0)
+    HIGH_HNR_MAX = float(os.environ.get("RVC_HIGH_HNR") or 10.0)
+
+    def _f0_curve(sig, sr, hop_ms=10.0, floor=60.0, ceiling=2400.0, voicing=0.5):
+        """parselmouth AC 逐帧 f0；无声帧为 0。算不出来返回 None。"""
+        import numpy as np
+
+        try:
+            import parselmouth
+        except Exception:
+            return None
+        sig = np.asarray(sig, dtype=np.float32).reshape(-1)
+        if sig.size < int(sr * 0.05):
+            return None
+        try:
+            sound = parselmouth.Sound(sig.astype(np.float64), sampling_frequency=int(sr))
+            pitch = sound.to_pitch_ac(
+                time_step=hop_ms / 1000.0,
+                pitch_floor=float(floor),
+                pitch_ceiling=float(ceiling),
+                voicing_threshold=float(voicing),
+            )
+        except Exception:
+            return None
+        return np.asarray(pitch.selected_array["frequency"], dtype=np.float64)
+
+    def high_weights(src, src_sr, conv, conv_sr, pitch=0, hop_ms=10.0, ratio=None,
+                     floor_hz=None, floor_db=-45.0, min_run_ms=30.0, fade_ms=10.0, hnr_max=None):
+        """返回「输出音高明显高于干声、该换回干声」的权重曲线（0..1，对齐到 conv）；算不出来返回 None。"""
+        import numpy as np
+
+        ratio = HIGH_RATIO if ratio is None else float(ratio)
+        floor_hz = HIGH_FLOOR_HZ if floor_hz is None else float(floor_hz)
+        src = np.asarray(src, dtype=np.float32).reshape(-1)
+        conv = np.asarray(conv, dtype=np.float32).reshape(-1)
+        if src.size < int(src_sr * 0.05) or conv.size < 2:
+            return None
+        f_dry = _f0_curve(src, src_sr, hop_ms=hop_ms)
+        f_out = _f0_curve(conv, conv_sr, hop_ms=hop_ms)
+        if f_dry is None or f_out is None or f_dry.size == 0 or f_out.size == 0:
+            return None
+        # 干声逐帧电平（换回去的帧必须是有内容的，纯静音交给静音门）
+        hop = max(1, int(round(src_sr * hop_ms / 1000.0)))
+        n_frames = max(1, int(np.ceil(src.size / float(hop))))
+        padded = np.zeros(n_frames * hop, dtype=np.float32)
+        padded[: src.size] = src[: n_frames * hop]
+        src_rms = np.sqrt(np.mean(padded.reshape(n_frames, hop) ** 2, axis=1) + 1e-12)
+        src_db = 20.0 * np.log10(src_rms + 1e-9)
+        src_ticks = (np.arange(n_frames, dtype=np.float64) + 0.5) * hop / float(src_sr)
+        out_ticks = (np.arange(f_out.size, dtype=np.float64) + 0.5) * hop / float(conv_sr)
+        f_dry_on_src = np.pad(f_dry, (0, max(0, n_frames - f_dry.size)), mode="edge")[:n_frames]
+        f_out_on_src = np.interp(src_ticks, out_ticks, f_out)
+        expect = pow(2.0, float(pitch) / 12.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            jump = (f_out_on_src > 0.0) & (f_dry_on_src > 0.0)
+            over = np.where(jump, (f_out_on_src / np.maximum(f_dry_on_src * expect, 1e-6)), 0.0)
+        # 两种都算「凭空多出来的高音」：干声有音高但输出远超它，或干声根本没音高（气声/清辅音）而输出在唱高音。
+        mask = (f_out_on_src > floor_hz) & (src_db > float(floor_db)) & (
+            (jump & (over > ratio)) | (~jump))
+        # 只保留 >= min_run_ms 的连续段，两端各外扩 2 帧，再做 10 ms 淡化；段太长（>0.4 s）不当幻觉，
+        # 那通常是真高音，留着不动。另外只认可「输出本身也是噪声」的段（默认 HNR < 10 dB）——
+        # 干净的高音即使比干声高也不该被换掉。
+        hnr_max = HIGH_HNR_MAX if hnr_max is None else float(hnr_max)
+        keep = np.zeros(n_frames, dtype=bool)
+        min_run = max(1, int(round(min_run_ms / hop_ms)))
+        max_run = max(min_run, int(round(0.4 / hop_ms)))
+        edges = np.flatnonzero(np.diff(np.r_[0, mask.astype(np.int8), 0]))
+        try:
+            import parselmouth
+        except Exception:
+            parselmouth = None
+        for start, end in zip(edges[::2], edges[1::2]):
+            if end - start < min_run or end - start > max_run:
+                continue
+            if parselmouth is not None:
+                t0 = max(0, start - 3)
+                t1 = min(n_frames, end + 3)
+                sr_ratio = float(conv_sr) / float(src_sr)
+                a = int(t0 * hop * sr_ratio)
+                b = min(conv.size, int(t1 * hop * sr_ratio))
+                if b - a < int(conv_sr * 0.02):
+                    continue
+                try:
+                    snip = parselmouth.Sound(conv[a:b].astype(np.float64), sampling_frequency=int(conv_sr))
+                    hv = np.asarray(snip.to_harmonicity_cc(time_step=hop_ms / 1000.0, minimum_pitch=70.0,
+                                                         silence_threshold=0.03).values[0], dtype=np.float64)
+                    hv = hv[np.isfinite(hv)]
+                    if hv.size and float(np.median(hv)) >= hnr_max:
+                        continue
+                except Exception:
+                    pass
+            keep[max(0, start - 2): min(n_frames, end + 2)] = True
+        fade = max(1, int(round(fade_ms / hop_ms)))
+        window = np.hanning(fade + 2)[1:-1] if fade > 2 else np.array([1.0])
+        weights = np.convolve(keep.astype(np.float64), window / window.sum(), mode="same") if window.sum() > 0 else keep.astype(np.float64)
+        ticks = np.arange(conv.size, dtype=np.float64) / float(conv_sr)
+        return np.interp(ticks, src_ticks, weights).astype(np.float32)
+
+    def high_guard(conv, src, src_sr, conv_sr, pitch=0):
+        """高音幻觉保护后处理：conv 是 RVC 输出（int16 或 float），src 是同一段干声。"""
+        import numpy as np
+
+        if not HIGH_ENABLED:
+            return conv
+        try:
+            data = np.asarray(conv)
+            integer = np.issubdtype(data.dtype, np.integer)
+            scale = 32768.0 if integer else 1.0
+            data = data.astype(np.float32) / scale
+            weights = high_weights(src, src_sr, data, conv_sr, pitch=pitch)
+            if weights is None:
+                return conv
+            from math import gcd
+            from scipy.signal import resample_poly
+
+            dry = np.asarray(src, dtype=np.float32).reshape(-1)
+            if int(src_sr) != int(conv_sr):
+                g = gcd(int(src_sr), int(conv_sr))
+                dry = resample_poly(dry, int(conv_sr) // g, int(src_sr) // g).astype(np.float32)
+            mixed = data.copy()
+            n = min(mixed.size, dry.size)
+            if n > 0:
+                mixed[:n] = data[:n] * (1.0 - weights[:n]) + dry[:n] * weights[:n]
+            if integer:
+                return (np.clip(mixed, -1.0, 1.0) * 32767.0).astype(np.int16)
+            return mixed
+        except Exception as error:
+            print("[rvc] 高音保护跳过：%s" % error, file=sys.stderr)
+            return conv
+
     def convert(req: dict) -> None:
         req_id = req.get("id")
         target = (req.get("voice") or "").strip() or default_voice
@@ -841,7 +978,8 @@ def main() -> int:
         if not result or result[0] is None or result[1] is None:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": _last_line(result[0] if result else "没有可转换的音频")})
             return
-        # 气声保护：把模型在气声/轻声段「编」出来的低频嗡鸣换回干声；再做静音门，把本来没人的段压回静音。
+        # 高音幻觉保护：输出音高明显高于干声的帧换回干声；气声保护把低频嗡鸣换回干声；最后静音门。
+        result = (result[0], high_guard(result[1], src_mono, 16000, int(result[0]), pitch=int(req.get("pitch") or 0)))
         result = (result[0], breath_guard(result[1], src_mono, 16000, int(result[0])))
         result = (result[0], gate_vocal(result[1], src_mono, 16000, int(result[0])))
         try:
@@ -1033,6 +1171,7 @@ def main() -> int:
             n = instrumental.shape[1]
             conv = conv[:n] if conv.size >= n else np.pad(conv, (0, n - conv.size))
             # 电平比例按「未门控」的 RMS 算，否则静音被压掉会让整首歌人声变大。
+            conv = high_guard(conv, vocals.mean(axis=0), 44100, 44100, pitch=int(req.get("pitch") or 0))
             conv = breath_guard(conv, vocals.mean(axis=0), 44100, 44100)
             rms_conv_raw = float(np.sqrt(np.mean(conv.astype(np.float64) ** 2)))
             conv = gate_vocal(conv, vocals.mean(axis=0), 44100, 44100)
@@ -1177,8 +1316,10 @@ def main() -> int:
             _stem, _ = sf.read(stem, dtype="float32", always_2d=False)
             if getattr(_stem, "ndim", 1) > 1:
                 _stem = _stem.mean(axis=1)
-            conv = breath_guard(conv, np.asarray(_stem, dtype=np.float32), 44100, 44100)
-            conv = gate_vocal(conv, np.asarray(_stem, dtype=np.float32), 44100, 44100)
+            _stem_f = np.asarray(_stem, dtype=np.float32)
+            conv = high_guard(conv, _stem_f, 44100, 44100, pitch=int(req.get("pitch") or 0))
+            conv = breath_guard(conv, _stem_f, 44100, 44100)
+            conv = gate_vocal(conv, _stem_f, 44100, 44100)
         except Exception:
             pass
 
@@ -1575,8 +1716,9 @@ def main() -> int:
         if model_sr != out_sr:
             g = gcd(model_sr, out_sr)
             piece = resample_poly(piece, out_sr // g, model_sr // g).astype(np.float32)
-        # 选段重跑也走气声保护（干声窗口与输出窗口同起点、同采样率）。
+        # 选段重跑也走高音幻觉保护与气声保护（干声窗口与输出窗口同起点、同采样率）。
         try:
+            piece = high_guard(piece, mono, out_sr, out_sr, pitch=int(as_float(req.get("pitch"), 0)))
             piece = breath_guard(piece, mono, out_sr, out_sr)
         except Exception as error:
             print("[rvc] 选段气声保护跳过：%s" % error, file=sys.stderr)

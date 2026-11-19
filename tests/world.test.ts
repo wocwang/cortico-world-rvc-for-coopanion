@@ -1100,15 +1100,18 @@ describe('点歌与翻唱默认值配置', () => {
     expect(on.world!.envPromptVars()!['rvc.mouth']).toContain('已开启');
   });
 });
-describe('静音门与气声保护', () => {
-  it('两个后处理默认都开，且都能在变声参数分组里关掉', () => {
+describe('静音门、气声保护与高音保护', () => {
+  it('三个后处理默认都开，且都能在变声参数分组里关掉', () => {
     expect(RVC_DEFAULTS.silenceGate).toBe(true);
     expect(RVC_DEFAULTS.breathGuard).toBe(true);
+    expect(RVC_DEFAULTS.highGuard).toBe(true);
     const zh = configGroups('zh').find((g) => g.id === 'world:rvc')?.schema.properties ?? {};
     expect(zh['worlds.rvc.silenceGate']).toMatchObject({ type: 'boolean' });
     expect(zh['worlds.rvc.breathGuard']).toMatchObject({ type: 'boolean' });
+    expect(zh['worlds.rvc.highGuard']).toMatchObject({ type: 'boolean' });
     const en = configGroups('en').find((g) => g.id === 'world:rvc')?.schema.properties ?? {};
     expect(en['worlds.rvc.breathGuard']).toMatchObject({ type: 'boolean' });
+    expect(en['worlds.rvc.highGuard']).toMatchObject({ type: 'boolean' });
   });
 });
 

@@ -82,6 +82,8 @@ export interface RvcConfigSection {
   silenceGate: boolean;
   /** 气声保护：模型在气声/轻声上会「编」出低频嗡鸣，这些帧换回干声；默认开。 */
   breathGuard: boolean;
+  /** 高音幻觉保护：输出音高明显高于干声的帧换回干声（模型凭空唱出高八度噪声）；默认开。 */
+  highGuard: boolean;
   /** 对其他插件开放本机 HTTP 接口：只监听 127.0.0.1。 */
   httpApi: boolean;
   /** HTTP 接口端口；默认 9881。改端口要重挂扩展（重启 World）才生效。 */
@@ -139,6 +141,7 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   protect: 0.33,
   silenceGate: true,
   breathGuard: true,
+  highGuard: true,
   httpApi: true,
   httpPort: DEFAULT_PORT,
   httpToken: '',
@@ -182,6 +185,7 @@ const TEXT = {
     indexRate: { title: '索引率', description: '0..1，越高越贴近音色、但可能带出素材口音；该音色没有 .index 时忽略。' },
     protect: { title: '保护清辅音', description: '0..0.5，防止换声后齿音、吸气声被抹掉。' },
     breathGuard: { title: '气声保护（轻声不被改成低音）', description: '遇到气声、轻声、只有气息没有音高的帧，模型会自己「编」出一段低频嗡鸣，听起来像被压低喉咙唱出来。开启后这些帧换回原干声，正常演唱段不动。实测整曲约 4.5% 帧、正常段 0%。改完要重启引擎才生效；也可用 RVC_BREATH_GUARD=0 临时关闭。' },
+    highGuard: { title: '高音幻觉保护（凭空多出的高音）', description: '干声里本来没有高音内容时，模型偶尔会自己「唱」出一个高八度的音（1300–1600 Hz 的窄带噪声），听起来像突然尖叫或整句移调。开启后，凡是输出音高比干声（按当前变调折算）高出 5 个半音以上、且本身超过 800 Hz 的帧，换回原干声；正常高音不动。改完要重启引擎才生效；也可用 RVC_HIGH_GUARD=0 临时关闭。' },
     silenceGate: { title: '静音门（去掉嘶声）', description: '按原干声的包络，把本来没人声的段（前奏、间奏、尾音）压成数字静音。RVC 会把分离残留放大 20 dB 以上，听起来就是沙沙声；关掉则原样输出。改完要重启引擎才生效。' },
     codeDir: { title: '推理代码目录', description: 'RVC 源码目录；留空用扩展包自带的 vendor/rvc（只含代码，不含权重）。' },
     assetsDir: { title: '模型资产目录', description: 'hubert_base 与 rmvpe 所在目录；留空为插件数据目录下的 assets。约 587 MB，首次使用在面板里安装，不随包分发。' },
@@ -221,6 +225,7 @@ const TEXT = {
     indexRate: { title: 'Index rate', description: '0..1; higher sticks closer to the voice but may leak the source accent. Ignored when the voice has no .index.' },
     protect: { title: 'Protect voiceless consonants', description: '0..0.5; keeps sibilants and breaths from being smeared by the conversion.' },
     breathGuard: { title: 'Breath guard (whispers stay whispers)', description: 'On breathy or whispered frames with no clear pitch the model invents a low buzz, which sounds like being sung down an octave. With this on, those frames are replaced by the original dry vocal; normal singing is untouched (about 4.5% of frames in a full song, 0% in sung parts). Takes effect after the engine restarts; RVC_BREATH_GUARD=0 disables it.' },
+    highGuard: { title: 'High-note hallucination guard', description: 'When the dry vocal has no high content, the model sometimes sings an octave above it (a narrow 1300-1600 Hz noise band), which sounds like a sudden squeal or a shifted phrase. With this on, frames whose output pitch is more than 5 semitones above the dry pitch (after the current pitch shift) and above 800 Hz are replaced by the original dry vocal; real high notes are untouched. Takes effect after the engine restarts; RVC_HIGH_GUARD=0 disables it.' },
     silenceGate: { title: 'Silence gate (removes hiss)', description: 'Uses the source envelope to zero out stretches where nobody is singing (intro, interludes, tails). RVC lifts separation residue by 20+ dB, which is heard as hiss; turn it off to keep the raw output. Takes effect after the engine restarts.' },
     codeDir: { title: 'Inference code folder', description: 'RVC source folder; empty uses the bundled vendor/rvc (code only, no weights).' },
     assetsDir: { title: 'Model assets folder', description: 'Where hubert_base and rmvpe live; empty uses assets under the plugin data folder. About 587 MB, installed from the panel on first use; not shipped in the package.' },
@@ -252,6 +257,7 @@ export function configGroups(language: Language): ConfigGroup[] {
           [`${K}.protect`]: { type: 'number', title: t.protect.title, description: t.protect.description, minimum: 0, maximum: PROTECT_MAX, multipleOf: 0.01, 'x-hot': true },
           [`${K}.silenceGate`]: { type: 'boolean', title: t.silenceGate.title, description: t.silenceGate.description, 'x-hot': true },
           [`${K}.breathGuard`]: { type: 'boolean', title: t.breathGuard.title, description: t.breathGuard.description, 'x-hot': true },
+          [`${K}.highGuard`]: { type: 'boolean', title: t.highGuard.title, description: t.highGuard.description, 'x-hot': true },
         },
       },
     },
