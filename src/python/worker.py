@@ -252,6 +252,138 @@ def _last_line(text, limit: int = 300) -> str:
     return (lines[-1] if lines else str(text or "推理失败"))[:limit]
 
 
+def _env_switch(name: str, default: str = "1") -> bool:
+    return (os.environ.get(name) or default).strip().lower() not in ("0", "off", "false", "no")
+
+
+# 高音补救：模型在超出音域的段会整段掉八度（或唱到别的音），此时「降到音域内重唱、
+# 再用保共振峰的方式升回去」能保住音高正确。质量不如直接唱，但比整句错调/尖叫好。
+HIGH_RESCUE = _env_switch("RVC_HIGH_RESCUE")
+RESCUE_FLOOR = float(os.environ.get("RVC_HIGH_RESCUE_FLOOR") or 800.0)
+RESCUE_ERR_ST = float(os.environ.get("RVC_HIGH_RESCUE_ERR") or 3.0)
+RESCUE_MIN_BAD = float(os.environ.get("RVC_HIGH_RESCUE_MIN") or 0.15)
+RESCUE_STEPS = max(1, int(float(os.environ.get("RVC_HIGH_RESCUE_STEPS") or 3)))
+
+
+def _pitch_curve(samples, sample_rate):
+    """10 ms 网格的 F0 曲线（Hz，0 表示清音）；上限放到 2400 以覆盖宽音域音色。"""
+    import numpy as np
+    import parselmouth
+
+    data = np.asarray(samples, dtype=np.float64)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if data.size < int(0.05 * sample_rate):
+        return np.zeros(0, dtype=np.float32)
+    pitch = parselmouth.Sound(data, sampling_frequency=float(sample_rate)).to_pitch_ac(
+        time_step=0.01, voicing_threshold=0.6, pitch_floor=75.0, pitch_ceiling=2400.0
+    )
+    return np.asarray(pitch.selected_array["frequency"], dtype=np.float32)
+
+
+def _high_error_ratio(src_f0, out_f0, pitch: int):
+    """高音段里「输出音高错得离谱」的帧占比；错得离谱 = 差 3 个半音以上（含整八度）。"""
+    import numpy as np
+
+    count = min(int(src_f0.size), int(out_f0.size))
+    if count < 40:
+        return 0.0, 0
+    expected = src_f0[:count].astype(np.float32) * float(2.0 ** (float(pitch) / 12.0))
+    got = out_f0[:count]
+    mask = (expected >= RESCUE_FLOOR) & (src_f0[:count] > 0) & (got > 0)
+    total = int(mask.sum())
+    if total < 40:
+        return 0.0, total
+    ratio = np.maximum(got[mask] / np.maximum(expected[mask], 1e-6), 1e-6)
+    steps = np.abs(12.0 * np.log2(ratio))
+    return float((steps >= RESCUE_ERR_ST).mean()), total
+
+
+def _align_latency(shifted, reference, sample_rate, max_ms: float = 120.0):
+    """补偿移调器引入的整体延迟（rubberband 会把输出整体推后十几毫秒）。
+
+    用短时能量包络做互相关找延迟——包络对音高变化不敏感，定得准；
+    找不到可信峰值就原样返回，绝不把音频越裁越糟。
+    """
+    import numpy as np
+
+    n = min(np.asarray(shifted).size, np.asarray(reference).size)
+    if n < int(0.2 * sample_rate):
+        return shifted
+    hop = max(1, int(0.005 * sample_rate))
+    win = max(1, int(0.010 * sample_rate))
+    count = (n - win) // hop
+    if count < 8:
+        return shifted
+
+    def envelope(samples):
+        data = np.asarray(samples, dtype=np.float32)[: n]
+        frames = np.lib.stride_tricks.sliding_window_view(data, win)[::hop][:count]
+        return np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+
+    try:
+        a = envelope(reference)
+        b = envelope(shifted)
+    except Exception:
+        return shifted
+    a = a - a.mean()
+    b = b - b.mean()
+    if not np.any(a) or not np.any(b):
+        return shifted
+    size = 1
+    while size < 2 * count:
+        size *= 2
+    corr = np.fft.irfft(np.fft.rfft(b, size) * np.conj(np.fft.rfft(a, size)), size)[:count]
+    limit = max(1, int(max_ms / 5.0))
+    lags = np.concatenate((corr[-limit:], corr[:limit]))
+    offsets = np.concatenate((np.arange(-limit, 0), np.arange(0, limit)))
+    best = int(offsets[int(np.argmax(lags))]) * hop
+    peak = float(lags.max() / (np.std(a) * np.std(b) * count + 1e-9))
+    if abs(best) < hop or peak < 0.15:
+        return shifted
+    data = np.asarray(shifted, dtype=np.float32)
+    if best > 0:
+        out = data[best:]
+    else:
+        out = np.pad(data, (-best, 0))
+    if out.size < np.asarray(reference).size:
+        out = np.pad(out, (0, np.asarray(reference).size - out.size))
+    return out[: np.asarray(reference).size]
+
+
+def _shift_pitch_formant(samples, sample_rate, semitones: float):
+    """升 semitones 半音并保持共振峰（ffmpeg rubberband），走管道不落临时文件。"""
+    import shutil
+    import subprocess
+
+    import numpy as np
+
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        print("[rvc] 高音补救跳过：PATH 里没有 ffmpeg", file=sys.stderr)
+        return None
+    rate = float(2.0 ** (float(semitones) / 12.0))
+    wave = np.asarray(samples, dtype=np.float32)
+    if wave.ndim > 1:
+        wave = wave.mean(axis=1)
+    wave = np.ascontiguousarray(wave.reshape(-1), dtype="<f4")
+    if wave.size < 16:
+        return None
+    proc = subprocess.run(
+        [exe, "-hide_banner", "-loglevel", "error",
+         "-f", "f32le", "-ar", str(int(sample_rate)), "-ac", "1", "-i", "pipe:0",
+         "-af", "rubberband=pitch=%.6f:formant=preserved" % rate,
+         "-f", "f32le", "-ar", str(int(sample_rate)), "-ac", "1", "pipe:1"],
+        input=wave.tobytes(), capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        tail = _last_line(proc.stderr.decode("utf-8", "replace")) if proc.stderr else "returncode %s" % proc.returncode
+        print("[rvc] 高音补救跳过：ffmpeg rubberband 不可用（%s）" % tail, file=sys.stderr)
+        return None
+    out = np.frombuffer(proc.stdout, dtype="<f4").astype(np.float32, copy=True)
+    if out.size < 16:
+        return None
+    return out, int(sample_rate)
 def _release_memory() -> None:
     """把本轮推理释放的堆还给系统。
 
@@ -490,7 +622,7 @@ def main() -> int:
     CHUNK_SECONDS = 20.0
     OVERLAP_SECONDS = 0.3
 
-    def run_vc(path: str, pitch: int, index_rate: float, protect: float, chunked: bool = True):
+    def run_vc(path: str, pitch: int, index_rate: float, protect: float, chunked: bool = True, _rescue: bool = True):
         """整段或分段跑 RVC，返回 (sampleRate, int16 波形)。
 
         分段时按**绝对时间轴**摆放每一片：每片输出先裁/补到它应有的长度，再叠进总缓冲，
@@ -509,6 +641,8 @@ def main() -> int:
             status, result = vc.vc_single(0, path, pitch, f0_method, current["index"], index_rate, 0, 1.0, protect)
             if not result or result[0] is None or result[1] is None:
                 return status, None
+            if _rescue:
+                result = _maybe_rescue(path, result, pitch, index_rate, protect, chunked)
             return result
 
         overlap = int(OVERLAP_SECONDS * 16000)
@@ -576,7 +710,88 @@ def main() -> int:
             mixed[at:stop] += piece[:span] * ramp[:span]
             weight[at:stop] += ramp[:span]
         mixed /= np.maximum(weight, 1e-3)
-        return sample_rate, (np.clip(mixed, -1.0, 1.0) * 32767).astype(np.int16)
+        output = (sample_rate, (np.clip(mixed, -1.0, 1.0) * 32767).astype(np.int16))
+        if _rescue:
+            output = _maybe_rescue(path, output, pitch, index_rate, protect, chunked)
+        return output
+
+    def _maybe_rescue(path, result, pitch, index_rate, protect, chunked):
+        """高音段整段唱错（掉八度/跑到别的音）时，降几半音重唱再保共振峰升回去。
+
+        只在「高音帧里错音比例超过阈值」时触发，重唱后必须确实变好才采用；
+        否则原样返回，任何异常都吞掉——这是补救，不该把整次转换搞失败。
+        """
+        if not HIGH_RESCUE:
+            return result
+        try:
+            import numpy as np
+
+            sample_rate = int(result[0])
+            raw = np.asarray(result[1])
+            scale = 32768.0 if raw.dtype.kind in "iu" else 1.0
+            original = raw.astype(np.float32) / scale
+            if original.ndim > 1:
+                original = original.mean(axis=1)
+            if original.size < sample_rate:
+                return result
+            # 干声按 44.1 kHz 解码再测 F0：16 kHz 下 parselmouth 在 1 kHz 以上会掉八度、
+            # 清浊判断也偏，测出来的错音比例不可信；44.1 kHz 与输出同一个 10 ms 网格。
+            src_mono = load_audio(path, 44100)
+            src_rate = 44100
+            _src_curve = _pitch_curve(src_mono, src_rate)
+            _out_curve = _pitch_curve(original, sample_rate)
+            bad, total = _high_error_ratio(_src_curve, _out_curve, pitch)
+            if total < 40:
+                return result
+            print("[rvc] 高音检查：%d 个高音帧，错音 %.1f%%" % (total, bad * 100.0), file=sys.stderr)
+            if bad < RESCUE_MIN_BAD:
+                return result
+            lower = pitch - RESCUE_STEPS
+            if lower < -24:
+                return result
+            alt = run_vc(path, lower, index_rate, protect, chunked, _rescue=False)
+            if alt is None or alt[0] is None or alt[1] is None:
+                print(
+                    "[rvc] 高音补救：降 %d 半音重唱失败，保留原输出（%s）"
+                    % (RESCUE_STEPS, _last_line(alt[0] if alt else "无结果")),
+                    file=sys.stderr,
+                )
+                return result
+            alt_rate = int(alt[0])
+            alt_raw = np.asarray(alt[1])
+            alt_scale = 32768.0 if alt_raw.dtype.kind in "iu" else 1.0
+            lower_wave = alt_raw.astype(np.float32) / alt_scale
+            if lower_wave.ndim > 1:
+                lower_wave = lower_wave.mean(axis=1)
+            shifted = _shift_pitch_formant(lower_wave, alt_rate, RESCUE_STEPS)
+            if shifted is None:
+                return result
+            up, up_rate = shifted
+            if up.ndim > 1:
+                up = up.mean(axis=1)
+            up = _align_latency(up, lower_wave, up_rate)
+            fixed = up[: original.size] if up.size >= original.size else np.pad(up, (0, original.size - up.size))
+            bad_after, total_after = _high_error_ratio(
+                _pitch_curve(src_mono, src_rate), _pitch_curve(fixed, up_rate), pitch
+            )
+            if total_after >= 40 and bad_after < bad - 0.05:
+                print(
+                    "[rvc] 高音补救生效：错音 %.1f%% → %.1f%%（降 %d 半音重唱后升回）"
+                    % (bad * 100.0, bad_after * 100.0, RESCUE_STEPS),
+                    file=sys.stderr,
+                )
+                return (up_rate, (np.clip(fixed, -1.0, 1.0) * 32767).astype(np.int16))
+            print(
+                "[rvc] 高音补救无效：错音 %.1f%% → %.1f%%，保留原输出"
+                % (bad * 100.0, bad_after * 100.0),
+                file=sys.stderr,
+            )
+        except Exception as error:
+            if _env_switch("RVC_RESCUE_DEBUG", "0"):
+                print("[rvc] 高音补救异常：%s" % traceback.format_exc(), file=sys.stderr)
+            else:
+                print("[rvc] 高音补救跳过：%s" % error, file=sys.stderr)
+        return result
 
     def get_separator():
         """按需载入分离模型（63 MB，ONNX）；没装就把原因抛给面板。"""

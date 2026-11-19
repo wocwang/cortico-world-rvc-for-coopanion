@@ -385,6 +385,7 @@ export class RvcWorld implements World {
       silenceGate: this.opts.cfg.silenceGate !== false,
       breathGuard: this.opts.cfg.breathGuard !== false,
       highGuard: this.opts.cfg.highGuard !== false,
+      highRescue: this.opts.cfg.highRescue !== false,
       log: this.log ?? undefined,
     });
   }
