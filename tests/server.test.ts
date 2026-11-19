@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import type { ConvertDefaults } from '../src/config.ts';
 import { RvcError } from '../src/engine.ts';
 import {
   parseMultipart, readConvertJob, RvcHttpError, startConvertServer,
@@ -49,6 +50,8 @@ async function boot(opts: {
   uvr5?: boolean;
   /** 模拟「闲置回收后自动拉起」：初始未就绪，第一次请求时被 ensureReady 拉回。 */
   idleWake?: boolean;
+  /** 没带 pitch / indexRate / protect 时的默认值；函数形式每次请求现取。 */
+  defaults?: Partial<ConvertDefaults> | (() => Partial<ConvertDefaults>);
 } = {}): Promise<Harness> {
   const jobs: ConvertJob[] = [];
   const overlap: boolean[] = [];
@@ -80,7 +83,10 @@ async function boot(opts: {
       }
     },
   };
-  handle = await startConvertServer({ port: 0, token: opts.token, deps, queueLimit: opts.queueLimit });
+  handle = await startConvertServer({
+    port: 0, token: opts.token, deps, queueLimit: opts.queueLimit,
+    ...(opts.defaults ? { defaults: opts.defaults } : {}),
+  });
   return { base: `http://127.0.0.1:${handle.port}`, jobs, deps, overlap, wakes: () => wakes };
 }
 
@@ -104,6 +110,16 @@ describe('RVC 本机接口', () => {
     expect(Buffer.from(await res.arrayBuffer()).toString()).toBe('converted');
     expect(jobs[0]).toMatchObject({ voice: 'daifeiyu', pitch: 2, indexRate: 0.5, protect: 0.2, format: 'wav', save: false });
     expect(jobs[0]!.file.equals(WAV)).toBe(true);
+  });
+
+  it('服务端默认值：函数形式每次请求都现取', async () => {
+    let indexRate = 0.2;
+    const { base, jobs } = await boot({ defaults: () => ({ pitch: 1, indexRate, protect: 0.1 }) });
+    expect((await post(base, form())).status).toBe(200);
+    indexRate = 0.7;
+    expect((await post(base, form())).status).toBe(200);
+    expect(jobs[0]).toMatchObject({ pitch: 1, indexRate: 0.2, protect: 0.1 });
+    expect(jobs[1]).toMatchObject({ pitch: 1, indexRate: 0.7, protect: 0.1 });
   });
 
   it('save=1 时把落盘路径放进 X-Rvc-Saved', async () => {
@@ -230,5 +246,21 @@ describe('multipart 与字段校验', () => {
       file: { filename: 'a.wav', data: WAV },
     });
     expect(job).toMatchObject({ pitch: 0, indexRate: 0.3, protect: 0.33, format: 'wav', save: false, voice: '' });
+  });
+
+  it('调用方给的默认值（面板上次用的参数）生效', () => {
+    const job = readConvertJob(
+      { fields: {}, file: { filename: 'a.wav', data: WAV } },
+      { defaults: { pitch: -5, indexRate: 0.55, protect: 0.08 } },
+    );
+    expect(job).toMatchObject({ pitch: -5, indexRate: 0.55, protect: 0.08 });
+  });
+
+  it('表单里显式写了就用表单的，压过默认值', () => {
+    const job = readConvertJob(
+      { fields: { indexRate: '0.8', protect: '0.4' }, file: { filename: 'a.wav', data: WAV } },
+      { defaults: { pitch: 2, indexRate: 0.55, protect: 0.08 } },
+    );
+    expect(job).toMatchObject({ pitch: 2, indexRate: 0.8, protect: 0.4 });
   });
 });

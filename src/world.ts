@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Language } from 'cortico/core/language.ts';
 import type { Logger, ToolDef, ToolOutcome, World, WorldHost, WorldLamp, WorldWebUiDecl } from 'cortico/core/types.ts';
-import { clampVolume, configGroups, DEFAULT_PORT, idleDelayMs, RVC_DEFAULTS, RVC_ID, worldLabel, type RvcConfigSection, type RvcTier } from './config.ts';
+import { clampVolume, configGroups, convertDefaults as configConvertDefaults, DEFAULT_PORT, idleDelayMs, RVC_DEFAULTS, RVC_ID, worldLabel, type ConvertDefaults, type RvcConfigSection, type RvcTier } from './config.ts';
 import { MELBAND_FILES, UVR_MODEL_FILE } from './catalog.ts';
 import { RvcEngine, RvcError, type ConvertDone, type EngineState } from './engine.ts';
 import { FileSetJob, hasFile, RvcInstaller } from './install.ts';
@@ -56,6 +56,21 @@ export interface RvcWorldOptions {
   createSongPlayer?: (log: Logger) => SongPlayer;
   /** B 站搜索 / 下载；单测里注入替身，不联网。 */
   bili?: BiliClient;
+}
+
+/** 面板/接口上次成功用过的推理参数；配置文件在数据目录里，删掉就回到配置默认值。 */
+const CONVERT_DEFAULTS_FILE = 'convert-defaults.json';
+
+function storedConvertDefaults(dataDir: string): ConvertDefaults | null {
+  try {
+    const raw = JSON.parse(readFileSync(join(dataDir, CONVERT_DEFAULTS_FILE), 'utf8')) as Record<string, unknown>;
+    const indexRate = Number(raw.indexRate);
+    const protect = Number(raw.protect);
+    if (!Number.isFinite(indexRate) || !Number.isFinite(protect)) return null;
+    return configConvertDefaults({ pitch: Number(raw.pitch), indexRate, protect });
+  } catch {
+    return null;
+  }
 }
 
 /** 在 `<runtimesRoot>/gpt-sovits/<版本>/<档>/runtime/python.exe` 里挑一个可用运行时。
@@ -222,6 +237,8 @@ export class RvcWorld implements World {
   private playbackId = 0;
   /** 当前播放音量 0..100；配置默认值，桌宠/面板调了立即生效。 */
   private volume = 100;
+  /** 上次成功用过的推理参数；内存缓存，首次需要时从数据目录读。 */
+  private rememberedDefaults: ConvertDefaults | null = null;
   /** 宿主事件：播完 / 开始播放时告诉模型，不靠猜。 */
   private host: WorldHost | null = null;
 
@@ -566,6 +583,8 @@ export class RvcWorld implements World {
         port: this.opts.cfg.httpPort || DEFAULT_PORT,
         token: this.opts.cfg.httpToken,
         deps,
+        // 每次请求现取：面板上跑过一次后，接口的默认值也跟着变。
+        defaults: () => this.convertDefaults(),
       });
       if (this.stopped) { await handle.close(); return; }
       this.server = handle;
@@ -573,6 +592,31 @@ export class RvcWorld implements World {
       const why = err instanceof Error ? err.message : String(err);
       this.log?.warn('RVC 接口没能监听', { port: this.opts.cfg.httpPort, err: why });
       this.launchDetail = `接口监听失败（${this.opts.cfg.httpPort}）：${why}`;
+    }
+  }
+
+  /** 实际生效的推理默认值：上次成功用过的优先，其次配置里的出厂值。 */
+  private convertDefaults(): ConvertDefaults {
+    if (!this.rememberedDefaults) {
+      this.rememberedDefaults = storedConvertDefaults(this.opts.dataDir) ?? configConvertDefaults(this.opts.cfg);
+    }
+    return this.rememberedDefaults;
+  }
+
+  /** 记下这次实际用的参数，作为下次的默认值；写盘失败不影响本次转换。 */
+  private rememberConvertDefaults(job: ConvertJob): void {
+    const last = this.convertDefaults();
+    this.rememberedDefaults = { pitch: job.pitch, indexRate: job.indexRate, protect: job.protect };
+    if (job.pitch === last.pitch && job.indexRate === last.indexRate && job.protect === last.protect) return;
+    try {
+      mkdirSync(this.opts.dataDir, { recursive: true });
+      writeFileSync(
+        join(this.opts.dataDir, CONVERT_DEFAULTS_FILE),
+        `${JSON.stringify(this.rememberedDefaults)}\n`,
+        'utf8',
+      );
+    } catch (err) {
+      this.log?.warn('推理默认值没能写入数据目录', { err: err instanceof Error ? err.message : String(err) });
     }
   }
 
@@ -637,6 +681,7 @@ export class RvcWorld implements World {
         at, ms: done.ms, bytes: audio.length, savedPath: savedPath ?? null,
         voice: job.voice || engine.state().model || '', format: job.format,
       };
+      this.rememberConvertDefaults(job);
       return { audio, savedPath };
     } finally {
       rmSync(input, { force: true });
@@ -679,7 +724,10 @@ export class RvcWorld implements World {
     }
     let job: ConvertJob;
     try {
-      job = readConvertJob({ fields, file: { filename: name || 'song.wav', data } }, { uvr5: true });
+      job = readConvertJob({ fields, file: { filename: name || 'song.wav', data } }, {
+        uvr5: true,
+        defaults: this.convertDefaults(),
+      });
     } catch (err) {
       throw new RvcError('param', err instanceof Error ? err.message : String(err));
     }
@@ -739,6 +787,7 @@ export class RvcWorld implements World {
         melbandModel: highReady ? join(this.uvrDir, melbandFile.path) : '',
       });
       const audio = readFileSync(output);
+      this.rememberConvertDefaults(job);
       const outDir = join(this.opts.dataDir, 'out');
       mkdirSync(outDir, { recursive: true });
       const savedPath = join(outDir, `${withBgm ? 'cover' : 'clean'}-${stamp()}.${outFormat}`);
@@ -1966,13 +2015,14 @@ export class RvcWorld implements World {
     this.autoSingQuery = title;
     const bgm = kind === 'cover';
     const task = (async () => {
+      const defaults = this.convertDefaults();
       try {
         const result = await this.coverFromPanel([`${safeSongName(title)}.m4a`, '', {
           path: source,
           voice: '',
           pitch: 0,
-          indexRate: 0.3,
-          protect: 0.33,
+          indexRate: defaults.indexRate,
+          protect: defaults.protect,
           vocalGain: 0,
           format: 'wav',
           chunk: true,
@@ -2441,6 +2491,7 @@ export class RvcWorld implements World {
         panelKind: this.panelKind(),
         saveToLibrary: this.saveToLibraryByDefault(),
         keepSource: this.keepSourceByDefault(),
+        ...this.convertDefaults(),
       },
       lastConvert: this.lastConvert,
       lastCover: this.lastCover,
@@ -2550,7 +2601,10 @@ export class RvcWorld implements World {
     // 先按接口同一套规则校验参数，再问引擎：填错了立刻能看到原因。
     let job: ConvertJob;
     try {
-      job = readConvertJob({ fields, file: { filename: fileName || 'input.wav', data: Buffer.from(base64, 'base64') } }, { uvr5: hasUvr5(this.uvrDir) });
+      job = readConvertJob({ fields, file: { filename: fileName || 'input.wav', data: Buffer.from(base64, 'base64') } }, {
+        uvr5: hasUvr5(this.uvrDir),
+        defaults: this.convertDefaults(),
+      });
     } catch (err) {
       throw new RvcError('param', err instanceof Error ? err.message : String(err));
     }

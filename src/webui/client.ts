@@ -229,6 +229,10 @@ interface PanelState {
     panelKind: 'clean' | 'cover';
     saveToLibrary: boolean;
     keepSource: boolean;
+    /** 上次成功用过的推理参数；老版本 World 可能没有这三项。 */
+    pitch?: number;
+    indexRate?: number;
+    protect?: number;
   };
   lastConvert: ConvertDone | null;
   lastCover: CoverDone | null;
@@ -648,6 +652,8 @@ const convertPanel: WebUiPanel = {
     let state: PanelState | null = null;
     let file: File | null = null;
     let url: string | null = null;
+    /** 推理三参数只在首帧套一次默认值，之后跟随用户在面板上的修改。 */
+    let paramsInitialized = false;
     /** 面板选过的音色；首次渲染时套用，之后不覆盖用户当前选择。 */
     let voiceInitialized = false;
     const preferredVoice = savedPanelVoice();
@@ -687,6 +693,8 @@ const convertPanel: WebUiPanel = {
       ui.field(t.chunkMode, chunk),
     );
 
+    const paramHint = ui.h('div', 'rvc-detail');
+    paramHint.hidden = true;
     const convertBtn = ui.button(t.convert, { variant: 'primary', size: 'sm', onClick: () => void run() });
     const acts = ui.actions();
     acts.append(convertBtn);
@@ -696,6 +704,7 @@ const convertPanel: WebUiPanel = {
       ui.h('div', 'rvc-detail', t.fileHint),
       ui.field(t.voice, voiceSelect),
       knobs,
+      paramHint,
       acts,
     );
 
@@ -727,6 +736,21 @@ const convertPanel: WebUiPanel = {
           : '';
       } else if (voiceSelect.value !== '' && !voices.some((v) => v.name === voiceSelect.value)) {
         voiceSelect.value = '';
+      }
+      if (!paramsInitialized) {
+        paramsInitialized = true;
+        const d = s.defaults;
+        pitch.value = String(d?.pitch ?? 0);
+        indexRate.value = String(d?.indexRate ?? 0.3);
+        protect.value = String(d?.protect ?? 0.33);
+      }
+      paramHint.hidden = !s.defaults;
+      if (s.defaults) {
+        paramHint.textContent = t.paramDefaults(
+          s.defaults.pitch ?? 0,
+          s.defaults.indexRate ?? 0.3,
+          s.defaults.protect ?? 0.33,
+        );
       }
       convertBtn.disabled = !s.ready || s.job?.phase === 'working';
       if (!s.ready && s.detail) msg.textContent = s.detail;
@@ -894,6 +918,8 @@ const coverPanel: WebUiPanel = {
       ui.field(t.protect, protect),
       ui.field(t.chunkMode, chunk),
     );
+    const paramHint = ui.h('div', 'rvc-detail');
+    paramHint.hidden = true;
 
     // 第二组：只影响混音。首次出结果前隐藏，但仍参与「上次生效值」比对。
     const vocalGainDb = slider(t.vocalGain, -12, 12, 1);
@@ -946,6 +972,7 @@ const coverPanel: WebUiPanel = {
       sepLine,
       ui.h('div', 'rvc-detail', t.coverInferHint),
       inferKnobs,
+      paramHint,
       ui.h('div', 'rvc-detail', t.inferHint),
       acts,
       dirtyLine,
@@ -2679,6 +2706,17 @@ const coverPanel: WebUiPanel = {
         toLibrary.checked = s.defaults.saveToLibrary;
         biliKind.value = s.defaults.panelKind;
         bgmMode.value = s.defaults.panelKind === 'clean' ? 'clean' : 'bgm';
+        pitch.value = String(s.defaults.pitch ?? 0);
+        indexRate.value = String(s.defaults.indexRate ?? 0.3);
+        protect.value = String(s.defaults.protect ?? 0.33);
+      }
+      paramHint.hidden = !s.defaults;
+      if (s.defaults) {
+        paramHint.textContent = t.paramDefaults(
+          s.defaults.pitch ?? 0,
+          s.defaults.indexRate ?? 0.3,
+          s.defaults.protect ?? 0.33,
+        );
       }
       const fallback = s.defaultVoice ? `${t.defaultVoice}（${t.voiceLabel(s.defaultVoice)}）` : t.defaultVoice;
       fillSelect(ui, voiceSelect, [{ value: '', label: fallback }, ...voices.map((v) => ({ value: v.name, label: t.voiceLabel(v.name) + binTag(v) }))]);

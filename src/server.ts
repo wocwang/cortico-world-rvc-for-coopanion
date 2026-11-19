@@ -9,7 +9,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Logger } from 'cortico/core/types.ts';
-import { PITCH_MAX, PITCH_MIN, PROTECT_MAX } from './config.ts';
+import { PITCH_MAX, PITCH_MIN, PROTECT_MAX, RVC_DEFAULTS, type ConvertDefaults } from './config.ts';
 
 /** 单次请求体上限：一条几分钟的音频足够，别让内存被占满。 */
 export const MAX_BODY_BYTES = 64 * 1024 * 1024;
@@ -128,21 +128,26 @@ const num = (raw: string | undefined, fallback: number): number => {
   return value;
 };
 
-/** 字段校验：范围按 spec §6，越界一律 400。`opts.uvr5` 为 false 时禁用分离。 */
-export function readConvertJob(multipart: MultipartBody, opts: { uvr5?: boolean } = {}): ConvertJob {
+/** 字段校验：范围按 spec §6，越界一律 400。`opts.uvr5` 为 false 时禁用分离；
+ *  请求里没带的 pitch / indexRate / protect 用 `opts.defaults`（配置里的默认值）。 */
+export function readConvertJob(
+  multipart: MultipartBody,
+  opts: { uvr5?: boolean; defaults?: Partial<ConvertDefaults> } = {},
+): ConvertJob {
+  const defaults = opts.defaults ?? {};
   const { fields, file } = multipart;
   if (!file || !file.data.length) throw new RvcHttpError(400, '缺少音频文件 file');
   const ext = /\.[^./\\]+$/.exec(file.filename.toLowerCase())?.[0] ?? '';
   if (!AUDIO_EXTENSIONS.includes(ext)) {
     throw new RvcHttpError(400, `不支持的音频扩展名：${ext || '(无)'}；可用 ${AUDIO_EXTENSIONS.join(' ')}`);
   }
-  const pitch = num(fields.pitch, 0);
+  const pitch = num(fields.pitch, defaults.pitch ?? RVC_DEFAULTS.pitch);
   if (!Number.isInteger(pitch) || pitch < PITCH_MIN || pitch > PITCH_MAX) {
     throw new RvcHttpError(400, `pitch 必须是 ${PITCH_MIN}..${PITCH_MAX} 的整数`);
   }
-  const indexRate = num(fields.indexRate, 0.3);
+  const indexRate = num(fields.indexRate, defaults.indexRate ?? RVC_DEFAULTS.indexRate);
   if (indexRate < 0 || indexRate > 1) throw new RvcHttpError(400, 'indexRate 必须在 0..1');
-  const protect = num(fields.protect, 0.33);
+  const protect = num(fields.protect, defaults.protect ?? RVC_DEFAULTS.protect);
   if (protect < 0 || protect > PROTECT_MAX) throw new RvcHttpError(400, `protect 必须在 0..${PROTECT_MAX}`);
   const separator = (fields.separator ?? 'off').trim() || 'off';
   if (separator !== 'off' && separator !== 'uvr5') throw new RvcHttpError(400, `未知的 separator：${separator}`);
@@ -193,6 +198,8 @@ export function startConvertServer(opts: {
   token?: string;
   deps: ConvertDeps;
   queueLimit?: number;
+  /** 请求里没带的 pitch / indexRate / protect 用这里的值；给函数则每次请求现取。 */
+  defaults?: Partial<ConvertDefaults> | (() => Partial<ConvertDefaults>);
 }): Promise<ConvertServerHandle> {
   const { deps } = opts;
   const token = opts.token?.trim() ?? '';
@@ -230,7 +237,10 @@ export function startConvertServer(opts: {
     // 闲置回收后第一次请求：先把它拉起来（和请求体上传并行），别让调用方吃 409。
     if (!deps.ready()) await deps.ensureReady?.();
     const raw = await readBody(req, MAX_BODY_BYTES);
-    const job = readConvertJob(parseMultipart(raw, req.headers['content-type'] ?? ''), { uvr5: deps.uvr5() });
+    const job = readConvertJob(parseMultipart(raw, req.headers['content-type'] ?? ''), {
+      uvr5: deps.uvr5(),
+      defaults: typeof opts.defaults === 'function' ? opts.defaults() : opts.defaults,
+    });
     if (!deps.ready()) throw new RvcHttpError(409, `模型未就绪：${deps.stateText()}`);
     await acquire();
     const at = Date.now();

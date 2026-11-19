@@ -1097,13 +1097,36 @@ describe('点歌与翻唱默认值配置', () => {
   it('面板状态带回配置默认值', async () => {
     const { invoke } = await makeWorld({
       singKind: 'cover', panelKind: 'clean', saveToLibrary: false, keepSource: false,
+      pitch: 2, indexRate: 0.42, protect: 0.2,
     });
     const state = await invoke('state') as {
-      defaults: { singKind: string; panelKind: string; saveToLibrary: boolean; keepSource: boolean };
+      defaults: {
+        singKind: string; panelKind: string; saveToLibrary: boolean; keepSource: boolean;
+        pitch: number; indexRate: number; protect: number;
+      };
     };
     expect(state.defaults).toEqual({
       singKind: 'cover', panelKind: 'clean', saveToLibrary: false, keepSource: false,
+      pitch: 2, indexRate: 0.42, protect: 0.2,
     });
+  });
+
+  it('数据目录里上次成功用过的参数压过配置默认值', async () => {
+    const { invoke, dataDir } = await makeWorld({ pitch: 2, indexRate: 0.42, protect: 0.2 });
+    writeFileSync(join(dataDir, 'convert-defaults.json'), '{"pitch":-3,"indexRate":0.6,"protect":0.11}\n');
+    const state = await invoke('state') as {
+      defaults: { pitch: number; indexRate: number; protect: number };
+    };
+    expect(state.defaults).toMatchObject({ pitch: -3, indexRate: 0.6, protect: 0.11 });
+  });
+
+  it('坏掉的 convert-defaults.json 不影响状态，回落到配置默认值', async () => {
+    const { invoke, dataDir } = await makeWorld({ pitch: 4, indexRate: 0.5, protect: 0.25 });
+    writeFileSync(join(dataDir, 'convert-defaults.json'), '{"indexRate":"what"');
+    const state = await invoke('state') as {
+      defaults: { pitch: number; indexRate: number; protect: number };
+    };
+    expect(state.defaults).toMatchObject({ pitch: 4, indexRate: 0.5, protect: 0.25 });
   });
 
   it('嘴型开关写进环境变量', async () => {
