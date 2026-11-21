@@ -119,11 +119,12 @@ const TEXT = {
     biliKind: '类型',
     biliKindCover: '翻唱（带伴奏）',
     biliKindClean: '清唱（无伴奏）',
-    biliGenerate: 'B 站搜索并生成',
+    biliGenerate: 'B 站搜索',
     biliSearching: '正在 B 站搜索…',
     biliNoResult: 'B 站没搜到结果，换个歌名或稍后再试。',
     biliNeedSong: '先填歌名。',
     biliLowConfidence: (reason: string) => `没找到足够确定的版本（${reason === 'no-result' ? '没有结果' : reason === 'weak-match' ? '标题匹配度不高' : reason === 'partial' ? '标题只是包含这个词，不是同名歌曲' : reason === 'ambiguous' ? '同名版本太多' : reason === 'version' ? '像是翻唱 / 伴奏 / 片段' : reason}）。从下面选一首再生成：`,
+    biliPickOne: '找到这些版本（按相似度排序），选一首再生成：',
     biliCandidateMeta: (author: string, play: string, artist = '') => artist
       ? `${artist} · ${author} · ${play} 播放`
       : `${author} · ${play} 播放`,
@@ -482,11 +483,12 @@ const TEXT = {
     biliKind: 'Type',
     biliKindCover: 'Cover (with backing track)',
     biliKindClean: 'Clean vocal (no backing track)',
-    biliGenerate: 'Search Bilibili and generate',
+    biliGenerate: 'Search Bilibili',
     biliSearching: 'Searching Bilibili…',
     biliNoResult: 'No Bilibili results. Try another song name or retry later.',
     biliNeedSong: 'Enter a song name first.',
     biliLowConfidence: (reason: string) => `No reliable match (${reason === 'no-result' ? 'no results' : reason === 'weak-match' ? 'title match is weak' : reason === 'partial' ? 'the title only contains that word, it is not this song' : reason === 'ambiguous' ? 'too many versions' : reason === 'version' ? 'looks like a cover / instrumental / clip' : reason}). Pick one below:`,
+    biliPickOne: 'Found these versions, best match first — pick one to generate:',
     biliCandidateMeta: (author: string, play: string, artist = '') => artist
       ? `${artist} · ${author} · ${play} plays`
       : `${author} · ${play} plays`,

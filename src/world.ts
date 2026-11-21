@@ -909,7 +909,7 @@ export class RvcWorld implements World {
     }
   }
 
-  /** 面板「B 站搜索」：只搜不下载。低置信时把候选原样交给用户选，别硬跑几分钟。 */
+  /** 面板「B 站搜索」：只搜不下载，返回全部候选（按相似度排序）交给用户挑。 */
   private async biliSearch(args: unknown[]): Promise<BiliPick> {
     const query = typeof args[0] === 'string' ? args[0].trim() : '';
     if (!query) throw new RvcError('param', '先填歌名');
@@ -920,7 +920,7 @@ export class RvcWorld implements World {
     } catch (err) {
       throw new RvcError('param', `B 站搜索失败：${err instanceof Error ? err.message : String(err)}`);
     }
-    return pickCandidates(hits, query, 6);
+    return pickCandidates(hits, query, 20);
   }
 
   /** 自动一键翻唱的前提：分离模型在位（引擎可以在后面等）。 */
@@ -1835,14 +1835,8 @@ export class RvcWorld implements World {
       return { text: `I cannot make "${song}" automatically: the vocal-separation model is not installed. Ask the person to open the RVC panel and click "install" on the Service page.`, failed: true };
     }
     const query = song.replace(/[《》「」『』]/g, '').trim() || bvid;
-    let decision: BiliPick;
-    if (bvid) {
-      decision = {
-        confident: true,
-        reason: 'ok',
-        candidates: [{ bvid, title: song || bvid, author: '', durationSec: 0, play: 0 }],
-      };
-    } else {
+    // 没指定 BV 号：只搜索并返回按相似度排序的候选，由模型挑或问用户，不在这里硬挑一条直接开做。
+    if (!bvid) {
       let hits: SearchHit[];
       try {
         hits = await this.bili.search(query, 20);
@@ -1850,23 +1844,29 @@ export class RvcWorld implements World {
         return { text: `Bilibili search for "${query}" failed: ${err instanceof Error ? err.message : String(err)}. Try again later.`, failed: true };
       }
       if (generation !== this.singGeneration) return { text: 'Cancelled: another song was requested.' };
-      decision = pickCandidates(hits, query, 6);
-    }
-    if (!decision.candidates.length) {
-      return { text: `Bilibili returned no results for "${query}". Try another song name later.` };
-    }
-    if (!decision.confident) {
+      const decision = pickCandidates(hits, query, 8);
+      if (!decision.candidates.length) {
+        return { text: `Bilibili returned no results for "${query}". Try another song name later.` };
+      }
+      const best = decision.candidates[0]!;
+      const lines = candidateLines(decision.candidates);
       return {
-        text: `I could not pick a reliable Bilibili version for "${query}" (${decision.reason}). Ask the person which one to use; list them, then call rvc_sing again with bvid set to the chosen BV id:\n${candidateLines(decision.candidates)}`,
+        text: decision.confident
+          ? `Bilibili best match for "${query}": ${best.title} — ${best.author || 'unknown'} · ${clock(best.durationSec)} · ${best.bvid}.\nRanked candidates:\n${lines}\nIf the first one is clearly the song the person meant, call rvc_sing again right away with the same song and bvid "${best.bvid}" (you may also pass title) so the cover starts. If it is not clearly right, show 2-4 numbered candidates and ask which one they want.`
+          : `I could not pick a reliable Bilibili version for "${query}" (${decision.reason}). Ask the person which one to use; list the numbered candidates, then call rvc_sing again with bvid set to the chosen BV id:\n${lines}`,
       };
     }
+    // 已经选定了具体一条：按 BV 号直接下载，不再重新搜索。
     // 生成链路需要引擎：停着就先拉起并等就绪，最多 90 秒；拉不起来把原因直接回给模型。
     const ready = await this.ensureReadyForTool();
     if (!ready.ok) {
       return { text: `I could not start the RVC engine, so I cannot make "${query}" right now: ${ready.reason}.`, failed: true };
     }
     // 先把音频下下来：下载失败要当场回原因，别让用户等几分钟后才发现没下成。
-    const download = await this.downloadBiliCandidates(decision.candidates, query);
+    const download = await this.downloadBiliCandidates(
+      [{ bvid, title: song || bvid, author: '', durationSec: 0, play: 0 }],
+      query,
+    );
     if (!download.source) {
       return {
         text: `The Bilibili audio download for "${query}" failed: ${download.failures.slice(-1)[0] ?? 'no usable candidate'}. Try again later.`,
@@ -2624,7 +2624,7 @@ const MAX_BILI_BYTES = 200 * 1024 * 1024;
 /** 给模型看候选：标题 / UP 主 / 时长，够它转述让用户选。 */
 function candidateLines(candidates: SearchHit[]): string {
   if (!candidates.length) return '(no candidates)';
-  return candidates.slice(0, 6).map((hit, at) =>
+  return candidates.slice(0, 8).map((hit, at) =>
     `${at + 1}. ${hit.title} — ${hit.author || 'unknown'} · ${clock(hit.durationSec)} · ${hit.bvid}`).join('\n');
 }
 

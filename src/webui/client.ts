@@ -1560,7 +1560,7 @@ const coverPanel: WebUiPanel = {
       biliKind.disabled = busy;
     }
 
-    /** 低置信时列候选：用户点哪首就只跑哪首，不硬挑。 */
+    /** 每次搜索都列候选：按相似度排序，用户点哪首就只跑哪首。 */
     function renderBiliCandidates(pick: BiliPickResp): void {
       biliCandidates.textContent = '';
       for (const [index, cand] of pick.candidates.entries()) {
@@ -1586,7 +1586,7 @@ const coverPanel: WebUiPanel = {
       }
     }
 
-    /** 面板「B 站一键生成」：先搜；确定就直接生成，不确定就列候选。`chosen` 是用户点的候选。 */
+    /** 面板「B 站搜索」：搜索后总是列出按相似度排序的候选，用户点一首再生成。 */
     async function runBili(chosen?: BiliCandidate[]): Promise<void> {
       msg.textContent = '';
       msg.classList.remove('bad');
@@ -1607,13 +1607,12 @@ const coverPanel: WebUiPanel = {
             biliLine.classList.add('bad');
             return;
           }
-          if (!r.confident) {
-            biliLine.textContent = t.biliLowConfidence(r.reason);
-            biliLine.classList.add('bad');
-            renderBiliCandidates(r);
-            return;
-          }
-          picked = r.candidates;
+          // 每次搜索都列候选（按相似度排序），不再自动挑第一条直接跑几分钟。
+          biliLine.textContent = r.confident ? t.biliPickOne : t.biliLowConfidence(r.reason);
+          biliLine.classList.toggle('bad', !r.confident);
+          renderBiliCandidates(r);
+          biliBtn.disabled = false;
+          return;
         } catch (err) {
           biliLine.textContent = errText(err);
           biliLine.classList.add('bad');

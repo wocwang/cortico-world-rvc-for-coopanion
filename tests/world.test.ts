@@ -799,7 +799,7 @@ describe('rvc_sing 桌宠点歌', () => {
     expect(player.files[0]).toContain('清唱cover');
   });
 
-  it('引擎停着时点歌先自动拉起；启动失败直接回原因', async () => {
+  it('候选选定后才拉起引擎；启动失败直接回原因', async () => {
     const player = fakePlayer();
     let fetched = 0;
     const { world, invoke, dataDir } = await makeWorld({ autoStart: false }, () => player, {
@@ -807,7 +807,13 @@ describe('rvc_sing 桌宠点歌', () => {
       fetch: async () => { fetched += 1; throw new Error('不该下载'); },
     });
     installUvr(dataDir);
-    const out = await call(world, { song: '起风了' });
+    // 第一次调用只搜候选，不碰引擎。
+    const list = await call(world, { song: '起风了' });
+    expect(list.failed).toBeUndefined();
+    expect(list.text).toContain('BV0000000001');
+    expect(fetched).toBe(0);
+    // 选定候选后才拉起引擎；失败时把原因直接回给模型。
+    const out = await call(world, { song: '起风了', bvid: 'BV0000000001' });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('could not start the RVC engine');
     expect(out.text).toContain('Python 解释器不存在');
@@ -815,7 +821,7 @@ describe('rvc_sing 桌宠点歌', () => {
     expect(((await invoke('state')) as { phase: string }).phase).toBe('error');
   });
 
-  it('手动停引擎后，桌宠点歌不会偷偷拉起', async () => {
+  it('手动停引擎后，选定候选也不会偷偷拉起', async () => {
     const player = fakePlayer();
     let fetched = 0;
     const { world, invoke, dataDir } = await makeWorld({ autoStart: false }, () => player, {
@@ -824,7 +830,10 @@ describe('rvc_sing 桌宠点歌', () => {
     });
     installUvr(dataDir);
     await invoke('stop');
-    const out = await call(world, { song: '起风了' });
+    const list = await call(world, { song: '起风了' });
+    expect(list.failed).toBeUndefined();
+    expect(list.text).toContain('BV0000000001');
+    const out = await call(world, { song: '起风了', bvid: 'BV0000000001' });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('stopped manually');
     expect(fetched).toBe(0);
@@ -993,6 +1002,25 @@ describe('B 站一键翻唱', () => {
     const out = await tool.handler({ song: '起风了' }, {} as never) as ToolOutcome;
     expect(out.text).toContain('could not pick');
     expect(out.text).toContain('起风了 官方现场版');
+    expect(fetched).toBe(0);
+    expect(player.files).toHaveLength(0);
+  });
+
+  it('桌宠点歌库未命中 + 高置信：也先回排序候选，由模型选定后再生成', async () => {
+    const player = fakePlayer();
+    let fetched = 0;
+    const bili: BiliClient = {
+      search: async () => [biliHit('BV0000000001', '起风了 原版')],
+      fetch: async () => { fetched += 1; throw new Error('不该下载'); },
+    };
+    const { world, dataDir } = await makeWorld({ autoStart: false }, () => player, bili);
+    installUvr(dataDir);
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    const out = await tool.handler({ song: '起风了' }, {} as never) as ToolOutcome;
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('best match');
+    expect(out.text).toContain('BV0000000001');
+    expect(out.text).toContain('bvid');
     expect(fetched).toBe(0);
     expect(player.files).toHaveLength(0);
   });
