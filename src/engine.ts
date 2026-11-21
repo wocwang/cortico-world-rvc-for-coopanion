@@ -54,6 +54,7 @@ export interface EngineOptions {
   breathGuard?: boolean;
   /** 高音幻觉保护：默认开；false 时 worker 原样输出（等于 RVC_HIGH_GUARD=0）。 */
   highGuard?: boolean;
+  prePurify?: boolean;
   highRescue?: boolean;
   log?: Logger;
 }
@@ -568,6 +569,8 @@ export class RvcEngine {
         RVC_HIGH_GUARD: process.env.RVC_HIGH_GUARD ?? (this.opts.highGuard === false ? '0' : '1'),
         // 高音补救：整段掉八度时降 3 半音重唱、再用 rubberband 保共振峰升回；RVC_HIGH_RESCUE=0 关闭。
         RVC_HIGH_RESCUE: process.env.RVC_HIGH_RESCUE ?? (this.opts.highRescue === false ? '0' : '1'),
+        // 前处理提纯：转换前把气声段的谐波强化、噪声压掉；RVC_PRE_PURIFY=0 关闭。
+        RVC_PRE_PURIFY: process.env.RVC_PRE_PURIFY ?? (this.opts.prePurify === false ? '0' : '1'),
         PATH: this.searchPath(),
       },
     });

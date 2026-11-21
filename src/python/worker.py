@@ -793,6 +793,92 @@ def main() -> int:
                 print("[rvc] 高音补救跳过：%s" % error, file=sys.stderr)
         return result
 
+    PRE_PURIFY = _env_switch("RVC_PRE_PURIFY")
+    PRE_PURIFY_DB = float(os.environ.get("RVC_PRE_PURIFY_DB") or -12.0)
+    PRE_PURIFY_HNR = float(os.environ.get("RVC_PRE_PURIFY_HNR") or 12.0)
+
+    def purify_source(path: str):
+        """气声/弱周期段先做谐波提纯，再交给模型。
+
+        只在干声本来就「气」的帧上动手（HNR 低于 PRE_PURIFY_HNR），干净帧原样保留；
+        音高、时长、共振峰都不动，只把谐波之间的噪声压下去，让周期性更明显，
+        避免模型把气声当噪声生成。返回临时 wav 路径；没必要处理时返回 None。
+        """
+        import numpy as np
+        import parselmouth
+        import soundfile as sf
+        from scipy import signal as ss
+
+        y = load_audio(path, 44100)
+        if y is None or len(y) < 4410:
+            return None
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        audio16 = load_audio(path, 16000)
+        p_len = max(1, int(round(len(audio16) / 160.0)))
+        f0 = np.asarray(vc.pipeline._swift_f0_curve(audio16, p_len), dtype=np.float64)
+        hnr = parselmouth.Sound(y, sampling_frequency=44100).to_harmonicity_cc(
+            minimum_pitch=75.0, time_step=0.01, silence_threshold=0.05
+        ).values.ravel()
+        nfft, hop = 2048, 512
+        fr, t, Z = ss.stft(y, fs=44100, nperseg=nfft, noverlap=nfft - hop)
+        floor = 10 ** (PRE_PURIFY_DB / 20.0)
+        binhz = 44100.0 / nfft
+        touched = 0
+        for k in range(Z.shape[1]):
+            i = int(round(t[k] / 0.01))
+            if i >= f0.size or i >= hnr.size:
+                continue
+            fv = float(f0[i])
+            if fv <= 0:
+                continue
+            h = float(hnr[i])
+            if not np.isfinite(h) or h >= PRE_PURIFY_HNR:
+                continue
+            weight = min(1.0, (PRE_PURIFY_HNR - h) / 6.0)
+            if weight <= 0:
+                continue
+            fb = fv / binhz
+            dist = np.abs(fr / binhz - np.round(fr / binhz / fb) * fb)
+            soft = np.clip((4.0 - dist) / 2.0, 0.0, 1.0)
+            mask = floor + (1.0 - floor) * soft
+            Z[:, k] *= 1.0 - weight * (1.0 - mask)
+            touched += 1
+        if touched < 10:
+            return None
+        _, out = ss.istft(Z, fs=44100, nperseg=nfft, noverlap=nfft - hop)
+        if out.size < y.size:
+            out = np.pad(out, (0, y.size - out.size))
+        out = out[: y.size]
+        out *= np.sqrt(np.mean(y ** 2)) / (np.sqrt(np.mean(out ** 2)) + 1e-12)
+        folder = tempfile.mkdtemp(prefix="rvc-pre-")
+        dst = os.path.join(folder, "pre.wav")
+        sf.write(dst, out.astype(np.float32), 44100)
+        print(
+            "[rvc] 前处理：提纯 %d 帧（%.0f%%）" % (touched, 100.0 * touched / max(1, Z.shape[1])),
+            file=sys.stderr,
+        )
+        return dst
+
+    def run_vc_purified(path: str, pitch: int, index_rate: float, protect: float, chunked: bool = True, _rescue: bool = True):
+        """转换入口：可选地在跑模型前先提纯气声段（RVC_PRE_PURIFY，默认开）。"""
+        prepared = None
+        if PRE_PURIFY:
+            try:
+                prepared = purify_source(path)
+            except Exception as error:
+                print("[rvc] 前处理跳过：%s" % error, file=sys.stderr)
+                prepared = None
+        try:
+            return run_vc(prepared or path, pitch, index_rate, protect, chunked, _rescue)
+        finally:
+            if prepared:
+                try:
+                    import shutil
+                    shutil.rmtree(os.path.dirname(prepared), ignore_errors=True)
+                except Exception:
+                    pass
+
+
     def get_separator():
         """按需载入分离模型（63 MB，ONNX）；没装就把原因抛给面板。"""
         if separation["model"] is not None:
@@ -1180,7 +1266,7 @@ def main() -> int:
             return
         began = time.time()
         try:
-            result = run_vc(
+            result = run_vc_purified(
                 source,
                 int(req.get("pitch") or 0),
                 float(req.get("indexRate", 0.3)),
@@ -1347,7 +1433,7 @@ def main() -> int:
 
         convert_began = time.time()
         try:
-            result = run_vc(
+            result = run_vc_purified(
                 vocal_path,
                 int(req.get("pitch") or 0),
                 float(req.get("indexRate", 0.3)),
@@ -1499,7 +1585,7 @@ def main() -> int:
 
         began = time.time()
         try:
-            result = run_vc(
+            result = run_vc_purified(
                 stem,
                 int(req.get("pitch") or 0),
                 float(req.get("indexRate", 0.3)),

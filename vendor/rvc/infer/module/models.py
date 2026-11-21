@@ -1,4 +1,5 @@
 import math
+import os
 import logging
 from typing import Optional
 
@@ -366,12 +367,14 @@ class SourceModuleHnNSF(torch.nn.Module):
         sampling_rate,
         harmonic_num=0,
         sine_amp=0.1,
-        add_noise_std=0.003,
+        add_noise_std=None,
         voiced_threshod=0,
         is_half=True,
     ):
         super(SourceModuleHnNSF, self).__init__()
 
+        if add_noise_std is None:
+            add_noise_std = float(os.environ.get("RVC_NSF_NOISE", "0.003"))
         self.sine_amp = sine_amp
         self.noise_std = add_noise_std
         self.is_half = is_half
