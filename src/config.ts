@@ -23,6 +23,8 @@ export interface RvcConfigSection {
   keepStems: boolean;
   /** 桌宠点歌默认类型：用户没明确说清唱 / 翻唱时用它。 */
   singKind: RvcKind;
+  /** 桌宠点歌只在翻唱库选取：库里没有就直说，不去 B 站搜索现做。 */
+  libraryOnly: boolean;
   /** 面板翻唱与 B 站一键生成的默认类型。 */
   panelKind: RvcKind;
   /** 翻唱完成后默认保存到翻唱库（面板勾选框与桌宠自动生成共用）。 */
@@ -148,6 +150,8 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   // 保持原有行为：桌宠默认清唱，面板一键翻唱默认带伴奏，训完默认入库、默认留原声。
   singKind: 'clean',
   panelKind: 'cover',
+  // 默认保持旧行为：库里没有就让桌宠去 B 站现学一首。
+  libraryOnly: false,
   saveToLibrary: true,
   keepSource: true,
   mouthAnimation: true,
@@ -196,6 +200,7 @@ const TEXT = {
     idleMinutes: { title: '闲置回收（分钟）', description: '多久没有变声/翻唱就停掉引擎子进程、释放显存与内存；支持小数，例如 0.5 = 30 秒，按秒计时。0 表示不回收（默认，保持旧行为）。只回收引擎，9881 接口照常监听，下一条请求会自动重新拉起；桌宠按需拉起的引擎也照此回收。手动点「停止引擎」后不会自动重启，也不会被桌宠拉起。' },
     keepStems: { title: '保留分轨（可精修）', description: '翻唱后把人声、伴奏和变声结果留在插件数据目录的 sessions 下，面板可以只重做混音，不用重新分离和变声。每首 4 分钟的歌约占 250 MB；默认 7 天 / 8 GB 自动清理，只清 sessions，不动 out。关闭后与旧版一样不落盘。' },
     singKind: { title: '桌宠点歌默认类型', description: '用户没明确说「清唱」或「翻唱」时，rvc_sing 用这个类型；也决定 B 站自动生成时带不带伴奏。' },
+    libraryOnly: { title: '桌宠点歌只在翻唱库选取', description: '开启后桌宠只播放翻唱库里已有的歌；库里没有就如实说明，不会去 B 站搜索并现做一首。面板里的「B 站搜索」不受影响。' },
     panelKind: { title: '面板翻唱默认类型', description: '翻唱页 BGM 下拉与 B 站一键生成的初始选项；面板里仍可逐次切换。' },
     saveToLibrary: { title: '完成后默认保存到翻唱库', description: '翻唱页「完成后保存到翻唱库」的初始勾选；桌宠自动生成也按它决定是否入库。关闭后桌宠仍会播放生成结果，只是不入库。' },
     keepSource: { title: '默认保存原声副本', description: '翻唱页「保存原声副本」的初始勾选；保存后可以在「最近翻唱」里原地重跑，不必重新选文件。' },
@@ -238,6 +243,7 @@ const TEXT = {
     idleMinutes: { title: 'Idle shutdown (minutes)', description: 'Stop the engine process and free VRAM/RAM after this many idle minutes; decimals work (0.5 = 30 seconds) and the timer is accurate to the second. 0 keeps it running (default, same as before). Only the engine is recycled — the 9881 API keeps listening and the next request starts it again; an engine started by the pet is recycled the same way. A manual Stop engine is never restarted, including by the pet.' },
     keepStems: { title: 'Keep stems for refinement', description: 'After a cover, keep the separated vocals, instrumental and converted vocal under sessions in the plugin data folder, so the panel can remix without separating or converting again. About 250 MB per 4-minute song; 7 days / 8 GB auto-cleanup by default, and only sessions is touched. Off restores the old behavior (nothing kept).' },
     singKind: { title: 'Default pet singing type', description: 'Used by rvc_sing when the person does not explicitly ask for clean vocals or a cover; also decides whether Bilibili auto generation keeps the backing track.' },
+    libraryOnly: { title: 'Pet songs: library only', description: 'On means the pet only plays songs already saved in the cover library. If a song is missing, it says so instead of searching Bilibili and making a new cover. The Bilibili search in the panel is not affected.' },
     panelKind: { title: 'Default panel cover type', description: 'Starting value for the BGM selector and Bilibili one-click generation; still switchable per run in the panel.' },
     saveToLibrary: { title: 'Save finished covers to the library by default', description: 'Starting state of the "save to cover library" checkbox and whether pet auto generation is saved. When off, the pet still plays the generated result, it just is not added to the library.' },
     keepSource: { title: 'Keep the source audio by default', description: 'Starting state of the "keep source copy" checkbox; keeping it lets you rerun a cover in place from Recent covers without picking the file again.' },
@@ -304,6 +310,7 @@ export function configGroups(language: Language): ConfigGroup[] {
         description: t.groupDefaults.description,
         properties: {
           [`${K}.singKind`]: { type: 'string', title: t.singKind.title, description: t.singKind.description, 'x-options': KIND_OPTIONS, 'x-hot': true },
+          [`${K}.libraryOnly`]: { type: 'boolean', title: t.libraryOnly.title, description: t.libraryOnly.description, 'x-hot': true },
           [`${K}.panelKind`]: { type: 'string', title: t.panelKind.title, description: t.panelKind.description, 'x-options': KIND_OPTIONS, 'x-hot': true },
           [`${K}.saveToLibrary`]: { type: 'boolean', title: t.saveToLibrary.title, description: t.saveToLibrary.description, 'x-hot': true },
           [`${K}.keepSource`]: { type: 'boolean', title: t.keepSource.title, description: t.keepSource.description, 'x-hot': true },

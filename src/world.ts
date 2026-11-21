@@ -274,6 +274,9 @@ export class RvcWorld implements World {
       'rvc.state': state,
       'rvc.library': library,
       'rvc.defaultKind': defaultKind,
+      'rvc.libraryOnly': this.libraryOnly()
+        ? '仅翻唱库（库里没有就如实说明，不要许诺去学一首）'
+        : '翻唱库优先，库里没有可以去找原版现做',
       'rvc.mouth': mouth,
       'rvc.playback': this.playbackStatus(),
       'rvc.volume': `${this.volume}%`,
@@ -1829,6 +1832,15 @@ export class RvcWorld implements World {
     } else if (!bvid && !song) {
       return { text: 'To look for the original on Bilibili, pass the song name in "song".' };
     }
+    // 设成「只在翻唱库选取」时，库里没有就到此为止：不搜索、不拉引擎、也不现做一首。
+    if (this.libraryOnly()) {
+      const name = song || bvid;
+      return {
+        text: name
+          ? `"${name}" is not in the cover library. Pet song requests are set to library only, so I will not search online or make a new cover. Tell the person they can add it in the RVC panel, or turn off "Only pick songs from the cover library" in the RVC settings.`
+          : 'Pet song requests are set to library only. Tell the person to save a song in the RVC panel first, or turn off "Only pick songs from the cover library" in the RVC settings.',
+      };
+    }
     if (this.job?.phase === 'working') {
       return { text: 'The RVC panel is busy with another conversion. Wait for it to finish, or stop it, then ask again.' };
     }
@@ -2438,6 +2450,11 @@ export class RvcWorld implements World {
   /** 配置里的桌宠默认类型；老配置没有这个字段时按清唱。 */
   private singKind(): LibraryKind {
     return this.opts.cfg.singKind === 'cover' ? 'cover' : 'clean';
+  }
+
+  /** 桌宠点歌是否只能在翻唱库里选；关掉才会去 B 站搜索现做。 */
+  private libraryOnly(): boolean {
+    return this.opts.cfg.libraryOnly === true;
   }
 
   /** 配置里的面板默认类型；老配置没有这个字段时按翻唱。 */

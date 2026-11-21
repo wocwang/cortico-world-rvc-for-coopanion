@@ -1025,6 +1025,39 @@ describe('B 站一键翻唱', () => {
     expect(player.files).toHaveLength(0);
   });
 
+  it('桌宠点歌设为只在翻唱库时，库里没有就直说，不搜索也不现做', async () => {
+    const player = fakePlayer();
+    let searches = 0;
+    const { world, dataDir } = await makeWorld({ libraryOnly: true }, () => player, {
+      search: async () => { searches += 1; return []; },
+      fetch: async () => { throw new Error('不该下载'); },
+    });
+    installUvr(dataDir);
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    const out = await tool.handler({ song: '起风了' }, {} as never) as ToolOutcome;
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('library only');
+    // 显式指定 BV 号也遵守这个开关。
+    const forced = await tool.handler({ song: '起风了', bvid: 'BV0000000001' }, {} as never) as ToolOutcome;
+    expect(forced.text).toContain('library only');
+    expect(searches).toBe(0);
+    expect(player.files).toHaveLength(0);
+  });
+
+  it('只在翻唱库时，库里已有的歌照常播放', async () => {
+    const player = fakePlayer();
+    const { world, dataDir } = await makeWorld({ libraryOnly: true }, () => player, {
+      search: async () => { throw new Error('不该搜索'); },
+      fetch: async () => { throw new Error('不该下载'); },
+    });
+    seedLibrary(dataDir, [{ title: '起风了', kind: 'clean' }]);
+    const tool = world.tools().find((item) => item.name === 'rvc_sing')!;
+    const out = await tool.handler({ song: '起风了' }, {} as never) as ToolOutcome;
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('Playing');
+    expect(player.files[0]).toContain('清唱cover');
+  });
+
   it('桌宠点歌库未命中 + 分离模型未装：明确说明先安装', async () => {
     const player = fakePlayer();
     const { world } = await makeWorld({}, () => player, {
@@ -1083,6 +1116,13 @@ describe('B 站一键翻唱', () => {
 });
 
 describe('闲置回收配置', () => {
+  it('桌宠点歌只在翻唱库选取：默认关，配置分组里有开关', () => {
+    expect(RVC_DEFAULTS.libraryOnly).toBe(false);
+    const group = configGroups('zh').find((g) => g.id.endsWith(':defaults'));
+    const prop = group?.schema.properties?.['worlds.rvc.libraryOnly'] as { type?: string } | undefined;
+    expect(prop?.type).toBe('boolean');
+  });
+
   it('默认 0 分钟：升级后引擎照旧常驻', () => {
     expect(RVC_DEFAULTS.idleMinutes).toBe(0);
   });
