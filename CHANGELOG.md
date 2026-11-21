@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.65 — 2026-11-21
+
+- **移除「前处理提纯」功能**：转换前的气声谐波提纯整段删除——worker 里的
+  `purify_source` / `run_vc_purified` 与 `RVC_PRE_PURIFY*` 环境变量都不再存在，
+  转换直接走原来的 `run_vc`。少一次整曲预分析，也少一个可能改变干声的环节。
+- 验证：`tsc --noEmit`、226 个单测、`python -m py_compile worker.py`、`npm run build` 全绿。
+
 ## 0.4.64 — 2026-11-21
 
 - **去掉「前处理提纯」开关**：设置 → 变声参数里不再显示这一项，避免把内部后处理项暴露给用户。

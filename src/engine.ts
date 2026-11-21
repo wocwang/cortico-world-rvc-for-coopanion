@@ -568,8 +568,6 @@ export class RvcEngine {
         RVC_HIGH_GUARD: process.env.RVC_HIGH_GUARD ?? (this.opts.highGuard === false ? '0' : '1'),
         // 高音补救：整段掉八度时降 3 半音重唱、再用 rubberband 保共振峰升回；RVC_HIGH_RESCUE=0 关闭。
         RVC_HIGH_RESCUE: process.env.RVC_HIGH_RESCUE ?? (this.opts.highRescue === false ? '0' : '1'),
-        // 前处理提纯：内部默认开启（气声段谐波强化、噪声压掉）；排查时可用 RVC_PRE_PURIFY=0 关闭。
-        RVC_PRE_PURIFY: process.env.RVC_PRE_PURIFY ?? '1',
         PATH: this.searchPath(),
       },
     });
