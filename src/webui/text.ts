@@ -99,6 +99,8 @@ const TEXT = {
     notReady: 'RVC 引擎还没就绪，等状态变成「就绪」再试。',
     preview: '试听',
     download: '下载',
+    saveMp3: '以 MP3 保存',
+    mp3Saving: '正在转 MP3…',
     saved: (path: string) => `已存到 ${path}`,
     convertDone: (ms: string, size: string) => `${ms} · ${size}`,
     // 翻唱
@@ -463,6 +465,8 @@ const TEXT = {
     notReady: 'The RVC engine is not ready yet; wait until the lamp turns ready.',
     preview: 'Preview',
     download: 'Download',
+    saveMp3: 'Save as MP3',
+    mp3Saving: 'Converting to MP3…',
     saved: (path: string) => `saved to ${path}`,
     convertDone: (ms: string, size: string) => `${ms} · ${size}`,
     cover: 'Make cover',

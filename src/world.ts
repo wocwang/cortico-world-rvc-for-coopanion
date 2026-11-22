@@ -1383,6 +1383,40 @@ export class RvcWorld implements World {
     };
   }
 
+  private async outputMp3FromPanel(args: unknown[]): Promise<unknown> {
+    const id = typeof args[0] === 'string' ? args[0] : '';
+    const index = Number(args[1]);
+    const kind = args[2] === 'master' ? 'master' : 'output';
+    const dir = sessionDir(this.opts.dataDir, id);
+    const session = dir ? readSession(this.opts.dataDir, id) : null;
+    if (!dir || !session) throw new RvcError('param', `找不到会话：${id || '(空)'}`);
+    const list = kind === 'master' ? session.masters ?? [] : session.outputs;
+    const output = Number.isInteger(index) ? list[index] : undefined;
+    if (!output) throw new RvcError('param', `成品序号无效：${String(args[1] ?? '')}`);
+    const full = join(dir, output.path);
+    if (!existsSync(full)) throw new RvcError('param', '成品文件不存在，可能已被清理');
+    if (output.format === 'mp3') {
+      const data = readFileSync(full);
+      return { $binary: { mime: 'audio/mpeg', base64: data.toString('base64') } };
+    }
+    const engine = this.engine;
+    if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
+    if (!engine.ready()) {
+      await this.ensureReady();
+      if (!engine.ready()) throw new RvcError('unavailable', engine.state().detail ?? 'RVC 引擎未就绪');
+    }
+    const tmpDir = join(this.opts.dataDir, 'tmp');
+    mkdirSync(tmpDir, { recursive: true });
+    const tmp = join(tmpDir, `mp3-${randomUUID()}.mp3`);
+    try {
+      await engine.encode({ input: full, output: tmp, format: 'mp3' });
+      const data = readFileSync(tmp);
+      return { $binary: { mime: 'audio/mpeg', base64: data.toString('base64') } };
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+  }
+
   private async peaksFromPanel(id: string): Promise<unknown> {
     const engine = this.engine;
     if (!engine) throw new RvcError('unavailable', 'RVC 引擎未启动');
@@ -2187,6 +2221,7 @@ export class RvcWorld implements World {
     if (method === 'exportF0') return this.f0FromPanel(String(args[0] ?? ''));
     if (method === 'refinePitch') return this.pitchFromPanel(String(args[0] ?? ''));
     if (method === 'refineAudio') return this.audioFromPanel(args);
+    if (method === 'outputMp3') return this.outputMp3FromPanel(args);
     if (method === 'refinePreview') {
       const raw = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as Record<string, unknown>;
       return this.previewSession(String(args[0] ?? ''), raw);

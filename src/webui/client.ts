@@ -992,6 +992,10 @@ const coverPanel: WebUiPanel = {
     const resultLine = ui.h('div', 'rvc-detail');
     const dl = ui.h('a', 'btn sm', t.download);
     dl.hidden = true;
+    const dlMp3 = ui.button(t.saveMp3, { size: 'sm', onClick: () => void saveAsMp3() });
+    dlMp3.hidden = true;
+    const dlRow = ui.h('div', 'rvc-dlrow');
+    dlRow.append(dl, dlMp3);
 
     // 结果编辑：只列会话元数据，不读音频；选中的会话决定「重新混音」的素材。
     let selectedId = '';
@@ -1016,6 +1020,8 @@ const coverPanel: WebUiPanel = {
     let outputLoadKey = '';
     let outputSeq = 0;
     let outputsSessionId = '';
+    /** 当前「下载」对应的会话成品；格式是 WAV 时额外提供「以 MP3 保存」。 */
+    let mp3Source: { sessionId: string; kind: 'output' | 'master'; index: number } | null = null;
     /** 只有刚跑完一次成品才自动选最新一条；切会话/换原声一律不自动亮播放条。 */
     let autoPickOutput = false;
     let currentSession: RefineSession | null = null;
@@ -1278,7 +1284,7 @@ const coverPanel: WebUiPanel = {
     abSheet.body.append(abActs, abLine);
 
     ctx.root.append(
-      recentSheet.el, sheet, audio, resultLine, dl,
+      recentSheet.el, sheet, audio, resultLine, dlRow,
       refineSheet.el, waveSheet.el, masterSheet.el, segmentSheet.el, abSheet.el,
       librarySheet.el,
       abAudioA, abAudioB, libraryAudio, msg,
@@ -1468,6 +1474,8 @@ const coverPanel: WebUiPanel = {
         dl.href = url;
         dl.download = `${item.kind === 'master' ? 'master' : 'cover'}-${selectedId}.${item.format}`;
         dl.hidden = false;
+        mp3Source = { sessionId: selectedId, kind: item.kind, index: item.index };
+        dlMp3.hidden = item.format !== 'wav';
       } catch (err) {
         if (token !== outputSeq) return;
         outputLoadKey = '';
@@ -1485,9 +1493,36 @@ const coverPanel: WebUiPanel = {
       audio.hidden = true;
       dl.removeAttribute('href');
       dl.hidden = true;
+      mp3Source = null;
+      dlMp3.hidden = true;
       if (url) {
         URL.revokeObjectURL(url);
         url = null;
+      }
+    }
+
+    /** 把当前下载的 WAV 成品转成 MP3 并保存；失败时在面板底部说明。 */
+    async function saveAsMp3(): Promise<void> {
+      const src = mp3Source;
+      if (!src) return;
+      dlMp3.disabled = true;
+      dlMp3.textContent = t.mp3Saving;
+      try {
+        const blob = await ctx.invokeBinary('outputMp3', [src.sessionId, src.index, src.kind]);
+        const href = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = href;
+        a.download = `${src.kind === 'master' ? 'master' : 'cover'}-${src.sessionId}.mp3`;
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(href), 5000);
+      } catch (err) {
+        msg.textContent = errText(err);
+        msg.classList.add('bad');
+      } finally {
+        dlMp3.disabled = false;
+        dlMp3.textContent = t.saveMp3;
       }
     }
 
@@ -3326,6 +3361,9 @@ const coverPanel: WebUiPanel = {
       }
       if (!s.resultReady || settledKey === key) return;
       settledKey = key;
+      // 结果先挂在播放器上；等 refineState 回来选中成品后，再决定要不要显示「以 MP3 保存」。
+      mp3Source = null;
+      dlMp3.hidden = true;
       // 这次任务多半新增了一条成品：让选择器回到最新一条，播放器/下载随选择器重载。
       autoPickOutput = true;
       pickedOutput = '';

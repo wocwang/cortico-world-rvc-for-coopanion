@@ -163,6 +163,12 @@ export interface VocalOnlyRequest {
   mutedRanges?: Array<{ start: number; end: number }>;
 }
 
+export interface EncodeRequest {
+  input: string;
+  output: string;
+  format: 'mp3';
+}
+
 export interface ConvertDone {
   ms: number;
   sampleRate: number;
@@ -444,6 +450,13 @@ export class RvcEngine {
     }, REMIX_TIMEOUT_MS);
   }
 
+  /** 把已有的 WAV 成品转成 MP3（面板「以 MP3 保存」用）。 */
+  async encode(req: EncodeRequest): Promise<ConvertDone> {
+    return this.run('encode', {
+      input: req.input, output: req.output, format: req.format,
+    }, REMIX_TIMEOUT_MS);
+  }
+
   /** 只重跑一段时间并拼回 conv；超时按窗口时长给，不按整首给。 */
   async convertRange(req: RangeConvertRequest): Promise<ConvertDone> {
     const span = Math.max(0, req.endSec - req.startSec);
@@ -505,7 +518,7 @@ export class RvcEngine {
     return { ...done, loudness: done.loudness };
   }
 
-  private async run(op: 'convert' | 'separate' | 'cover' | 'reconvert' | 'remix' | 'vocalOnly' | 'convertRange' | 'restoreRange' | 'peaks' | 'f0' | 'master', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
+  private async run(op: 'convert' | 'separate' | 'cover' | 'reconvert' | 'remix' | 'vocalOnly' | 'encode' | 'convertRange' | 'restoreRange' | 'peaks' | 'f0' | 'master', payload: Record<string, unknown>, timeoutMs: number): Promise<ConvertDone> {
     if (!this.ready()) throw new RvcError('unavailable', this.st.detail ?? 'RVC 引擎未就绪');
     const id = ++this.seq;
     const run = () => new Promise<ConvertDone>((resolve, reject) => {

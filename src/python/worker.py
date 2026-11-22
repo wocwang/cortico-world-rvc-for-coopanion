@@ -794,6 +794,40 @@ def main() -> int:
         return result
 
 
+    def encode(req: dict) -> None:
+        """把已有的 WAV 成品转成 MP3（面板「以 MP3 保存」用）。"""
+        req_id = req.get("id")
+        src = req.get("input") or ""
+        dst = req.get("output") or ""
+        fmt = (req.get("format") or "mp3").lower()
+        if fmt != "mp3":
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "只支持转成 MP3"})
+            return
+        if not src or not os.path.isfile(src):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "decode", "error": "读不到音频：%s" % src})
+            return
+        if not dst:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "缺少输出路径"})
+            return
+        began = time.time()
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+            if src.lower().endswith((".wav", ".wave")):
+                with open(src, "rb") as source, open(dst, "wb") as sink:
+                    wav2(source, sink, fmt)
+            else:
+                import soundfile as sf
+
+                data, sr = sf.read(src, always_2d=True, dtype="float32")
+                write_audio(dst, data, sr, fmt)
+        except Exception:
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": traceback.format_exc()[-800:]})
+            return
+        emit({
+            "type": "result", "id": req_id, "ok": True,
+            "ms": int((time.time() - began) * 1000), "bytes": os.path.getsize(dst),
+        })
+
     def get_separator():
         """按需载入分离模型（63 MB，ONNX）；没装就把原因抛给面板。"""
         if separation["model"] is not None:
@@ -2209,6 +2243,7 @@ def main() -> int:
             "reconvert": reconvert,
             "remix": remix,
             "vocalOnly": vocal_only,
+            "encode": encode,
             "convertRange": convert_range,
             "peaks": peaks,
             "restoreRange": restore_range,
