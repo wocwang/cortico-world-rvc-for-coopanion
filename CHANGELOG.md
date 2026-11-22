@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.68 — 2026-11-22
+
+- **f0 跟踪器默认改回 rmvpe**（推理与训练同源）：插件默认值从 `sw2` 改为 `rmvpe`，
+  worker 的兜底默认同样改成 rmvpe。训练侧 `train/dataset/extract_f0.py` 的
+  `RVC_F0_METHOD_CUDA` 默认本来就是 rmvpe，现在两边一致，权重标签与推理输入同源。
+- 仍可用环境变量 `RVC_F0_METHOD=sw2 / swift / hy2 / pm` 切换，旧行为随时可回退。
+- 同批带上推理侧八度对齐工具：`_octave_align`（1 s 窗 log2 中位投票 + 大跳保护 + auto 门控）、
+  `_despike`、`_median_filter_voiced`，默认关闭，由 `RVC_F0_OCTAVE_ALIGN` 开启。
+- 验证：`tsc --noEmit`、`vitest` 226 个单测、`python -m py_compile worker.py` 全绿。
+
 ## 0.4.67 — 2026-11-22
 
 - **「下载」旁新增「以 MP3 保存」**：当前播放 / 下载的成品是 WAV 时，翻唱页会多出这个按钮；

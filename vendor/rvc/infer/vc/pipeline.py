@@ -22,6 +22,11 @@ bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=16000)
 # ── hy2 混合跟踪参数（可用环境变量覆盖；默认值由 25 条宽音域素材 + 音频级复测调出） ──
 
 
+
+def _env_str(name, default):
+    value = os.environ.get(name)
+    return default if value is None else str(value).strip()
+
 def _env_float(name, default):
     try:
         return float(os.environ.get(name, default))
@@ -36,6 +41,31 @@ HY2_MEDIAN = int(_env_float("RVC_HY2_MEDIAN", 5))  # 有声区中值滤波窗（
 HOP_SWIFT = 256  # SwiftF0 帧移（16 kHz / 256 = 16 ms）
 
 
+def _cep_blend(f0, f0_c, strength, min_strength=4.0, stab=0.10):
+    """用倒谱基频兜底：清音帧补回；与主曲线差一个八度且倒谱自身稳定、主曲线抖动时采信倒谱。"""
+    f0 = np.asarray(f0, dtype=np.float64).reshape(-1).copy()
+    f0_c = np.asarray(f0_c, dtype=np.float64).reshape(-1)
+    strength = np.asarray(strength, dtype=np.float64).reshape(-1)
+    n = min(f0.size, f0_c.size, strength.size)
+    if n < 8:
+        return f0
+    f0, f0_c, strength = f0[:n], f0_c[:n], strength[:n]
+    good = (f0_c > 0) & (strength >= min_strength)
+    f0 = np.where(good & (f0 <= 0), f0_c, f0)
+    both = good & (f0 > 0)
+    ratio = np.divide(f0_c, np.maximum(f0, 1e-9))
+    dis = both & (((ratio > 0.45) & (ratio < 0.56)) | ((ratio > 1.8) & (ratio < 2.2)))
+    if dis.any():
+        k = 5
+        def local_std(a):
+            pad = np.pad(a, (k, k), mode="edge")
+            return np.std(np.lib.stride_tricks.sliding_window_view(pad, 2 * k + 1), axis=1)
+        s_c = local_std(np.log2(np.maximum(f0_c, 1e-9)))
+        s_s = local_std(np.log2(np.maximum(f0, 1e-9)))
+        f0 = np.where(dis & (s_c < stab) & (s_s > stab), f0_c, f0)
+    return f0
+
+
 def _median_filter_voiced(f0, win):
     """对有声帧做 log 域中值滤波，清音位置保持不变；win<=1 时原样返回。"""
     if win <= 1 or f0.size == 0:
@@ -48,6 +78,89 @@ def _median_filter_voiced(f0, win):
         window = log[i : i + win]
         voiced = window[np.isfinite(window)]
         out[i] = 2 ** np.median(voiced) if voiced.size else 0.0
+    return out
+
+
+
+def _octave_align(f0, win=100, hop=25, max_shift=1, min_voiced_ratio=0.5):
+    """八度一致性：每 win 帧（10 ms/帧）按有声帧的 log2 中位投票，把帧对齐到窗口主八度。"""
+    f0 = np.asarray(f0, dtype=np.float64)
+    if f0.size == 0:
+        return f0
+    out = f0.copy()
+    for s in range(0, f0.size, hop):
+        seg = f0[s:s + win]
+        v = seg[seg > 0]
+        if v.size < max(8, int(win * min_voiced_ratio)):
+            continue
+        med = float(np.median(np.log2(v)))
+        # 真实的大跳（例如假声跳进）会让同一窗口里两个八度类都占相当比例；
+        # 这种情况下不强行对齐，避免把真跳唱成平音。
+        classes = np.rint(np.log2(v) - med)
+        if float(np.mean(np.abs(classes) >= 0.5)) > 0.25:
+            continue
+        idx = np.arange(s, min(s + win, f0.size))
+        x = f0[idx]
+        m = x > 0
+        if not m.any():
+            continue
+        lg = np.log2(x[m])
+        shift = np.clip(np.rint(med - lg), -max_shift, max_shift)
+        out[idx[m]] = 2 ** (lg + shift)
+    return out
+
+
+def _despike(f0, jump=0.45):
+    """去掉与左右邻域中位相差超过 jump 个八度的孤立毛刺。"""
+    f0 = np.asarray(f0, dtype=np.float64).copy()
+    for i in range(2, f0.size - 2):
+        if f0[i] <= 0:
+            continue
+        nb = [f0[j] for j in (i - 2, i - 1, i + 1, i + 2) if f0[j] > 0]
+        if len(nb) < 3:
+            continue
+        med = float(np.median(np.log2(nb)))
+        if abs(np.log2(f0[i]) - med) > jump:
+            f0[i] = 2 ** med
+    return f0
+
+
+def _frame_db(x, p_len, sr, hop=160, win=1024):
+    """每 10 ms 一格的短时 RMS（dBFS）。"""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    out = np.full(p_len, -120.0)
+    for i in range(p_len):
+        a = i * hop
+        seg = x[a:a + win]
+        if seg.size < 160:
+            break
+        out[i] = 20.0 * np.log10(np.sqrt(np.mean(seg ** 2) + 1e-12) + 1e-12)
+    return out
+
+
+def _fill_unvoiced(f0, db, max_frames, thresh_db):
+    """把有能量但被判清音的短空洞用两端有声帧的 log 插值补上。"""
+    if max_frames <= 0 or f0.size == 0:
+        return f0
+    out = np.asarray(f0, dtype=np.float64).copy()
+    i, n = 0, out.size
+    while i < n:
+        if out[i] > 0:
+            i += 1
+            continue
+        j = i
+        while j < n and out[j] <= 0:
+            j += 1
+        length = j - i
+        left = out[i - 1] if i > 0 else 0.0
+        right = out[j] if j < n else 0.0
+        if 0 < length <= max_frames and left > 0 and right > 0:
+            if float(np.mean(db[i:j])) > thresh_db:
+                ll, lr = np.log2(left), np.log2(right)
+                for k in range(length):
+                    w = (k + 1.0) / (length + 1.0)
+                    out[i + k] = 2 ** (ll * (1 - w) + lr * w)
+        i = j
     return out
 
 
@@ -126,6 +239,39 @@ class Pipeline(object):
         out[grid > (pitch.size - 1) * (HOP_SWIFT / 16000.0)] = 0.0
         return out[:p_len]
 
+    def _cep_f0_curve(self, x, p_len):
+        """倒谱基频（看谐波间距）：气声/弱周期段比慢速检测稳，用作兜底。
+
+        返回 (f0, strength)：f0 为 Hz（0 = 不可用），strength 为倒谱峰相对强度。
+        """
+        y = np.asarray(x, dtype=np.float64)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        n_fft, hop = 1024, self.window
+        need = (p_len - 1) * hop + n_fft
+        if y.size < need:
+            y = np.pad(y, (0, need - y.size))
+        frames = np.lib.stride_tricks.sliding_window_view(y, n_fft)[::hop][:p_len]
+        if frames.shape[0] == 0:
+            return np.zeros(p_len), np.zeros(p_len)
+        win = np.hanning(n_fft)
+        spec = np.fft.rfft(frames * win, axis=1)
+        logp = np.log(np.abs(spec) ** 2 + 1e-12)
+        ceps = np.real(np.fft.ifft(logp, axis=1))
+        q = np.arange(ceps.shape[1]) / 16000.0
+        band = (q >= 1.0 / 1200.0) & (q <= 1.0 / 60.0)
+        cb = ceps[:, band]
+        idx = np.argmax(cb, axis=1)
+        f0 = np.where(cb.max(axis=1) > 0, 1.0 / q[band][idx], 0.0)
+        # 强度：倒谱峰 / 该帧倒谱的标准差，越大越可信
+        strength = cb.max(axis=1) / (np.std(ceps, axis=1) + 1e-9)
+        out = np.zeros(p_len)
+        str_out = np.zeros(p_len)
+        n = min(p_len, f0.size)
+        out[:n] = f0[:n]
+        str_out[:n] = strength[:n]
+        return out, str_out
+
     def get_f0(
         self,
         x,
@@ -162,7 +308,37 @@ class Pipeline(object):
                     & (ratio <= HY2_RATIO_HI)
                 )
                 f0_s = np.where(use_pm, f0_p, f0_s)
+            if _env_str("RVC_F0_CEP_FALLBACK", "0") not in ("", "0", "off", "false", "no"):
+                f0_c, c_str = self._cep_f0_curve(x, f0_s.size)
+                f0_s = _cep_blend(f0_s, f0_c, c_str)
             f0 = _median_filter_voiced(f0_s, HY2_MEDIAN)
+            # 可选后处理（默认关闭）：
+            #   RVC_F0_OCTAVE_ALIGN=1 → 八度一致性对齐 + 去毛刺（缺基频/气声段常见整段八度误判）
+            #   RVC_F0_FILL_MS>0      → 有能量却被判清音的短空洞插值补回
+            align_mode = _env_str("RVC_F0_OCTAVE_ALIGN", "0").lower()
+            if align_mode not in ("", "0", "off", "false", "no"):
+                aligned = _octave_align(
+                    f0,
+                    int(_env_float("RVC_F0_OCTAVE_WIN", 100)),
+                    int(_env_float("RVC_F0_OCTAVE_HOP", 25)),
+                )
+                if align_mode == "auto":
+                    # 只有「相当比例的帧会被移动一个八度」时才认为存在整段八度误判，
+                    # 免得把真实的高音大跳（假声跳进）也抹平。
+                    voiced = (f0 > 0) & (aligned > 0)
+                    if voiced.sum() >= 20:
+                        moved = np.mean(np.abs(np.log2(aligned[voiced] / f0[voiced])) > 0.4)
+                        if moved < _env_float("RVC_F0_OCTAVE_MIN", 0.03):
+                            aligned = f0
+                if aligned is not f0:
+                    f0 = _despike(aligned, _env_float("RVC_F0_DESPIKE", 0.45))
+                    f0 = _median_filter_voiced(f0, HY2_MEDIAN)
+            fill_ms = _env_float("RVC_F0_FILL_MS", 0)
+            if fill_ms > 0:
+                db = _frame_db(x, f0.size, 16000)
+                f0 = _fill_unvoiced(
+                    f0, db, int(fill_ms / 10.0), _env_float("RVC_F0_FILL_DB", -45.0)
+                )
         elif f0_method == "hy2":
             # 混合跟踪：rmvpe 打底（中低音稳），只在高音区且呈八度上跳
             # （pm 为 rmvpe 的 1.22~2.4 倍且 >= 600 Hz）时采用 pm。
