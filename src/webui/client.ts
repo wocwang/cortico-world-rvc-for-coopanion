@@ -227,6 +227,7 @@ interface PanelState {
   defaults?: {
     singKind: 'clean' | 'cover';
     panelKind: 'clean' | 'cover';
+    outputFormat?: 'wav' | 'mp3';
     saveToLibrary: boolean;
     keepSource: boolean;
     /** 上次成功用过的推理参数；老版本 World 可能没有这三项。 */
@@ -656,6 +657,8 @@ const convertPanel: WebUiPanel = {
     let paramsInitialized = false;
     /** 面板选过的音色；首次渲染时套用，之后不覆盖用户当前选择。 */
     let voiceInitialized = false;
+    /** 配置里的默认输出格式只在首帧套一次。 */
+    let formatInitialized = false;
     const preferredVoice = savedPanelVoice();
     ctx.own(disposable(() => { if (url) URL.revokeObjectURL(url); }));
 
@@ -743,6 +746,10 @@ const convertPanel: WebUiPanel = {
         pitch.value = String(d?.pitch ?? 0);
         indexRate.value = String(d?.indexRate ?? 0.3);
         protect.value = String(d?.protect ?? 0.33);
+      }
+      if (!formatInitialized && s.defaults?.outputFormat) {
+        formatInitialized = true;
+        format.value = s.defaults.outputFormat;
       }
       paramHint.hidden = !s.defaults;
       if (s.defaults) {
@@ -1371,8 +1378,7 @@ const coverPanel: WebUiPanel = {
         instGainDb: Number(instGainDb.input.value),
         fadeInSec: Number(fadeIn.input.value),
         fadeOutSec: Number(fadeOut.input.value),
-        // 清唱固定 WAV；不把格式下拉的 mp3 算成「改动」。
-        format: bgmMode.value === 'clean' ? 'wav' : mixFormat.value,
+        format: mixFormat.value,
         withBgm: bgmMode.value !== 'clean',
       };
     }
@@ -1887,11 +1893,6 @@ const coverPanel: WebUiPanel = {
       line.classList.remove('bad');
       if (!target) {
         line.textContent = t.exportNeedOutput;
-        line.classList.add('bad');
-        return;
-      }
-      if (target.kind === 'clean' && target.format !== 'wav') {
-        line.textContent = t.libraryNeedWav;
         line.classList.add('bad');
         return;
       }
@@ -2705,6 +2706,10 @@ const coverPanel: WebUiPanel = {
         toLibrary.checked = s.defaults.saveToLibrary;
         biliKind.value = s.defaults.panelKind;
         bgmMode.value = s.defaults.panelKind === 'clean' ? 'clean' : 'bgm';
+        if (s.defaults.outputFormat) {
+          mixFormat.value = s.defaults.outputFormat;
+          masterFormat.value = s.defaults.outputFormat;
+        }
         pitch.value = String(s.defaults.pitch ?? 0);
         indexRate.value = String(s.defaults.indexRate ?? 0.3);
         protect.value = String(s.defaults.protect ?? 0.33);

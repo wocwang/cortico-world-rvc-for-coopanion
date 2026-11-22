@@ -154,6 +154,8 @@ export interface RemixRequest {
 export interface VocalOnlyRequest {
   vocals: string;
   output: string;
+  /** 输出格式；清唱与翻唱一样支持 wav / mp3。 */
+  format: 'wav' | 'mp3';
   vocalGain: number;
   fadeIn: number;
   fadeOut: number;
@@ -436,7 +438,7 @@ export class RvcEngine {
   /** 只渲染清唱：不重跑模型，输出单声道 WAV。 */
   async vocalOnly(req: VocalOnlyRequest): Promise<ConvertDone> {
     return this.run('vocalOnly', {
-      vocals: req.vocals, output: req.output,
+      vocals: req.vocals, output: req.output, format: req.format,
       vocalGain: req.vocalGain, fadeIn: req.fadeIn, fadeOut: req.fadeOut,
       rmsRatio: req.rmsRatio, mutedRanges: req.mutedRanges ?? [],
     }, REMIX_TIMEOUT_MS);

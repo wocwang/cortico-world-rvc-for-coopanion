@@ -749,7 +749,8 @@ export class RvcWorld implements World {
     const id = randomUUID();
     const ext = extname(fileName).toLowerCase() || '.wav';
     const withBgm = raw.withBgm !== false;
-    const outFormat: 'wav' | 'mp3' = withBgm ? job.format : 'wav';
+    // 清唱也支持 mp3：worker 的 cover 会按同一个格式写盘。
+    const outFormat: 'wav' | 'mp3' = job.format;
     const input = join(tmpDir, `${id}${ext}`);
     const output = join(tmpDir, `${id}.${outFormat}`);
     writeFileSync(input, job.file);
@@ -1028,7 +1029,7 @@ export class RvcWorld implements World {
     }
     this.activeSession = id;
     const withBgm = raw.withBgm === undefined ? result.session.mix.withBgm !== false : raw.withBgm !== false;
-    const outFormat = withBgm ? format : 'wav';
+    const outFormat = format;
     const { audio, done, path } = await this.mixSession(id, result.session, {
       format,
       vocalGainDb: clampNumber(raw.vocalGainDb, -24, 24, result.session.mix.vocalGainDb),
@@ -1077,10 +1078,10 @@ export class RvcWorld implements World {
     }, true);
     this.lastMix = {
       at: Date.now(), ms: done.ms, bytes: audio.length, savedPath: path,
-      format: withBgm ? format : 'wav', peakScale: done.peakScale,
+      format, peakScale: done.peakScale,
     };
-    this.log?.info('RVC 重新混音完成', { id, format: withBgm ? format : 'wav', ms: done.ms });
-    return { $binary: { mime: !withBgm || format === 'wav' ? 'audio/wav' : 'audio/mpeg', base64: audio.toString('base64') } };
+    this.log?.info('RVC 重新混音完成', { id, format, ms: done.ms });
+    return { $binary: { mime: format === 'wav' ? 'audio/wav' : 'audio/mpeg', base64: audio.toString('base64') } };
   }
 
   /**
@@ -1107,7 +1108,7 @@ export class RvcWorld implements World {
     if (opts.withBgm && !existsSync(inst)) {
       throw new RvcError('param', '会话缺少伴奏文件，请重新翻唱一次');
     }
-    const format = opts.withBgm ? opts.format : 'wav';
+    const format = opts.format;
     let output: string;
     let rel: string | null = null;
     if (record) {
@@ -1120,7 +1121,7 @@ export class RvcWorld implements World {
       rel = `out/${prefix}-${next}.${format}`;
       output = join(dir, rel);
     } else {
-      output = join(dir, 'out', opts.withBgm ? `preview.${format}` : 'preview-clean.wav');
+      output = join(dir, 'out', opts.withBgm ? `preview.${format}` : `preview-clean.${format}`);
     }
     this.cancelIdle();
     const done = opts.withBgm ? await engine.remix({
@@ -1130,7 +1131,7 @@ export class RvcWorld implements World {
       rmsRatio: session.mix.rmsRatio,
       mutedRanges: mutedRanges(session.segments),
     }) : await engine.vocalOnly({
-      vocals, output,
+      vocals, output, format,
       vocalGain: opts.vocalGainDb,
       fadeIn: opts.fadeInSec, fadeOut: opts.fadeOutSec,
       rmsRatio: session.mix.rmsRatio,
@@ -1188,7 +1189,7 @@ export class RvcWorld implements World {
     });
     this.activeSession = id;
     const withBgm = result.session.mix.withBgm !== false;
-    const outFormat = withBgm ? format : 'wav';
+    const outFormat = format;
     const { audio, done, path } = await this.mixSession(id, result.session, {
       format,
       vocalGainDb: result.session.mix.vocalGainDb,
@@ -1227,7 +1228,7 @@ export class RvcWorld implements World {
     }, false);
     return {
       $binary: {
-        mime: !withBgm || format === 'wav' ? 'audio/wav' : 'audio/mpeg',
+        mime: format === 'wav' ? 'audio/wav' : 'audio/mpeg',
         base64: audio.toString('base64'),
       },
     };
@@ -1547,10 +1548,6 @@ export class RvcWorld implements World {
     if (!item) throw new RvcError('param', media === 'master' ? '这个会话还没有母带' : '这个会话还没有成品');
     const source = join(dir, item.path);
     if (!existsSync(source)) throw new RvcError('param', `文件不在了：${item.path}`);
-    const ext = extname(item.path).toLowerCase();
-    if (libraryKind === 'clean' && ext !== '.wav') {
-      throw new RvcError('param', '清唱入库需要 WAV 格式，请先生成清唱版');
-    }
     const fallback = session.source.name ? session.source.name.replace(/\.[a-z0-9]{1,5}$/i, '') : '未命名';
     const title = titleArg || fallback;
     try {
@@ -2037,7 +2034,7 @@ export class RvcWorld implements World {
           indexRate: defaults.indexRate,
           protect: defaults.protect,
           vocalGain: 0,
-          format: 'wav',
+          format: this.outputFormat(),
           chunk: true,
           keepSource: this.keepSourceByDefault(),
           withBgm: bgm,
@@ -2461,6 +2458,11 @@ export class RvcWorld implements World {
     return this.opts.cfg.panelKind === 'clean' ? 'clean' : 'cover';
   }
 
+  /** 默认输出格式；老配置没有这个字段时按 WAV。 */
+  private outputFormat(): 'wav' | 'mp3' {
+    return this.opts.cfg.outputFormat === 'mp3' ? 'mp3' : 'wav';
+  }
+
   /** 翻唱完成后默认是否入库；老配置没有这个字段时保持旧行为（入库）。 */
   private saveToLibraryByDefault(): boolean {
     return this.opts.cfg.saveToLibrary !== false;
@@ -2507,6 +2509,7 @@ export class RvcWorld implements World {
       defaults: {
         singKind: this.singKind(),
         panelKind: this.panelKind(),
+        outputFormat: this.outputFormat(),
         saveToLibrary: this.saveToLibraryByDefault(),
         keepSource: this.keepSourceByDefault(),
         ...this.convertDefaults(),

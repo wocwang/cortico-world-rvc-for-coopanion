@@ -9,6 +9,9 @@ export type RvcTier = 'auto' | 'cuda' | 'cpu';
 /** 清唱 / 翻唱；与翻唱库的 `LibraryKind` 同一口径。 */
 export type RvcKind = 'clean' | 'cover';
 
+/** 输出音频格式：wav 无损，mp3 体积小。 */
+export type RvcFormat = 'wav' | 'mp3';
+
 /** config.json 的 `worlds.rvc` 段。 */
 export interface RvcConfigSection {
   enabled: boolean;
@@ -27,6 +30,8 @@ export interface RvcConfigSection {
   libraryOnly: boolean;
   /** 面板翻唱与 B 站一键生成的默认类型。 */
   panelKind: RvcKind;
+  /** 默认输出格式：面板翻唱 / 清唱 / 桌宠自动生成都用它；面板里仍可逐次切换。 */
+  outputFormat: RvcFormat;
   /** 翻唱完成后默认保存到翻唱库（面板勾选框与桌宠自动生成共用）。 */
   saveToLibrary: boolean;
   /** 默认保存原声副本，方便之后原地重跑。 */
@@ -148,6 +153,7 @@ export const RVC_DEFAULTS: RvcConfigSection = {
   // 保持原有行为：桌宠默认清唱，面板一键翻唱默认带伴奏，训完默认入库、默认留原声。
   singKind: 'clean',
   panelKind: 'cover',
+  outputFormat: 'wav',
   // 默认保持旧行为：库里没有就让桌宠去 B 站现学一首。
   libraryOnly: false,
   saveToLibrary: true,
@@ -184,6 +190,8 @@ const K = `worlds.${RVC_ID}`;
 /** `x-options` 的选项源，由定义的 `configOptions` 给出。 */
 export const TIER_OPTIONS = `${RVC_ID}:tier`;
 export const KIND_OPTIONS = `${RVC_ID}:kind`;
+/** 输出格式下拉：wav / mp3。 */
+export const FORMAT_OPTIONS = `${RVC_ID}:format`;
 /** 默认音色下拉：选项由 `listVoices` 扫音色目录现算。 */
 export const VOICE_OPTIONS = `${RVC_ID}:voice`;
 
@@ -199,6 +207,7 @@ const TEXT = {
     singKind: { title: '桌宠点歌默认类型', description: '用户没明确说「清唱」或「翻唱」时，rvc_sing 用这个类型；也决定 B 站自动生成时带不带伴奏。' },
     libraryOnly: { title: '桌宠点歌只在翻唱库选取', description: '开启后桌宠只播放翻唱库里已有的歌；库里没有就如实说明，不会去 B 站搜索并现做一首。面板里的「B 站搜索」不受影响。' },
     panelKind: { title: '面板翻唱默认类型', description: '翻唱页 BGM 下拉与 B 站一键生成的初始选项；面板里仍可逐次切换。' },
+    outputFormat: { title: '默认输出格式', description: '面板翻唱、清唱、母带和桌宠自动生成的默认输出格式。WAV 无损但文件大；MP3 体积小、分享方便。面板里仍可逐次切换。' },
     saveToLibrary: { title: '完成后默认保存到翻唱库', description: '翻唱页「完成后保存到翻唱库」的初始勾选；桌宠自动生成也按它决定是否入库。关闭后桌宠仍会播放生成结果，只是不入库。' },
     keepSource: { title: '默认保存原声副本', description: '翻唱页「保存原声副本」的初始勾选；保存后可以在「最近翻唱」里原地重跑，不必重新选文件。' },
     mouthAnimation: { title: '唱歌时让嘴型动起来', description: '开启后，提示模型在开唱后用一句短哼（如「♪～」）带动桌宠的 pet_say 气泡，嘴型会跟着动；唱完或切歌后气泡结束、嘴自然闭上。关闭后不再为嘴型额外调 pet_say。桌面宠物的嘴只跟气泡走，所以这是插件侧能做到的动画，不是逐字音频口型。' },
@@ -241,6 +250,7 @@ const TEXT = {
     singKind: { title: 'Default pet singing type', description: 'Used by rvc_sing when the person does not explicitly ask for clean vocals or a cover; also decides whether Bilibili auto generation keeps the backing track.' },
     libraryOnly: { title: 'Pet songs: library only', description: 'On means the pet only plays songs already saved in the cover library. If a song is missing, it says so instead of searching Bilibili and making a new cover. The Bilibili search in the panel is not affected.' },
     panelKind: { title: 'Default panel cover type', description: 'Starting value for the BGM selector and Bilibili one-click generation; still switchable per run in the panel.' },
+    outputFormat: { title: 'Default output format', description: 'Default output for panel covers, clean vocals, mastering and pet auto generation. WAV is lossless but large; MP3 is small and easy to share. Still switchable per run in the panel.' },
     saveToLibrary: { title: 'Save finished covers to the library by default', description: 'Starting state of the "save to cover library" checkbox and whether pet auto generation is saved. When off, the pet still plays the generated result, it just is not added to the library.' },
     keepSource: { title: 'Keep the source audio by default', description: 'Starting state of the "keep source copy" checkbox; keeping it lets you rerun a cover in place from Recent covers without picking the file again.' },
     mouthAnimation: { title: 'Move the mouth while singing', description: 'On tells the model to start a short hum (for example "♪～") through a pet_say bubble when a song begins, so the pet mouth moves; after the song ends or switches, the bubble ends and the mouth closes. Off stops the extra pet_say call used only for mouth movement. The desktop pet mouth follows bubbles only, so this is plugin-side motion, not per-word audio lip sync.' },
@@ -306,6 +316,7 @@ export function configGroups(language: Language): ConfigGroup[] {
           [`${K}.singKind`]: { type: 'string', title: t.singKind.title, description: t.singKind.description, 'x-options': KIND_OPTIONS, 'x-hot': true },
           [`${K}.libraryOnly`]: { type: 'boolean', title: t.libraryOnly.title, description: t.libraryOnly.description, 'x-hot': true },
           [`${K}.panelKind`]: { type: 'string', title: t.panelKind.title, description: t.panelKind.description, 'x-options': KIND_OPTIONS, 'x-hot': true },
+          [`${K}.outputFormat`]: { type: 'string', title: t.outputFormat.title, description: t.outputFormat.description, 'x-options': FORMAT_OPTIONS, 'x-hot': true },
           [`${K}.saveToLibrary`]: { type: 'boolean', title: t.saveToLibrary.title, description: t.saveToLibrary.description, 'x-hot': true },
           [`${K}.keepSource`]: { type: 'boolean', title: t.keepSource.title, description: t.keepSource.description, 'x-hot': true },
           [`${K}.mouthAnimation`]: { type: 'boolean', title: t.mouthAnimation.title, description: t.mouthAnimation.description, 'x-hot': true },
@@ -363,4 +374,11 @@ export function kindOptions(language: Language): Array<{ value: RvcKind; label: 
     { value: 'clean', label: t.kindClean },
     { value: 'cover', label: t.kindCover },
   ];
+}
+
+/** 输出格式下拉的选项。 */
+export function formatOptions(language: Language): Array<{ value: RvcFormat; label: string }> {
+  return language === 'zh'
+    ? [{ value: 'wav', label: 'WAV（无损，文件大）' }, { value: 'mp3', label: 'MP3（体积小，方便分享）' }]
+    : [{ value: 'wav', label: 'WAV (lossless, large)' }, { value: 'mp3', label: 'MP3 (small, easy to share)' }];
 }

@@ -1418,8 +1418,7 @@ def main() -> int:
                     scale = 0.99 / peak
                     clean *= scale
                 clean_path = req.get("output") or ""
-                os.makedirs(os.path.dirname(os.path.abspath(clean_path)), exist_ok=True)
-                sf.write(clean_path, clean.astype(np.float32), 44100, subtype="PCM_16")
+                write_audio(clean_path, clean.T, 44100, fmt)
         except Exception:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "infer", "error": "混音失败：%s" % traceback.format_exc()[-800:]})
             return
@@ -1697,8 +1696,8 @@ def main() -> int:
     def vocal_only(req: dict) -> None:
         """清唱：只渲染变声后的人声，按与翻唱版相同的 rmsRatio / vocalGain 对齐响度。
 
-        只读 `vocals/conv.wav`，不重新分离/变声；输出单声道 44.1 kHz PCM16 WAV，
-        桌宠播放器可以直接播。
+        只读 `vocals/conv.wav`，不重新分离/变声；输出单声道 44.1 kHz，
+        格式跟随 `format`（wav / mp3），桌宠播放器两种都能播。
         """
         import numpy as np
         import soundfile as sf
@@ -1706,6 +1705,10 @@ def main() -> int:
         req_id = req.get("id")
         vocals = req.get("vocals") or ""
         output = req.get("output") or ""
+        fmt = (req.get("format") or "wav").lower()
+        if fmt not in ("wav", "mp3"):
+            emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "未知的输出格式：%s" % fmt})
+            return
         if not output:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": "缺少输出路径"})
             return
@@ -1777,7 +1780,12 @@ def main() -> int:
                 with sf.SoundFile(tmp, "w", samplerate=44100, channels=1, subtype="PCM_16") as sink:
                     for pos, mono in blocks():
                         sink.write(np.clip(shaped(pos, mono) * scale, -1.0, 1.0).astype(np.float32))
-                os.replace(tmp, output)
+                if fmt == "wav":
+                    os.replace(tmp, output)
+                else:
+                    with open(tmp, "rb") as src, open(output, "wb") as dst:
+                        wav2(src, dst, fmt)
+                    os.remove(tmp)
         except ValueError as error:
             emit({"type": "result", "id": req_id, "ok": False, "kind": "param", "error": str(error)})
             return

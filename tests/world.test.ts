@@ -679,10 +679,13 @@ describe('翻唱库入库', () => {
     expect(again.files.find((file) => file.kind === 'master')?.mediaKind).toBe('cover');
   });
 
-  it('清唱只收 WAV；老会话没有原声歌名时用「未命名」兜底', async () => {
+  it('清唱也接受 MP3；老会话没有原声歌名时用「未命名」兜底', async () => {
     const { invoke, dataDir } = await makeWorld();
     const mp3 = seedSession(dataDir, { outputs: ['out/mix-1.mp3'] });
-    await expect(invoke('librarySave', [mp3.id, 'output', 0, 'clean', ''])).rejects.toThrow('需要 WAV');
+    const clean = (await invoke('librarySave', [mp3.id, 'output', 0, 'clean', ''])) as
+      { entry: { title: string; format: string } };
+    expect(clean.entry.format).toBe('mp3');
+    expect(clean.entry.title).toBe('未命名');
     const cover = (await invoke('librarySave', [mp3.id, 'output', 0, 'cover', ''])) as { entry: { title: string } };
     expect(cover.entry.title).toBe('未命名');
     await expect(invoke('librarySave', ['nope', 'output', 0, 'cover', ''])).rejects.toThrow('找不到会话');
@@ -1116,6 +1119,15 @@ describe('B 站一键翻唱', () => {
 });
 
 describe('闲置回收配置', () => {
+  it('默认输出格式：出厂 WAV，配置分组里有 wav / mp3 选项', () => {
+    expect(RVC_DEFAULTS.outputFormat).toBe('wav');
+    const group = configGroups('zh').find((g) => g.id.endsWith(':defaults'));
+    const prop = group?.schema.properties?.['worlds.rvc.outputFormat'] as
+      { type?: string; 'x-options'?: string } | undefined;
+    expect(prop?.type).toBe('string');
+    expect(prop?.['x-options']).toBe('rvc:format');
+  });
+
   it('桌宠点歌只在翻唱库选取：默认关，配置分组里有开关', () => {
     expect(RVC_DEFAULTS.libraryOnly).toBe(false);
     const group = configGroups('zh').find((g) => g.id.endsWith(':defaults'));
@@ -1164,17 +1176,20 @@ describe('点歌与翻唱默认值配置', () => {
 
   it('面板状态带回配置默认值', async () => {
     const { invoke } = await makeWorld({
-      singKind: 'cover', panelKind: 'clean', saveToLibrary: false, keepSource: false,
+      singKind: 'cover', panelKind: 'clean', outputFormat: 'mp3',
+      saveToLibrary: false, keepSource: false,
       pitch: 2, indexRate: 0.42, protect: 0.2,
     });
     const state = await invoke('state') as {
       defaults: {
-        singKind: string; panelKind: string; saveToLibrary: boolean; keepSource: boolean;
+        singKind: string; panelKind: string; outputFormat: string;
+        saveToLibrary: boolean; keepSource: boolean;
         pitch: number; indexRate: number; protect: number;
       };
     };
     expect(state.defaults).toEqual({
-      singKind: 'cover', panelKind: 'clean', saveToLibrary: false, keepSource: false,
+      singKind: 'cover', panelKind: 'clean', outputFormat: 'mp3',
+      saveToLibrary: false, keepSource: false,
       pitch: 2, indexRate: 0.42, protect: 0.2,
     });
   });

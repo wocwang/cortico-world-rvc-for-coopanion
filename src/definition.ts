@@ -5,8 +5,8 @@ import { runtimesRoot } from 'cortico/paths.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { describeTools, type WorldDefinition, type WorldDescribe } from 'cortico/world.ts';
 import {
-  KIND_OPTIONS, RVC_DEFAULTS, RVC_ID, TIER_OPTIONS, VOICE_OPTIONS, kindOptions, tierOptions,
-  type RvcConfigSection,
+  FORMAT_OPTIONS, KIND_OPTIONS, RVC_DEFAULTS, RVC_ID, TIER_OPTIONS, VOICE_OPTIONS,
+  formatOptions, kindOptions, tierOptions, type RvcConfigSection,
 } from './config.ts';
 import { RvcWorld } from './world.ts';
 import { RVC_TOOL_DECLS } from './tools.ts';
@@ -81,6 +81,7 @@ export const RVC: WorldDefinition<RvcConfigSection> = {
   configOptions(kind, language) {
     if (kind === TIER_OPTIONS) return tierOptions(language);
     if (kind === KIND_OPTIONS) return kindOptions(language);
+    if (kind === FORMAT_OPTIONS) return formatOptions(language);
     if (kind === VOICE_OPTIONS) return voiceOptions(language);
     return [];
   },
